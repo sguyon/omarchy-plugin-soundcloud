@@ -209,6 +209,17 @@ The widget appears in the right section of the top bar, immediately before the s
 
 ## Development
 
+Run every check with one command, from any directory:
+
+```sh
+scripts/verify.sh
+```
+
+It runs the Python and Node tests, `omarchy plugin validate .` and a QML syntax
+check (`qmllint`, errors only). It prints a PASS, FAIL or SKIP line per step
+(a missing `omarchy` or `qmllint` is skipped) and exits non-zero if a step fails.
+To run a single suite:
+
 ```sh
 python3 -m unittest tests/test_soundcloud_app.py -v
 node tests/test_soundcloud_model.js
