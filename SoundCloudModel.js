@@ -244,6 +244,37 @@ function barIconColor(playing, accent, foreground) {
   return playing === true ? accent : foreground
 }
 
+// Keys the popup handles before the key catcher (which would turn h, l and
+// Shift+arrows into moves). Returns an action name, "ignore" for a key that is
+// swallowed on purpose (h, no longer a seek alias), or "" to leave it alone.
+//   Shift+Up/Down: volume +/- 5      l: like/unlike
+// j/k stay list navigation (Omarchy convention) although the website uses K/J
+// for previous/next.
+var keyShift = 0x02000000
+var keyCtrl = 0x04000000
+var keyAlt = 0x08000000
+var keyMeta = 0x10000000
+
+function keyAction(key, modifiers, text) {
+  var mods = (Number(modifiers) || 0) & (keyShift | keyCtrl | keyAlt | keyMeta)
+  var shift = mods === keyShift
+  var none = mods === 0
+  var letter = String(text || "").toLowerCase()
+  if (shift && key === 0x01000013) return "volume-up"
+  if (shift && key === 0x01000015) return "volume-down"
+  if (key === 0x4c || (none && letter === "l")) {
+    if (none) return "like"
+    return ""
+  }
+  if (none && (key === 0x48 || letter === "h")) return "ignore"
+  return ""
+}
+
+// Held keys repeat only for the ones that make sense repeated.
+function actionRepeats(action) {
+  return action === "volume-up" || action === "volume-down"
+}
+
 // A status position that arrives within `windowMs` of an optimistic position
 // (set by a seek) is older than the seek and is ignored.
 var optimisticPositionMs = 500
@@ -307,6 +338,8 @@ if (typeof module !== "undefined") {
     sliderDisplayValue: sliderDisplayValue,
     volumeSetCommand: volumeSetCommand,
     barIconColor: barIconColor,
+    keyAction: keyAction,
+    actionRepeats: actionRepeats,
     positionFromStatus: positionFromStatus,
     seekedPosition: seekedPosition,
     launchError: launchError

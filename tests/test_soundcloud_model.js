@@ -211,6 +211,23 @@ assert.equal(model.steppedVolume(0.02, -120), 0);
 assert.equal(model.steppedVolume(0.3, 0), 0.3);
 assert.equal(model.steppedVolume(undefined, -120), 0.95);
 
+// Keys handled before the key catcher.
+const SH = 0x02000000, CT = 0x04000000, AL = 0x08000000;
+assert.equal(model.keyAction(0x01000013, SH, ""), "volume-up");
+assert.equal(model.keyAction(0x01000015, SH, ""), "volume-down");
+assert.equal(model.keyAction(0x01000013, 0, ""), "");
+assert.equal(model.keyAction(0x01000014, 0, ""), ""); // plain arrows are for the catcher
+assert.equal(model.keyAction(0x4c, 0, "l"), "like");
+assert.equal(model.keyAction(0x4c, SH, "L"), "");
+assert.equal(model.keyAction(0x4c, CT, ""), "");
+assert.equal(model.keyAction(0x48, 0, "h"), "ignore");
+assert.equal(model.keyAction(0x4a, 0, "j"), ""); // j and k stay list navigation
+assert.equal(model.keyAction(0x4b, 0, "k"), "");
+assert.equal(model.keyAction(0x20, 0x20000000, ""), ""); // keypad flag alone is no modifier
+assert.equal(model.actionRepeats("volume-up"), true);
+assert.equal(model.actionRepeats("volume-down"), true);
+assert.equal(model.actionRepeats("like"), false);
+
 // Optimistic seek position: a status right after a seek is older than the seek.
 assert.equal(model.positionFromStatus(30, 12, 1100, 1000), 30); // within 500 ms of a seek
 assert.equal(model.positionFromStatus(30, 12, 1600, 1000), 12);

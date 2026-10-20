@@ -131,6 +131,16 @@ BarWidget {
     runAction("play", track.playbackId)
   }
 
+  // Shortcuts from AppKeys (volume, like); the mapping is SoundCloudModel.keyAction.
+  function appKey(action) {
+    if (!running || !loggedIn) return
+    if (action === "volume-up" || action === "volume-down") {
+      stepVolumeOnce(action === "volume-up" ? 1 : -1)
+    } else if (action === "like") {
+      toggleLike()
+    }
+  }
+
   function toggle() {
     if (popupOpen) close()
     else open()
@@ -657,11 +667,14 @@ BarWidget {
     }
 
     // Keys: Esc closes, Up/Down (or j/k) move the selection, Enter plays it,
-    // Tab/Shift+Tab switch tabs, Space plays or pauses. The content sits inside
-    // the key catcher, so the catcher sees the keys first.
+    // Tab/Shift+Tab switch tabs, Space plays or pauses, m mutes. AppKeys adds
+    // Shift+Up/Down volume and l like. j/k stay list keys (Omarchy), so unlike
+    // the website they do not skip tracks. The content sits inside the key
+    // catcher, so the catcher sees the keys first.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      Keys.forwardTo: [appKeys]
       onCloseRequested: root.close()
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveSelectedRow(dy)
@@ -676,6 +689,14 @@ BarWidget {
       onTabRequested: function(direction) {
         if (root.running && root.loggedIn) root.selectTab(SoundCloudModel.cycleTab(root.selectedTab, direction))
       }
+      onTextKey: function(text) {
+        if (text === "m" || text === "M") root.sendUi("mute")
+      }
+
+    AppKeys {
+      id: appKeys
+      onTriggered: function(action) { root.appKey(action) }
+    }
 
     Column {
       id: content
