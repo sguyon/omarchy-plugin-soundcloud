@@ -69,7 +69,7 @@ You only need to sign in once. Closing the window hides it; the playback backend
 | Click | Open or close the popup |
 | Middle-click | Play or pause |
 | Right-click | Next track |
-| Scroll | Change the volume (Omarchy's volume display shows "SoundCloud") |
+| Scroll | Previous or next track (with the option `wheelVolume`, change the volume instead) |
 
 In the popup, click your avatar to open your SoundCloud Library, or the cover to open the current track on SoundCloud.
 
@@ -124,12 +124,13 @@ Turn this off by setting `multiPress` to `false` in `settings.json` while the ba
 Options go on the widget's entry in `~/.config/omarchy/shell.json`. The shell applies a saved change at once. The chevron in the popup saves its own choice, which wins over this option.
 
 ```json
-{ "id": "brunosilveira.soundcloud", "startFolded": true }
+{ "id": "brunosilveira.soundcloud", "startFolded": true, "wheelVolume": true }
 ```
 
 | Option | Default | What it does |
 |---|---|---|
 | `startFolded` | `false` | The popup opens showing only the player and the tabs. Picking a tab, the queue or the filter opens its list, and clicking the open tab folds it again. The popup reopens as you left it (folded or showing a list). The chevron at the right of the tab row folds or shows the lists at any time, and Tab walks through "no tab open" as one stop. |
+| `wheelVolume` | `false` | Scrolling over the bar icon changes SoundCloud's volume, with Omarchy's volume display showing "SoundCloud", instead of skipping tracks. |
 
 ## Key bindings
 

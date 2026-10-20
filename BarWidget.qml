@@ -53,6 +53,9 @@ BarWidget {
     ? setting("startFolded", false) === true : savedFold === true
   property bool listOpen: false
   readonly property bool listShown: !listsOnDemand || listOpen
+  // Option `wheelVolume` on the widget's shell.json entry: scrolling over the bar icon changes
+  // the volume (and shows Omarchy's volume display) instead of skipping tracks.
+  readonly property bool wheelVolume: setting("wheelVolume", false) === true
   // Keyboard selection in the track list (-1 = none). It resets when the tab
   // changes or the list is replaced, and Enter plays that row.
   property int selectedRow: -1
@@ -1031,9 +1034,15 @@ BarWidget {
     acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
 
     onClicked: function(mouse) { root.triggerPress(mouse.button) }
-    // A swipe over the icon changes the volume, not the track.
+    // Scrolling over the icon skips tracks (as in the original widget). With the option
+    // `wheelVolume` it changes the volume instead.
+    onWheel: function(wheel) {
+      if (!root.running || root.wheelVolume) return
+      root.runAction(wheel.angleDelta.y > 0 ? "previous" : "next")
+    }
     VolumeControl {
       anchors.fill: parent
+      enabled: root.wheelVolume
       onStepped: function(direction) { if (root.running) root.stepVolumeOnce(direction, true) }
     }
     onEntered: root.bar.showTooltip(root, root.safeTooltipLabel)
