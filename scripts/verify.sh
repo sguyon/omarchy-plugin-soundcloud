@@ -31,7 +31,7 @@ fi
 
 # qmllint cannot resolve the Quickshell imports and prints many warnings, and it
 # reports syntax errors as "Warning: ... [syntax]", so only lines starting with
-# "Error" or tagged [syntax] count.
+# "Error" or tagged [syntax] count. Every .qml file of the plugin root is checked.
 printf '\n== qml syntax\n'
 qmllint=$(command -v qmllint qmllint6 | head -n 1)
 if [ -z "$qmllint" ] && [ -x /usr/lib/qt6/bin/qmllint ]; then qmllint=/usr/lib/qt6/bin/qmllint; fi
@@ -39,8 +39,26 @@ if [ -z "$qmllint" ]; then
   echo "qmllint not found"
   report SKIP "qml syntax" "qmllint not installed"
 else
-  errors=$("$qmllint" BarWidget.qml 2>&1 | grep -E '^Error|\[syntax\]' || true)
-  if [ -n "$errors" ]; then echo "$errors"; report FAIL "qml syntax"; else report PASS "qml syntax"; fi
+  errors=""
+  for file in ./*.qml; do
+    found=$("$qmllint" "$file" 2>&1 | grep -E '^Error|\[syntax\]' || true)
+    [ -n "$found" ] && errors+="$found"$'\n'
+  done
+  if [ -n "$errors" ]; then printf '%s' "$errors"; report FAIL "qml syntax"; else report PASS "qml syntax"; fi
+fi
+
+# The Qt Quick tests run offscreen, so they need no display.
+printf '\n== qml tests\n'
+qmltestrunner=$(command -v qmltestrunner qmltestrunner6 | head -n 1)
+if [ -z "$qmltestrunner" ] && [ -x /usr/lib/qt6/bin/qmltestrunner ]; then qmltestrunner=/usr/lib/qt6/bin/qmltestrunner; fi
+if [ -z "$qmltestrunner" ]; then
+  echo "qmltestrunner not found"
+  report SKIP "qml tests" "qmltestrunner not installed"
+elif [ ! -d tests/qml ]; then
+  echo "tests/qml not found"
+  report SKIP "qml tests" "no tests/qml"
+else
+  if QT_QPA_PLATFORM=offscreen "$qmltestrunner" -input tests/qml; then report PASS "qml tests"; else report FAIL "qml tests"; fi
 fi
 
 printf '\nSummary: %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
