@@ -211,6 +211,16 @@ assert.equal(model.steppedVolume(0.02, -120), 0);
 assert.equal(model.steppedVolume(0.3, 0), 0.3);
 assert.equal(model.steppedVolume(undefined, -120), 0.95);
 
+// Optimistic seek position: a status right after a seek is older than the seek.
+assert.equal(model.positionFromStatus(30, 12, 1100, 1000), 30); // within 500 ms of a seek
+assert.equal(model.positionFromStatus(30, 12, 1600, 1000), 12);
+assert.equal(model.positionFromStatus(30, 12, 1100, 0), 12);
+assert.equal(model.positionFromStatus(30, 12, 900, 1000), 12); // clock went backwards
+assert.equal(model.seekedPosition(10, 5, 100), 15);
+assert.equal(model.seekedPosition(3, -5, 100), 0);
+assert.equal(model.seekedPosition(98, 5, 100), 100);
+assert.equal(model.seekedPosition(10, 5, 0), 15);
+
 // Wheel events add up to whole notches: smooth-scroll deltas are small, a mouse notch is 120.
 assert.deepEqual(model.wheelSteps(0, 120), { steps: 1, accumulator: 0 });
 assert.deepEqual(model.wheelSteps(0, -120), { steps: -1, accumulator: 0 });

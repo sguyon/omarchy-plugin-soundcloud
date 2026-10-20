@@ -244,6 +244,24 @@ function barIconColor(playing, accent, foreground) {
   return playing === true ? accent : foreground
 }
 
+// A status position that arrives within `windowMs` of an optimistic position
+// (set by a seek) is older than the seek and is ignored.
+var optimisticPositionMs = 500
+
+function positionFromStatus(current, incoming, now, optimisticAt) {
+  var at = Number(optimisticAt)
+  var elapsed = Number(now) - at
+  if (Number.isFinite(at) && at > 0 && elapsed >= 0 && elapsed < optimisticPositionMs) return Number(current) || 0
+  return Number(incoming) || 0
+}
+
+// The position after a seek of `seconds`, kept inside the track.
+function seekedPosition(position, seconds, duration) {
+  var total = Number(duration)
+  var moved = (Number(position) || 0) + (Number(seconds) || 0)
+  return Math.max(0, Number.isFinite(total) && total > 0 ? Math.min(total, moved) : moved)
+}
+
 function launchError(line) {
   try {
     var result = JSON.parse(line)
@@ -289,6 +307,8 @@ if (typeof module !== "undefined") {
     sliderDisplayValue: sliderDisplayValue,
     volumeSetCommand: volumeSetCommand,
     barIconColor: barIconColor,
+    positionFromStatus: positionFromStatus,
+    seekedPosition: seekedPosition,
     launchError: launchError
   }
 }

@@ -25,6 +25,9 @@ BarWidget {
   property var waveformLevels: []
   property real duration: 0
   property real position: 0
+  // When the position was last set by a seek here; status positions right after
+  // it are older than the seek and are ignored.
+  property double optimisticPositionAt: 0
   property string lastError: ""
   property bool actionBusy: false
   property bool selectionBusy: false
@@ -458,7 +461,7 @@ BarWidget {
       muted = state.muted === true
     }
     duration = Number(state.duration || 0)
-    position = Number(state.position || 0)
+    position = SoundCloudModel.positionFromStatus(position, state.position, Date.now(), optimisticPositionAt)
     if (!preserveMetadata) {
       var incomingTitle = String(state.title || "").slice(0, 512)
       var artwork = String(state.artDataUrl || "")
@@ -945,6 +948,7 @@ BarWidget {
             onClicked: function(mouse) {
               var ratio = Math.max(0, Math.min(1, mouse.x / width))
               root.position = root.duration * ratio
+              root.optimisticPositionAt = Date.now()
               waveform.requestPaint()
               root.runAction("seek", ratio)
             }
