@@ -4457,18 +4457,198 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual(self.application.playback.current.properties["volume"], 0.25)
 
     def test_saved_settings_are_restored_at_startup(self):
-        self.build(settings={"v": 1, "volume": 0.3, "muted": True})
+        self.build(settings={"v": 1, "volume": 0.3, "muted": True, "autoplay": False})
 
         status = self.application.build_status()
 
-        self.assertEqual((status["volume"], status["muted"]), (0.3, True))
+        self.assertEqual((status["volume"], status["muted"], status["autoplay"]), (0.3, True, False))
 
     def test_defaults_without_a_settings_file(self):
         self.build()
 
         status = self.application.build_status()
 
-        self.assertEqual((status["volume"], status["muted"]), (1.0, False))
+        self.assertEqual((status["volume"], status["muted"], status["autoplay"]), (1.0, False, True))
+
+    def test_autoplay_command_is_reported_and_saved(self):
+        self.build()
+
+        self.assertFalse(self.command("autoplay:off").reply["autoplay"])
+        self.assertFalse(self.command("autoplay:maybe").reply["ok"])
+        self.assertFalse(self.command("autoplay:").reply["ok"])
+        self.assertIs(self.application.build_status()["autoplay"], False)
+        self.glib.run_idle()
+        self.assertIs(self.saved_settings()["autoplay"], False)
+
+        self.command("autoplay:on")
+        self.assertIs(self.application.autoplay, True)
+
+    # autoplay
+
+    def related(self, ids=(101, 102, 103), error=None):
+        """Make the related-tracks endpoint answer with these tracks; returns the paths asked."""
+        paths = []
+
+        def request(method, path, token, maximum=0):
+            paths.append(path)
+            if path == "/me":
+                return {"id": 42}
+            if error is not None:
+                raise error
+            return {"collection": [like_item(n)["track"] for n in ids], "next_href": None}
+
+        self.application.track_likes.load_token = lambda: "token"
+        self.application.track_likes.request = request
+        return paths
+
+    def test_the_end_of_the_queue_continues_with_related_tracks(self):
+        self.build()
+        paths = self.related((101, 102, 103))
+        self.play_last_of_two()
+
+        self.end_track()
+
+        self.assertIn("/tracks/2/related?limit=10", paths)
+        self.assertEqual(self.started_id(), "101")
+        self.assertEqual(self.queue_ids(), ["1", "2", "101", "102", "103"])
+        self.assertEqual([row.get("auto") for row in self.application.queue.items],
+                         [None, None, True, True, True])
+        self.assertEqual(self.application.queue.cursor, 2)
+        self.resolve()
+        self.assertEqual(self.application.playback.state, "playing")
+        self.end_track()
+        self.assertEqual(self.started_id(), "102")  # a normal advance from here
+
+    def test_autoplay_rows_are_saved_with_their_mark(self):
+        self.build()
+        self.related((101,))
+        self.play_last_of_two()
+        self.end_track()
+
+        self.glib.run_idle()
+        fd = os.open(self.queue_file.parent, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        saved, _position = self.app.QueueStore(fd).load()
+
+        self.assertEqual([row.get("auto") for row in saved.items], [None, None, True])
+
+    def test_next_and_previous_work_across_autoplay_rows(self):
+        self.build()
+        self.related((101, 102))
+        self.play_last_of_two()
+        self.end_track()
+        self.resolve()
+
+        self.command("previous")
+        self.assertEqual(self.started_id(), "2")
+        self.resolve()
+        self.command("next")
+        self.assertEqual(self.started_id(), "101")
+        self.resolve()
+        self.command("next")
+        self.assertEqual(self.started_id(), "102")
+        self.resolve()
+        self.assertFalse(self.command("next").reply["ok"])  # the end again; no refetch on a user next
+
+    def test_autoplay_off_stops_at_the_end_without_asking_for_related_tracks(self):
+        self.build()
+        paths = self.related()
+        self.command("autoplay:off")
+        self.play_last_of_two()
+        started = len(self.evaluated)
+
+        self.end_track()
+
+        self.assertEqual((len(self.evaluated), paths), (started, []))
+
+    def test_no_related_tracks_or_a_failing_request_leave_the_queue_ended(self):
+        for error in (None, OSError("offline"), ValueError("bad"), PermissionError("not signed in")):
+            with self.subTest(error=error):
+                self.build()
+                self.related((), error=error)
+                self.play_last_of_two()
+                started = len(self.evaluated)
+
+                self.end_track()
+
+                self.assertEqual(len(self.evaluated), started)
+                self.assertEqual(self.queue_ids(), ["1", "2"])
+                self.assertFalse(self.application.autoplay_loading)
+                self.assertEqual(self.application.playback.state, "paused")
+
+    def test_related_tracks_already_in_the_queue_are_not_added_twice(self):
+        self.build()
+        self.related((1, 2))
+        self.play_last_of_two()
+        started = len(self.evaluated)
+
+        self.end_track()
+
+        self.assertEqual((len(self.evaluated), self.queue_ids()), (started, ["1", "2"]))
+
+    def test_a_pick_made_while_related_tracks_load_wins(self):
+        self.build()
+        self.related((101,))
+        waiting = []
+        self.application.run_in_thread = waiting.append
+        self.play_last_of_two()
+        self.end_track()
+
+        self.command("play-from:home:soundcloud:tracks:1")
+        waiting[0]()
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "1")
+        self.assertEqual(self.queue_ids(), ["1", "2"])
+        self.assertFalse(self.application.autoplay_loading)
+
+    def test_the_request_does_not_block_the_main_loop(self):
+        self.build()
+        self.related((101,))
+        waiting = []
+        self.application.run_in_thread = waiting.append
+        self.play_last_of_two()
+
+        self.end_track()
+        self.end_track()  # nothing doubles while the first request is out
+
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(self.queue_ids(), ["1", "2"])
+        waiting[0]()
+        self.glib.run_idle()
+        self.assertEqual(self.started_id(), "101")
+
+    def test_a_related_track_that_fails_at_once_is_skipped(self):
+        self.build()
+        self.related((101, 102))
+        self.play_last_of_two()
+        self.end_track()
+
+        self.resolve(ok=False)
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "102")
+        self.assertEqual(self.queue_ids(), ["1", "2", "102"])
+
+    def test_invalid_related_rows_are_dropped_before_they_reach_the_queue(self):
+        self.build()
+        self.related((101, 102))
+        real = self.application.track_likes.request
+        bad = like_item(150, permalink_url="https://evil.example/x")["track"]
+
+        def request(method, path, token, maximum=0):
+            payload = real(method, path, token, maximum)
+            if "/related" in path:
+                payload["collection"].insert(0, bad)
+            return payload
+
+        self.application.track_likes.request = request
+        self.play_last_of_two()
+
+        self.end_track()
+
+        self.assertEqual(self.queue_ids(), ["1", "2", "101", "102"])
+        self.assertEqual(self.started_id(), "101")
 
     def play_last_of_two(self):
         self.fill("home", 2)
@@ -4524,6 +4704,17 @@ class QueuePlaybackTest(unittest.TestCase):
         with mock.patch.object(app, "_api_opener", Cut()), self.assertRaises(OSError):
             app.soundcloud_api_request("GET", "/me", "token")
 
+    def test_a_cut_reply_ends_the_autoplay_load(self):
+        self.build()
+        self.truncated_api()
+        self.play_last_of_two()
+        started = len(self.evaluated)
+
+        self.end_track()
+
+        self.assertFalse(self.application.autoplay_loading)
+        self.assertEqual((len(self.evaluated), self.queue_ids()), (started, ["1", "2"]))
+
     def test_a_cut_reply_ends_a_list_load_and_the_tab_can_refresh(self):
         self.build()
         self.truncated_api()
@@ -4537,11 +4728,17 @@ class QueuePlaybackTest(unittest.TestCase):
 
     def test_a_worker_that_dies_still_resets_its_flags_and_replies(self):
         self.build()
+        self.fill("home", 2)
+        self.play_last_of_two()
+        self.related((101,))
+        self.application.track_likes.related_tracks = mock.Mock(side_effect=RuntimeError("boom"))
         self.application.track_likes.tracks_page = mock.Mock(side_effect=RuntimeError("boom"))
 
+        self.end_track()
         self.application._load_api_list("likes", reset=True)
         self.glib.run_idle()
 
+        self.assertFalse(self.application.autoplay_loading)
         self.assertFalse(self.application.api_lists["likes"]["loading"])
 
     def test_a_cut_reply_still_answers_a_pasted_link_and_frees_the_slot(self):
@@ -4610,8 +4807,8 @@ class QueuePlaybackTest(unittest.TestCase):
 
             queue = reply["queue"]
             self.assertTrue(reply["ok"])
-            self.assertEqual(set(queue), {"cursor", "items", "explicit_count", "added_count"})
-            self.assertEqual((queue["cursor"], queue["explicit_count"]), (1, 1))
+            self.assertEqual(set(queue), {"cursor", "items", "explicit_count", "added_count", "autoplay"})
+            self.assertEqual((queue["cursor"], queue["explicit_count"], queue["autoplay"]), (1, 1, True))
             self.assertEqual([row["playbackId"].rpartition(":")[2] for row in queue["items"]],
                              ["1", "2", "5", "3", "4"])
             self.assertEqual([row["current"] for row in queue["items"]], [False, True, False, False, False])
@@ -4619,10 +4816,17 @@ class QueuePlaybackTest(unittest.TestCase):
             self.assertEqual([row["auto"] for row in queue["items"]], [False] * 5)
             self.assertIn("artworkId", queue["items"][0])
             self.assertNotIn("artUrl", queue["items"][0])
-        with self.subTest('the queue command works when empty'):
+        with self.subTest('the queue command marks autoplay rows and works when empty'):
             self.build()
             self.assertEqual(self.command("queue").reply["queue"],
-                             {"cursor": -1, "items": [], "explicit_count": 0, "added_count": 0})
+                             {"cursor": -1, "items": [], "explicit_count": 0, "added_count": 0, "autoplay": True})
+            self.related((101,))
+            self.play_last_of_two()
+            self.end_track()
+
+            items = self.command("queue").reply["queue"]["items"]
+
+            self.assertEqual([row["auto"] for row in items], [False, False, True])
         with self.subTest('the queue command returns at most 100 rows'):
             self.build()
             self.fill("home", 100)
@@ -5427,9 +5631,17 @@ class SettingsCommandParsingTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(app.volume_step_from_command(bad))
 
+    def test_on_off_commands(self):
+        app = load_module()
+
+        self.assertIs(app.on_off_from_command("autoplay:on", "autoplay"), True)
+        self.assertIs(app.on_off_from_command("autoplay:off", "autoplay"), False)
+        self.assertIsNone(app.on_off_from_command("autoplay:maybe", "autoplay"))
+        self.assertIsNone(app.on_off_from_command("shuffle:on", "autoplay"))
+
 
 class SettingsStoreTest(unittest.TestCase):
-    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False}
+    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True}
 
     def store(self, content=None):
         app = load_module()
@@ -5450,13 +5662,9 @@ class SettingsStoreTest(unittest.TestCase):
                     self.assertEqual(store.load(), self.DEFAULTS)
         with self.subTest('each bad value falls back on its own'):
             _app, store, _path = self.store(json.dumps({
-                "v": 1, "volume": 3, "muted": True}).encode())
+                "v": 1, "volume": 3, "muted": "yes", "autoplay": False}).encode())
 
-            self.assertEqual(store.load(), {**self.DEFAULTS, "muted": True})
-            _app, store, _path = self.store(json.dumps({
-                "v": 1, "volume": 0.2, "muted": "yes"}).encode())
-
-            self.assertEqual(store.load(), {**self.DEFAULTS, "volume": 0.2})
+            self.assertEqual(store.load(), {**self.DEFAULTS, "autoplay": False})
         with self.subTest('an oversized file is ignored'):
             app, store, _path = self.store(b'{"v":1,"volume":0.2,"pad":"' + b"x" * 5000 + b'"}')
 
@@ -5466,18 +5674,18 @@ class SettingsStoreTest(unittest.TestCase):
     def test_settings_round_trip_privately(self):
         _app, store, path = self.store()
 
-        store.save({"v": 1, "volume": 0.35, "muted": True})
+        store.save({"v": 1, "volume": 0.35, "muted": True, "autoplay": False})
 
-        self.assertEqual(store.load(), {"v": 1, "volume": 0.35, "muted": True})
+        self.assertEqual(store.load(), {"v": 1, "volume": 0.35, "muted": True, "autoplay": False})
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_only_the_known_keys_are_kept_so_a_new_setting_is_added_on_purpose(self):
         app, store, _path = self.store()
 
-        store.save({"v": 1, "volume": 0.5, "muted": False, "somethingNew": True})
+        store.save({"v": 1, "volume": 0.5, "muted": False, "autoplay": True, "somethingNew": True})
 
-        self.assertEqual(store.load(), {"v": 1, "volume": 0.5, "muted": False})
-        self.assertEqual(set(app.DEFAULT_SETTINGS), {"v", "volume", "muted"})
+        self.assertEqual(store.load(), {"v": 1, "volume": 0.5, "muted": False, "autoplay": True})
+        self.assertEqual(set(app.DEFAULT_SETTINGS), {"v", "volume", "muted", "autoplay"})
 
 
 class GstVolumeTest(unittest.TestCase):
@@ -5618,18 +5826,20 @@ class SettingsStatusFieldsTest(unittest.TestCase):
         app = load_module()
 
         status = app.validate_status_payload({
-            **self.BASE, "volume": 0.5, "muted": True, "trackUrl": "https://soundcloud.com/artist/song"})
+            **self.BASE, "volume": 0.5, "muted": True, "autoplay": False,
+            "trackUrl": "https://soundcloud.com/artist/song"})
 
-        self.assertEqual((status["volume"], status["muted"]), (0.5, True))
+        self.assertEqual((status["volume"], status["muted"], status["autoplay"]), (0.5, True, False))
         self.assertEqual(status["trackUrl"], "https://soundcloud.com/artist/song")
 
     def test_invalid_values_are_left_out_and_a_foreign_track_url_is_emptied(self):
         app = load_module()
 
         status = app.validate_status_payload({
-            **self.BASE, "volume": 2, "muted": "yes", "trackUrl": "https://evil.example/x"})
+            **self.BASE, "volume": 2, "muted": "yes", "autoplay": 1,
+            "trackUrl": "https://evil.example/x"})
 
-        for key in ("volume", "muted"):
+        for key in ("volume", "muted", "autoplay"):
             self.assertNotIn(key, status)
         self.assertEqual(status["trackUrl"], "")
         self.assertNotIn("volume", app.validate_status_payload({**self.BASE, "volume": float("nan")}))
@@ -5639,7 +5849,7 @@ class SettingsStatusFieldsTest(unittest.TestCase):
 
         status = app.validate_status_payload(self.BASE)
 
-        for key in ("volume", "muted", "trackUrl"):
+        for key in ("volume", "muted", "autoplay", "trackUrl"):
             self.assertNotIn(key, status)
 
 
@@ -5655,17 +5865,39 @@ class QueueViewTest(unittest.TestCase):
     def row(self, number):
         return PlayQueueTest.row(None, number)
 
+    def test_extend_auto_adds_marked_implicit_rows_without_duplicates(self):
+        queue = self.queue(2, index=1)
+
+        added = queue.extend_auto([self.row(2), self.row(3), self.row(3), self.row(4)])
+
+        self.assertEqual(added, 2)
+        self.assertEqual([row.get("auto") for row in queue.items], [None, None, True, True])
+        self.assertEqual(queue.explicit, [])
+        self.assertEqual(queue.advance(False)["title"], "Song 3")
+
+    def test_extend_auto_keeps_the_queue_within_its_cap(self):
+        app = load_module()
+        queue = self.queue(100, index=99)
+
+        queue.extend_auto([self.row(n) for n in range(200, 205)])
+
+        self.assertEqual(queue.length, app.MAX_TRACKS)
+        self.assertEqual(queue.current["title"], "Song 100")
+        self.assertEqual(queue.items[-1]["title"], "Song 204")
+
     def test_the_view_orders_played_current_explicit_then_the_rest(self):
         queue = self.queue(5, index=1)
         queue.play_next(self.row(5))
+        queue.extend_auto([self.row(9)])
 
         rows, cursor, explicit_count = queue.view()
 
         self.assertEqual([row["title"] for row in rows],
-                         ["Song 1", "Song 2", "Song 5", "Song 3", "Song 4"])
+                         ["Song 1", "Song 2", "Song 5", "Song 3", "Song 4", "Song 9"])
         self.assertEqual((cursor, explicit_count), (1, 1))
-        self.assertEqual([row["current"] for row in rows], [False, True, False, False, False])
-        self.assertEqual([row["explicit"] for row in rows], [False, False, True, False, False])
+        self.assertEqual([row["current"] for row in rows], [False, True, False, False, False, False])
+        self.assertEqual([row["explicit"] for row in rows], [False, False, True, False, False, False])
+        self.assertEqual([row["auto"] for row in rows], [False, False, False, False, False, True])
 
     def test_a_played_explicit_item_stays_marked_explicit(self):
         queue = self.queue(3)
@@ -5726,15 +5958,17 @@ class QueueViewTest(unittest.TestCase):
         empty.clear()
         self.assertEqual((empty.items, empty.current), ([], None))
 
-    def test_the_explicit_flag_survives_a_save_and_load(self):
+    def test_auto_and_explicit_flags_survive_a_save_and_load(self):
         app = load_module()
         queue = self.queue(3, index=0)
         queue.play_next(self.row(7))
+        queue.extend_auto([self.row(9)])
 
         loaded = app.PlayQueue.from_dict(queue.to_dict(1000))
 
         self.assertEqual(loaded.items, queue.items)
         self.assertEqual(loaded.explicit, queue.explicit)
+        self.assertIs(loaded.items[-1]["auto"], True)
         self.assertIs(loaded.explicit[0]["explicit"], True)
 
     def test_a_stored_current_flag_is_ignored(self):
@@ -5743,6 +5977,54 @@ class QueueViewTest(unittest.TestCase):
         queue.replace([{**self.row(1), "current": True}], 0)
 
         self.assertNotIn("current", queue.items[0])
+
+
+class RelatedTracksTest(unittest.TestCase):
+    def likes(self, responses):
+        app = load_module()
+        calls = []
+
+        def request(method, path, token, maximum=0):
+            calls.append((method, path))
+            if path == "/me":
+                return {"id": 42}
+            return responses(path)
+
+        likes = app.TrackLikes(lambda: "tok", lambda *args: None, request=request)
+        return app, likes, calls
+
+    def test_related_rows_are_converted_filtered_and_paged(self):
+        encrypted = {"media": {"transcodings": [
+            {"format": {"protocol": "ctr-encrypted-hls"}, "url": "https://api-v2.soundcloud.com/m"}]}}
+        items = [like_item(2)["track"], {**like_item(3)["track"], **encrypted},
+                 like_item(4, policy="BLOCK")["track"], "junk", like_item(5)["track"]]
+        _app, likes, calls = self.likes(lambda path: {
+            "collection": items,
+            "next_href": "https://api-v2.soundcloud.com/tracks/9/related?offset=10&limit=10"})
+
+        tracks, cursor = likes.related_tracks(9)
+
+        self.assertEqual([row["playbackId"] for row in tracks],
+                         ["soundcloud:tracks:2", "soundcloud:tracks:5"])
+        self.assertEqual(calls[-1], ("GET", "/tracks/9/related?limit=10"))
+        self.assertEqual(cursor, "/tracks/9/related?offset=10&limit=10")
+        likes.related_tracks(9, cursor)
+        self.assertEqual(calls[-1], ("GET", "/tracks/9/related?offset=10&limit=10"))
+
+    def test_a_next_link_to_another_host_or_path_is_dropped(self):
+        for href in ("https://evil.example/tracks/9/related?offset=10",
+                     "https://api-v2.soundcloud.com/me/play-history/tracks?offset=1",
+                     "http://api-v2.soundcloud.com/tracks/9/related?offset=10", None, 5):
+            with self.subTest(href=href):
+                _app, likes, _calls = self.likes(
+                    lambda path: {"collection": [like_item(2)["track"]], "next_href": href})
+                self.assertIsNone(likes.related_tracks(9)[1])
+
+    def test_a_bad_payload_raises_value_error(self):
+        _app, likes, _calls = self.likes(lambda path: {"collection": "x"})
+
+        with self.assertRaises(ValueError):
+            likes.related_tracks(9)
 
 
 class BarWidgetTest(unittest.TestCase):
@@ -5908,6 +6190,12 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('sendCommand(request.command, "paste")', qml)
         # The clipboard text only ever reaches the backend as an encoded https link command.
         self.assertNotIn("sendCommand(text", qml)
+
+    def test_the_queue_toolbar_has_an_autoplay_switch(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertIn('SoundCloudModel.toggleCommand("autoplay", root.autoplay)', qml)
+        self.assertIn("autoplay = state.autoplay !== false", qml)
 
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()

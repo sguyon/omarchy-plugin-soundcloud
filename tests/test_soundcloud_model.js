@@ -250,9 +250,15 @@ assert.equal(model.isEncrypted({ encrypted: true }), true);
 assert.equal(model.isEncrypted({ encrypted: "yes" }), false);
 assert.equal(model.isEncrypted(undefined), false);
 
+// The autoplay switch asks for the opposite of its state.
+assert.equal(model.toggleCommand("autoplay", true), "autoplay:off");
+assert.equal(model.toggleCommand("autoplay", false), "autoplay:on");
+assert.equal(model.toggleCommand("other", false), "");
+
 // Queue rows: label by origin; the view starts at the current track.
 assert.equal(model.queueRowLabel({ current: true, explicit: true }), "playing now");
 assert.equal(model.queueRowLabel({ explicit: true }), "added by you");
+assert.equal(model.queueRowLabel({ auto: true }), "related");
 assert.equal(model.queueRowLabel({}), "");
 assert.equal(model.queueRowLabel(undefined), "");
 const queue = { items: [{ id: "a" }, { id: "b", current: true }, { id: "c" }] };

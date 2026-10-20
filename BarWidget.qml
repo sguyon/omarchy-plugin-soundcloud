@@ -21,6 +21,7 @@ BarWidget {
   property bool likeBusy: false
   property real volume: 1
   property bool muted: false
+  property bool autoplay: true
   property bool shuffle: false
   property string repeat: "none"
   property int queueCursor: -1
@@ -616,6 +617,7 @@ BarWidget {
       if (state.volume !== undefined) volume = Math.max(0, Math.min(1, Number(state.volume) || 0))
       muted = state.muted === true
     }
+    autoplay = state.autoplay !== false
     shuffle = state.shuffle === true
     repeat = SoundCloudModel.repeatMode(state.repeat)
     queueLength = Math.max(0, Math.floor(Number(state.length) || 0))
@@ -1653,6 +1655,13 @@ BarWidget {
               tooltipText: root.repeat === "one" ? "Repeat: this track"
                 : (root.repeat === "all" ? "Repeat: all" : "Repeat: off")
               onClicked: root.sendUi("repeat")
+            }
+            Button {
+              iconText: "󰲸"
+              foreground: root.bar.foreground
+              selected: root.autoplay
+              tooltipText: root.autoplay ? "Autoplay: on (related tracks when the queue ends)" : "Autoplay: off"
+              onClicked: root.sendUi(SoundCloudModel.toggleCommand("autoplay", root.autoplay))
             }
             Button {
               iconText: "󰆴"

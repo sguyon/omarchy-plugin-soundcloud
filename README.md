@@ -25,7 +25,9 @@ without official SoundCloud API credentials.
   queued it. Click a row, or select it and press Enter, to play it, or take it out of
   the queue with the cross. Drag the handle (or press Alt+Up/Down on the selected row) to
   reorder; the playing track stays first. A slim toolbar has shuffle, repeat and Clear, which
-  asks for a confirmation first. Tab and Shift+Tab reach it after History
+  asks for a confirmation first. The Autoplay switch in the toolbar (on by default) keeps
+  playing when the queue ends: related tracks from SoundCloud are added, marked "related".
+  Tab and Shift+Tab reach it after History
 - Link in the clipboard while the popup is open: Ctrl+V (or SUPER+V, Shift+Insert in a
   terminal) adds it as play next, Ctrl+Shift+V plays it now; the popup names the track
   it queued
@@ -194,7 +196,7 @@ not require another sign-in:
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached track lists (Home, Feed, Likes, History, and the tracks you
   played here), with titles, artists, and links
-- `settings.json`: the volume level and whether it is muted
+- `settings.json`: the volume level, whether it is muted and whether Autoplay is on
 - `queue.json`: the play queue (titles, artists, links), its repeat and shuffle
   settings, and where you stopped in the current track
 
@@ -258,6 +260,11 @@ widget talks to the backend over a private Unix socket.
   and shuffle settings, and the playback position are saved in
   `~/.local/share/omarchy-soundcloud/queue.json`; after a restart the last track
   shows as paused where you left it, and play resumes from there.
+- When the last queued track ends and Autoplay is on, the backend asks SoundCloud's
+  `/tracks/{id}/related` endpoint (with the signed-in session token) for tracks like the one
+  that just played, adds the playable ones to the queue and goes on with the first. Tracks
+  already in the queue and encrypted ones are left out; if the request fails the queue
+  simply ends.
 - Play/pause and seek control GStreamer when it is playing. Otherwise they control
   SoundCloud's own web player. Previous and next never touch it.
 - On Hyprland the backend sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` to avoid

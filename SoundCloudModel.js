@@ -317,11 +317,17 @@ function queueMoveCommand(playbackId, offset) {
   return "queue-move:" + playbackId + ":" + places
 }
 
+// The command for the autoplay switch: the opposite of its current state.
+function toggleCommand(name, currentlyOn) {
+  return name === "autoplay" ? name + ":" + (currentlyOn === true ? "off" : "on") : ""
+}
+
 // The small label under a queue row.
 function queueRowLabel(item) {
   item = item || {}
   if (item.current === true) return "playing now"
   if (item.explicit === true) return "added by you"
+  if (item.auto === true) return "related"
   return ""
 }
 
@@ -606,6 +612,7 @@ if (typeof module !== "undefined") {
     queuePlayCommand: queuePlayCommand,
     queueRemoveCommand: queueRemoveCommand,
     queueMoveCommand: queueMoveCommand,
+    toggleCommand: toggleCommand,
     queueKeyMoveOffset: queueKeyMoveOffset,
     queueDragOffset: queueDragOffset,
     queueSignature: queueSignature,

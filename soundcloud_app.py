@@ -72,6 +72,7 @@ MAX_TRACK_CACHE_BYTES = 1024 * 1024
 MAX_QUEUE_BYTES = 256 * 1024
 MAX_QUEUE_SOURCE_BYTES = 64
 MAX_SETTINGS_BYTES = 4096
+RELATED_TRACKS_LIMIT = 10
 NOTIFICATION_TIMEOUT_SECONDS = 3.0
 NO_PLAYABLE_MESSAGE = "No other track in the queue can play"
 ENCRYPTED_MESSAGE = "This track is only offered as an encrypted stream the plugin can't play"
@@ -758,6 +759,11 @@ def _command_number(command: str, prefix: str, minimum: float, maximum: float) -
     return max(minimum, min(maximum, number)) if math.isfinite(number) else None
 
 
+def on_off_from_command(command: str, name: str) -> bool | None:
+    """`<name>:on` or `<name>:off` as a bool."""
+    return {f"{name}:on": True, f"{name}:off": False}.get(command)
+
+
 def queue_remove_from_command(command: str) -> str | None:
     value = command.removeprefix("queue-remove:") if command.startswith("queue-remove:") else None
     return value if is_playback_id(value) else None
@@ -1020,6 +1026,21 @@ class PlayQueue:
                 self._items.insert(target, self._items.pop(position))
                 return True
         return False
+
+    def extend_auto(self, rows: list[dict[str, object]]) -> int:
+        """Add autoplay rows at the end as implicit items marked `auto`. Returns how many were new."""
+        known = {row["url"] for row in self._items} | {row["url"] for row in self._explicit}
+        added = 0
+        for row in _queue_rows(rows):
+            if row["url"] in known:
+                continue
+            known.add(row["url"])
+            self._items.append({**row, "auto": True})
+            added += 1
+            if len(self._items) > MAX_TRACKS:
+                del self._items[0]
+                self._cursor -= 1
+        return added
 
     def view(self, limit: int = MAX_TRACKS) -> tuple[list[dict[str, object]], int, int]:
         """The rows to show as (rows, cursor, explicit count): what was played and the current
@@ -1991,7 +2012,7 @@ def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         fields["volume"] = volume
-    for key in ("muted",):
+    for key in ("muted", "autoplay"):
         if isinstance(payload.get(key), bool):
             fields[key] = payload[key]
     if "trackUrl" in payload:
@@ -2234,7 +2255,7 @@ def sanitize_queue(payload: object) -> dict[str, object]:
     }
 
 
-DEFAULT_SETTINGS: dict[str, object] = {"v": 1, "volume": 1.0, "muted": False}
+DEFAULT_SETTINGS: dict[str, object] = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True}
 
 
 def sanitize_settings(payload: object) -> dict[str, object]:
@@ -2245,14 +2266,14 @@ def sanitize_settings(payload: object) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         settings["volume"] = volume
-    for key in ("muted",):
+    for key in ("muted", "autoplay"):
         if isinstance(payload.get(key), bool):
             settings[key] = payload[key]
     return settings
 
 
 class SettingsStore:
-    """Volume and mute in `settings.json`."""
+    """Volume, mute and the autoplay choice in `settings.json`."""
 
     def __init__(self, directory_fd: int, maximum_bytes: int = MAX_SETTINGS_BYTES):
         self._store = PrivateJsonStore(directory_fd, "settings.json", maximum_bytes)
@@ -3102,6 +3123,34 @@ class TrackLikes:
         if not isinstance(items, list):
             raise ValueError("invalid likes response")
         tracks = [track for track in map(track_from_entry, items) if track is not None]
+        next_href = payload.get("next_href")
+        parsed = urlparse(next_href) if isinstance(next_href, str) else None
+        if (not items or parsed is None or parsed.scheme != "https"
+                or parsed.netloc != "api-v2.soundcloud.com" or parsed.path != list_path):
+            return tracks, None
+        return tracks, parsed.path + "?" + parsed.query
+
+    def related_tracks(self, track_id: int, cursor: str | None = None) -> tuple[list[dict[str, object]], str | None]:
+        """Tracks SoundCloud suggests after `track_id` (autoplay), and the cursor for the next page.
+
+        Blocked tracks and tracks that only offer encrypted streams are left out.
+        `cursor` is only ever a value this method returned earlier.
+        """
+        with self.lock:
+            token = self._identify()
+        list_path = f"/tracks/{track_id}/related"
+        payload = self.request(
+            "GET", cursor or f"{list_path}?limit={RELATED_TRACKS_LIMIT}", token, 2 * 1024 * 1024
+        )
+        items = payload.get("collection") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("invalid related tracks response")
+        tracks = [
+            track for item in items
+            if isinstance(item, dict) and item.get("policy") != "BLOCK"
+            and (track := track_from_entry({"track": item})) is not None
+            and track.get("encrypted") is not True
+        ]
         next_href = payload.get("next_href")
         parsed = urlparse(next_href) if isinstance(next_href, str) else None
         if (not items or parsed is None or parsed.scheme != "https"
@@ -3984,7 +4033,9 @@ def build_application(show_on_start: bool = False):
             self.notice_until = 0.0
             self.queue_finished = False  # the last queued track ended and nothing followed
             self.queue_save_pending = False
+            self.autoplay = saved_settings["autoplay"] is True
             self.settings_save_pending = False
+            self.autoplay_loading = False
             self.run_in_thread = lambda target: threading.Thread(target=target, daemon=True).start()
             self.track_cache_save_pending = False
             self.had_subscriber = False
@@ -4219,7 +4270,9 @@ def build_application(show_on_start: bool = False):
         def _save_settings(self):
             self.settings_save_pending = False
             try:
-                settings_store.save({"v": 1, **self.playback.volume_status()})
+                settings_store.save({
+                    "v": 1, **self.playback.volume_status(), "autoplay": self.autoplay,
+                })
             except OSError:
                 pass
             return False
@@ -4445,6 +4498,47 @@ def build_application(show_on_start: bool = False):
             self._queue_changed()
             if row is not None:
                 self._play_when_page_ready(row, None, None, automatic=True)
+            else:
+                self._start_autoplay()
+
+        def _start_autoplay(self):
+            """The queue ran out: fetch related tracks off the main loop and keep playing."""
+            current = self.queue.current
+            if (not self.autoplay or self.autoplay_loading or current is None
+                    or not is_playback_id(current.get("playbackId"))):
+                return
+            self.autoplay_loading = True
+            generation = self.selection_generation
+            track_id = int(str(current["playbackId"]).rpartition(":")[2])
+
+            def worker():
+                tracks = []
+                try:
+                    tracks, cursor = self.track_likes.related_tracks(track_id)
+                    if not tracks and cursor:  # a page of unplayable rows: try the next one
+                        tracks, _cursor = self.track_likes.related_tracks(track_id, cursor)
+                except Exception:
+                    tracks = []  # no suggestions: the queue stays ended
+                finally:
+                    GLib.idle_add(self._autoplay_loaded, generation, tracks)
+
+            self.run_in_thread(worker)
+
+        def _autoplay_loaded(self, generation, tracks):
+            self.autoplay_loading = False
+            if generation != self.selection_generation or not self.autoplay:
+                return False  # the user picked something else meanwhile
+            # Suggestions come from the network: only rows the validator accepts reach the queue.
+            tracks = [row for track in tracks
+                      for row in (validate_tracks_payload({"tracks": [track]}) or {"tracks": []})["tracks"]]
+            if not self.queue.extend_auto(tracks):
+                return False
+            self.auto_skip.begin_chain(self.queue.length)
+            row = self._next_playable(False)
+            self._queue_changed()
+            if row is not None:
+                self._play_when_page_ready(row, None, None, automatic=True)
+            return False
 
         def _track_failed(self):
             """A track failed. If an automatic start failed at once, drop it and play the next."""
@@ -4778,6 +4872,7 @@ def build_application(show_on_start: bool = False):
                 "items": result["tracks"],
                 "explicit_count": explicit_count,
                 "added_count": len(self.queue.added),
+                "autoplay": self.autoplay,
             }}
 
         def _publish_status_once(self):
@@ -4799,6 +4894,7 @@ def build_application(show_on_start: bool = False):
                 **merge_status(self.page_status.values, gst_status),
                 **queue_status(self.queue),
                 **self.playback.volume_status(),
+                "autoplay": self.autoplay,
                 "trackUrl": track_url,
             }
             if not status.get("error") and time.monotonic() < self.notice_until:
@@ -5154,6 +5250,16 @@ def build_application(show_on_start: bool = False):
                 self._respond(
                     connection, request_id,
                     {"ok": ok, "running": True, **self.playback.volume_status()},
+                    publish_status=True,
+                )
+            elif command.startswith("autoplay:"):
+                enabled = on_off_from_command(command, "autoplay")
+                if enabled is not None:
+                    self.autoplay = enabled
+                    self._settings_changed()
+                self._respond(
+                    connection, request_id,
+                    {"ok": enabled is not None, "running": True, "autoplay": self.autoplay},
                     publish_status=True,
                 )
             elif command == "queue":
