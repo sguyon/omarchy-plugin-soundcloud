@@ -70,6 +70,8 @@ CLIENT_IDLE_SECONDS = 60.0
 SEND_TIMEOUT_SECONDS = 0.1
 HLS_MAX_WORKERS = 2
 HLS_OPERATION_SECONDS = 45.0
+# A seek waits this long for the feeder it replaces to let go of its slot.
+HLS_SEEK_WAIT_SECONDS = 1.0
 ARTWORK_HOSTS = {"i1.sndcdn.com"}
 MAX_WAVEFORM_BARS = 200
 STATUS_INTERVAL_MS = 500
@@ -2517,7 +2519,7 @@ class GstPlayback:
             return False
         return True
 
-    def _play_hls(self, uri: str, start: int = 0, paused: bool = False) -> bool:
+    def _play_hls(self, uri: str, start: int = 0, paused: bool = False, wait: float = 0.0) -> bool:
         try:
             pipeline = self.Gst.parse_launch(
                 "appsrc name=source format=time is-live=false block=true "
@@ -2545,7 +2547,7 @@ class GstPlayback:
             self.error = "SoundCloud could not initialize audio playback"
             self.state = "error"
             return False
-        if not self.hls_slots.acquire(blocking=False):
+        if not self.hls_slots.acquire(blocking=wait > 0, timeout=wait if wait > 0 else None):
             self._stop_current()
             self.active = False
             self.error = "SoundCloud playback is busy"
@@ -2697,7 +2699,9 @@ class GstPlayback:
         self._stop_current()
         self.hls_base, self.hls_skip = base, max(0.0, seconds - base)
         self.playing = False
-        if not self._play_hls(self.hls_uri, start, paused):
+        # The feeder this replaces may still be inside a network read and holding its slot.
+        if not self._play_hls(self.hls_uri, start, paused, wait=HLS_SEEK_WAIT_SECONDS):
+            self.on_change()  # show the error
             return False
         self.has_started = paused
         self.state = "paused" if paused else "buffering"

@@ -2376,6 +2376,38 @@ class GstPlaybackEndTest(unittest.TestCase):
         player.current.position = 2 * 10**9
         self.assertAlmostEqual(player.status()["position"], 36.0)  # base + skip + pipeline position
 
+    def test_rapid_hls_seeks_wait_for_a_stuck_feeder_and_report_a_failure(self):
+        app, player = self.player()
+        stuck = threading.Event()
+        release = threading.Event()
+
+        def slow(*_args, **_kwargs):  # a network read that does not notice the cancel
+            stuck.set()
+            release.wait(5)
+            raise OSError("cancelled")
+
+        self.addCleanup(release.set)
+        segments = self.hls_segments(app)
+        with mock.patch.object(app, "fetch_private_media", slow), \
+                mock.patch.object(app, "hls_segment_list", return_value=segments):
+            self.start(player, "hls", "audio/mpeg")  # feeder 1 is stuck in a read
+            self.assertTrue(stuck.wait(2))
+            player.hls_cache = ("https://x.sndcdn.com/a", segments)
+            self.assertTrue(player.seek_seconds(34.0))  # feeder 2 takes the last slot, also stuck
+            with mock.patch.object(app, "HLS_SEEK_WAIT_SECONDS", 0.05):
+                self.assertFalse(player.seek_seconds(44.0))  # no slot frees up in time
+            self.assertEqual((player.state, player.error), ("error", "SoundCloud playback is busy"))
+            release.set()
+
+    def test_a_hls_seek_waits_briefly_for_the_old_feeder_to_stop(self):
+        app, player = self.player()
+        self.start(player, "hls", "audio/mpeg")
+        player.hls_cache = ("https://x.sndcdn.com/a", self.hls_segments(app))
+        self.assertTrue(player.hls_slots.acquire(blocking=False))  # a second feeder, still finishing
+        threading.Timer(0.1, player.hls_slots.release).start()
+        with mock.patch.object(player.hls_executor, "submit", lambda fn, *a: None):
+            self.assertTrue(player.seek_seconds(34.0))
+
     def test_a_hls_mp3_seek_before_the_playlist_is_known_is_refused(self):
         _app, player = self.player()
         self.start(player, "hls", "audio/mpeg")
