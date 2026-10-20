@@ -47,9 +47,13 @@ TestCase {
   function test_keys_are_taken_before_the_catcher() {
     make()
     keyClick("l")
+    keyClick(Qt.Key_Right, Qt.ShiftModifier)
+    keyClick(Qt.Key_PageDown)
     keyClick(Qt.Key_Up, Qt.ShiftModifier)
     keyClick(Qt.Key_Down, Qt.ShiftModifier)
-    compare(actions, ["like", "volume-up", "volume-down"])
+    keyClick("L", Qt.ShiftModifier)
+    keyClick("S", Qt.ShiftModifier)
+    compare(actions, ["like", "next", "next", "volume-up", "volume-down", "repeat", "shuffle"])
     compare(catcherKeys, [])
   }
 

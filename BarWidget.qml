@@ -16,9 +16,15 @@ BarWidget {
   property string playbackState: "idle"
   property string playbackId: ""
   property bool liked: false
+  property bool canNext: true
+  property bool canPrevious: true
   property bool likeBusy: false
   property real volume: 1
   property bool muted: false
+  property bool shuffle: false
+  property string repeat: "none"
+  property int queueCursor: -1
+  property int queueLength: 0
   property string title: ""
   property string artist: ""
   property string artDataUrl: ""
@@ -147,13 +153,21 @@ BarWidget {
     sendUi(SoundCloudModel.seekByCommand(seconds))
   }
 
-  // Shortcuts from AppKeys (volume, like); the mapping is SoundCloudModel.keyAction.
+  // Shortcuts from AppKeys (next, previous, volume, like, repeat, shuffle); the
+  // mapping is SoundCloudModel.keyAction.
   function appKey(action) {
     if (!running || !loggedIn) return
-    if (action === "volume-up" || action === "volume-down") {
+    if (action === "next" || action === "previous") {
+      if (SoundCloudModel.queueButtonEnabled(actionBusy, hasTrack, action === "next" ? canNext : canPrevious))
+        runAction(action)
+    } else if (action === "volume-up" || action === "volume-down") {
       stepVolumeOnce(action === "volume-up" ? 1 : -1)
     } else if (action === "like") {
       toggleLike()
+    } else if (action === "repeat") {
+      sendUi("repeat")
+    } else if (action === "shuffle") {
+      sendUi("shuffle")
     }
   }
 
@@ -483,10 +497,16 @@ BarWidget {
     }
     var preserveMetadata = SoundCloudModel.shouldPreservePlaybackMetadata(state, root.title)
     playing = state.playing === true
+    canNext = state.canNext !== false
+    canPrevious = state.canPrevious !== false
     if (!volumeDragging && !volumeSettling) {
       if (state.volume !== undefined) volume = Math.max(0, Math.min(1, Number(state.volume) || 0))
       muted = state.muted === true
     }
+    shuffle = state.shuffle === true
+    repeat = SoundCloudModel.repeatMode(state.repeat)
+    queueLength = Math.max(0, Math.floor(Number(state.length) || 0))
+    queueCursor = state.cursor === undefined ? -1 : Math.floor(Number(state.cursor))
     duration = Number(state.duration || 0)
     position = SoundCloudModel.positionFromStatus(position, state.position, Date.now(), optimisticPositionAt)
     if (!preserveMetadata) {
@@ -644,7 +664,7 @@ BarWidget {
 
     onClicked: function(mouse) {
       if (mouse.button === Qt.MiddleButton) root.runAction(root.running ? "play-pause" : "launch")
-      else if (mouse.button === Qt.RightButton && root.running) root.runAction("next")
+      else if (mouse.button === Qt.RightButton && root.running && root.canNext) root.runAction("next")
       else root.toggle()
     }
     onWheel: function(wheel) {
@@ -685,9 +705,10 @@ BarWidget {
 
     // Keys: Esc closes, Up/Down (or j/k) move the selection, Enter plays it,
     // Tab/Shift+Tab switch tabs, Space plays or pauses, Left/Right seek (5 s,
-    // longer while held), m mutes. AppKeys adds
-    // Shift+Up/Down volume and l like. j/k stay list keys (Omarchy), so unlike
-    // the website they do not skip tracks. The content sits inside the key
+    // longer while held), m mutes. AppKeys adds PageDown/Shift+Right next,
+    // PageUp/Shift+Left previous, Shift+Up/Down volume, l like, Shift+L repeat
+    // and Shift+S shuffle. j/k stay list keys (Omarchy), so unlike the website
+    // they do not skip tracks. The content sits inside the key
     // catcher, so the catcher sees the keys first.
     PanelKeyCatcher {
       id: keyCatcher
@@ -822,7 +843,7 @@ BarWidget {
           Button {
             iconText: "󰒮"
             foreground: root.bar.foreground
-            enabled: !root.actionBusy && root.hasTrack
+            enabled: SoundCloudModel.queueButtonEnabled(root.actionBusy, root.hasTrack, root.canPrevious)
             opacity: enabled ? 1 : 0.4
             onClicked: root.runAction("previous")
           }
@@ -855,7 +876,7 @@ BarWidget {
           Button {
             iconText: "󰒭"
             foreground: root.bar.foreground
-            enabled: !root.actionBusy && root.hasTrack
+            enabled: SoundCloudModel.queueButtonEnabled(root.actionBusy, root.hasTrack, root.canNext)
             opacity: enabled ? 1 : 0.4
             onClicked: root.runAction("next")
           }

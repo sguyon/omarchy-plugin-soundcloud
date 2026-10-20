@@ -252,6 +252,15 @@ function volumeSetCommand(value) {
   return "volume:" + Math.max(0, Math.min(1, level)).toFixed(2)
 }
 
+function repeatMode(value) {
+  return value === "one" || value === "all" ? value : "none"
+}
+
+// Next and Previous follow the queue; an older backend that does not report it keeps them on.
+function queueButtonEnabled(actionBusy, hasTrack, allowed) {
+  return actionBusy !== true && hasTrack === true && allowed !== false
+}
+
 function barIconColor(playing, accent, foreground) {
   return playing === true ? accent : foreground
 }
@@ -259,7 +268,9 @@ function barIconColor(playing, accent, foreground) {
 // Keys the popup handles before the key catcher (which would turn h, l and
 // Shift+arrows into moves). Returns an action name, "ignore" for a key that is
 // swallowed on purpose (h, no longer a seek alias), or "" to leave it alone.
+//   PageDown, Shift+Right: next      PageUp, Shift+Left: previous
 //   Shift+Up/Down: volume +/- 5      l: like/unlike
+//   Shift+L: repeat   Shift+S: shuffle
 // j/k stay list navigation (Omarchy convention) although the website uses K/J
 // for previous/next.
 var keyShift = 0x02000000
@@ -272,12 +283,18 @@ function keyAction(key, modifiers, text) {
   var shift = mods === keyShift
   var none = mods === 0
   var letter = String(text || "").toLowerCase()
+  if (none && key === 0x01000017) return "next"
+  if (none && key === 0x01000016) return "previous"
+  if (shift && key === 0x01000014) return "next"
+  if (shift && key === 0x01000012) return "previous"
   if (shift && key === 0x01000013) return "volume-up"
   if (shift && key === 0x01000015) return "volume-down"
   if (key === 0x4c || (none && letter === "l")) {
     if (none) return "like"
+    if (shift) return "repeat"
     return ""
   }
+  if (shift && (key === 0x53)) return "shuffle"
   if (none && (key === 0x48 || letter === "h")) return "ignore"
   return ""
 }
@@ -389,6 +406,8 @@ if (typeof module !== "undefined") {
     sliderVisible: sliderVisible,
     sliderDisplayValue: sliderDisplayValue,
     volumeSetCommand: volumeSetCommand,
+    repeatMode: repeatMode,
+    queueButtonEnabled: queueButtonEnabled,
     barIconColor: barIconColor,
     seekRepeatCount: seekRepeatCount,
     seekSeconds: seekSeconds,
