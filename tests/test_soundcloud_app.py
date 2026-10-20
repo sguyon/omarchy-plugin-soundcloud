@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -6507,6 +6508,248 @@ class MprisCommandMappingTest(unittest.TestCase):
     def test_unknown_method_is_none(self):
         self.assertIsNone(self.commands("Explode"))
         self.assertIsNone(self.commands("OpenUri", "https://soundcloud.com/a/b"))
+
+
+class FakeMprisBackend:
+    def __init__(self):
+        self.status = {
+            "playbackState": "paused", "playing": False, "playbackId": "soundcloud:tracks:42",
+            "title": "T", "artist": "A", "duration": 100.0, "position": 30.0, "volume": 0.5,
+            "repeat": "none", "shuffle": False, "canNext": True, "canPrevious": True,
+            "trackUrl": "https://soundcloud.com/a/t",
+        }
+        self.commands = []
+
+    def mpris_status(self):
+        return dict(self.status)
+
+    def mpris_position_ms(self):
+        return int(self.status["position"] * 1000)
+
+    def mpris_command(self, command):
+        self.commands.append(command)
+
+
+class MprisServiceBusTest(unittest.TestCase):
+    """MprisService on a private bus, served from its own thread so a blocking client can call it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.daemon = None
+        cls.skip_reason = ""
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError):
+            cls.skip_reason = "PyGObject is not available"
+            return
+        cls.Gio, cls.GLib = Gio, GLib
+        if not shutil.which("dbus-daemon"):
+            cls.skip_reason = "dbus-daemon is not available"
+            return
+        # A private bus (Gio.TestDBus.down() blocks while a client connection is open).
+        try:
+            cls.daemon = subprocess.Popen(
+                ["dbus-daemon", "--session", "--nofork", "--print-address=1"],
+                stdout=subprocess.PIPE, text=True)
+            address = cls.daemon.stdout.readline().strip()
+            if not address:
+                raise OSError("no bus address")
+        except OSError:
+            cls.skip_reason = "a private bus can't be started"
+            if cls.daemon:
+                cls.daemon.kill()
+                cls.daemon = None
+            return
+        # A dedicated connection to the private daemon, handed to the service: GLib's shared
+        # session connection is created once per process and may already point at the real bus.
+        cls.address = address
+        cls.connection = cls.private_connection()
+        cls.assert_private_bus(cls.connection)
+
+    @classmethod
+    def private_connection(cls):
+        connection = cls.Gio.DBusConnection.new_for_address_sync(
+            cls.address,
+            cls.Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | cls.Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None)
+        connection.set_exit_on_close(False)
+        return connection
+
+    @classmethod
+    def assert_private_bus(cls, connection):
+        """The connection must lead to the private daemon: its address is not the real session
+        bus, and the process serving the bus is the daemon started here."""
+        real = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        assert cls.address and cls.address != real, "the test bus must not be the session bus"
+        reply = connection.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID", cls.GLib.Variant("(s)", ("org.freedesktop.DBus",)),
+            None, cls.Gio.DBusCallFlags.NONE, 2000, None)
+        assert reply.unpack() == (cls.daemon.pid,), "the test connection is not on the private bus"
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.daemon is None:
+            return
+        cls.connection.close_sync(None)
+        cls.daemon.terminate()
+        cls.daemon.wait(5)
+        cls.daemon.stdout.close()
+
+    def setUp(self):
+        if self.skip_reason:
+            self.skipTest(self.skip_reason)
+        Gio, GLib = self.Gio, self.GLib
+        self.app = load_module()
+        self.backend = FakeMprisBackend()
+        self.name = "org.mpris.MediaPlayer2.omarchy_soundcloud_test"
+        self.service = None
+        self.loop = None
+        started = threading.Event()
+
+        def serve():
+            context = GLib.MainContext.new()
+            context.push_thread_default()
+            self.loop = GLib.MainLoop.new(context, False)
+            self.service = self.app.MprisService(
+                Gio, GLib, self.backend, bus_name=self.name, connection=self.connection)
+            self.service.start()
+            source = GLib.idle_source_new()
+            source.set_callback(lambda *_: started.set() or False)
+            source.attach(context)
+            self.loop.run()
+            self.service.stop()
+            context.pop_thread_default()
+
+        self.thread = threading.Thread(target=serve, daemon=True)
+        self.thread.start()
+        self.assertTrue(started.wait(5))
+        self.addCleanup(self.stop_service)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.service.owned:
+            time.sleep(0.02)
+        self.assertTrue(self.service.owned)
+
+    def stop_service(self):
+        if self.loop:
+            self.loop.quit()
+        self.thread.join(5)
+
+    def get(self, name, interface="org.mpris.MediaPlayer2.Player"):
+        reply = self.connection.call_sync(
+            self.name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "Get",
+            self.GLib.Variant("(ss)", (interface, name)), None,
+            self.Gio.DBusCallFlags.NONE, 3000, None)
+        return reply.unpack()[0]
+
+    def set(self, name, variant):
+        self.connection.call_sync(
+            self.name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "Set",
+            self.GLib.Variant("(ssv)", ("org.mpris.MediaPlayer2.Player", name, variant)), None,
+            self.Gio.DBusCallFlags.NONE, 3000, None)
+
+    def call(self, method, parameters=None, interface="org.mpris.MediaPlayer2.Player"):
+        return self.connection.call_sync(
+            self.name, "/org/mpris/MediaPlayer2", interface, method, parameters, None,
+            self.Gio.DBusCallFlags.NONE, 3000, None)
+
+    def test_root_interface(self):
+        root = "org.mpris.MediaPlayer2"
+        self.assertEqual(self.get("Identity", root), "SoundCloud")
+        for name in ("CanQuit", "CanRaise", "HasTrackList"):
+            self.assertIs(self.get(name, root), False, name)
+        self.assertEqual(self.get("SupportedUriSchemes", root), [])
+        self.assertEqual(self.get("SupportedMimeTypes", root), [])
+        self.call("Raise", None, root)
+        self.call("Quit", None, root)
+
+    def test_player_properties(self):
+        self.assertEqual(self.get("PlaybackStatus"), "Paused")
+        metadata = self.get("Metadata")
+        self.assertEqual(metadata["mpris:trackid"], "/org/omarchy/soundcloud/track/42")
+        self.assertEqual(metadata["mpris:length"], 100_000_000)
+        self.assertEqual(metadata["xesam:artist"], ["A"])
+        self.assertEqual(self.get("Position"), 30_000_000)
+        self.backend.status["position"] = 31.5
+        self.assertEqual(self.get("Position"), 31_500_000)
+        self.assertEqual(self.get("Volume"), 0.5)
+        self.assertEqual(self.get("LoopStatus"), "None")
+        self.assertIs(self.get("CanGoNext"), True)
+        self.assertIs(self.get("CanControl"), True)
+        self.assertEqual(self.get("Rate"), 1.0)
+
+    def test_methods_run_backend_commands(self):
+        track = self.GLib.Variant("(ox)", ("/org/omarchy/soundcloud/track/42", 50_000_000))
+        self.call("PlayPause")
+        self.call("Play")
+        self.call("Next")
+        self.call("Previous")
+        self.call("Seek", self.GLib.Variant("(x)", (10_000_000,)))
+        self.call("SetPosition", track)
+        self.assertEqual(self.backend.commands, [
+            "play-pause", "play-pause", "next", "previous", "seek:0.400000", "seek:0.500000"])
+
+    def test_property_writes_run_backend_commands(self):
+        self.set("Volume", self.GLib.Variant("d", 0.8))
+        self.set("LoopStatus", self.GLib.Variant("s", "Track"))
+        self.set("Shuffle", self.GLib.Variant("b", True))
+        self.assertEqual(self.backend.commands, ["volume:0.8000", "repeat:one", "shuffle:on"])
+
+    def test_open_uri_is_an_error(self):
+        with self.assertRaises(self.GLib.Error):
+            self.call("OpenUri", self.GLib.Variant("(s)", ("https://soundcloud.com/a/b",)))
+
+    def test_property_changes_are_emitted_once(self):
+        received = []
+        subscription = self.connection.signal_subscribe(
+            self.name, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+            "/org/mpris/MediaPlayer2", None, self.Gio.DBusSignalFlags.NONE,
+            lambda *args: received.append(args[-1].unpack()))
+        self.addCleanup(self.connection.signal_unsubscribe, subscription)
+        context = self.GLib.MainContext.default()
+
+        def pump(seconds=0.5):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                while context.iteration(False):
+                    pass
+                time.sleep(0.01)
+
+        self.backend.status.update(playbackState="playing", playing=True)
+        self.service.update(self.backend.mpris_status())
+        self.service.update(self.backend.mpris_status())  # identical: no second signal
+        self.backend.status.update(position=77.0)  # position alone is never signalled
+        self.service.update(self.backend.mpris_status())
+        pump()
+
+        self.assertEqual(len(received), 1)
+        interface, changed, _invalidated = received[0]
+        self.assertEqual(interface, "org.mpris.MediaPlayer2.Player")
+        self.assertEqual(changed, {"PlaybackStatus": "Playing"})
+
+    def test_second_owner_of_the_name_is_harmless(self):
+        second = self.private_connection()
+        self.addCleanup(second.close_sync, None)
+        other = self.app.MprisService(
+            self.Gio, self.GLib, self.backend, bus_name=self.name, connection=second)
+        other.start()
+        context = self.GLib.MainContext.default()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            context.iteration(False)
+            time.sleep(0.01)
+
+        self.assertFalse(other.owned)
+        other.update(self.backend.mpris_status())
+        other.stop()
+        self.assertEqual(self.get("PlaybackStatus"), "Paused")
+
+    def test_stop_releases_the_name(self):
+        self.stop_service()
+        self.assertFalse(self.service.owned)
 
 
 if __name__ == "__main__":

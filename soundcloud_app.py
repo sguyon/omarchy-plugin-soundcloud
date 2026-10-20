@@ -3902,6 +3902,168 @@ def mpris_property_commands(name: str, value: object) -> list[str] | None:
     return None
 
 
+class MprisService:
+    """Shows the player on the session bus as an MPRIS player so media keys and playerctl work.
+
+    `backend` provides mpris_status(), mpris_position_ms() and mpris_command(command). Every
+    failure (no bus, name taken) leaves the plugin working without MPRIS. With `connection` (a
+    ready Gio.DBusConnection) the service uses that connection and never GLib's shared session
+    one: tests pass their private bus this way.
+    """
+
+    def __init__(self, Gio, GLib, backend, bus_name: str = MPRIS_BUS_NAME, bus_type=None,
+                 connection=None):
+        self.Gio, self.GLib, self.backend = Gio, GLib, backend
+        self._given_connection = connection
+        self.bus_name = bus_name
+        self.bus_type = bus_type if bus_type is not None else Gio.BusType.SESSION
+        self.owned = False
+        self.connection = None
+        self._owner_id = 0
+        self._registrations: list[int] = []
+        self._last: dict[str, object] | None = None
+        self._nodes = None
+
+    def start(self) -> None:
+        try:
+            self._nodes = self.Gio.DBusNodeInfo.new_for_xml(MPRIS_INTROSPECTION)
+            if self._given_connection is not None:
+                self._bus_acquired(self._given_connection, self.bus_name)
+                self._owner_id = self.Gio.bus_own_name_on_connection(
+                    self._given_connection, self.bus_name, self.Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+                    self._name_acquired, self._name_lost,
+                )
+            else:
+                self._owner_id = self.Gio.bus_own_name(
+                    self.bus_type, self.bus_name, self.Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+                    self._bus_acquired, self._name_acquired, self._name_lost,
+                )
+        except Exception:
+            self._owner_id = 0
+
+    def stop(self) -> None:
+        owner_id, self._owner_id = self._owner_id, 0
+        connection, self.connection = self.connection, None
+        self.owned = False
+        for registration in self._registrations:
+            try:
+                connection.unregister_object(registration)
+            except Exception:
+                pass
+        self._registrations = []
+        if owner_id:
+            try:
+                self.Gio.bus_unown_name(owner_id)
+            except Exception:
+                pass
+
+    def _bus_acquired(self, connection, _name) -> None:
+        try:
+            for interface in self._nodes.interfaces:
+                self._registrations.append(connection.register_object(
+                    MPRIS_OBJECT_PATH, interface,
+                    self._method_call, self._get_property, self._set_property,
+                ))
+            self.connection = connection
+        except Exception:
+            self.connection = None
+
+    def _name_acquired(self, _connection, _name) -> None:
+        self.owned = self.connection is not None
+        if self.owned:
+            try:
+                self._last = mpris_properties(self.backend.mpris_status())
+            except Exception:
+                self._last = None
+
+    def _name_lost(self, _connection, _name) -> None:
+        self.owned = False
+
+    def _variant(self, signature: str, value):
+        return self.GLib.Variant(signature, value)
+
+    def _metadata_variant(self, metadata: Mapping[str, object]):
+        entries = {key: self._variant(MPRIS_METADATA_TYPES[key], value)
+                   for key, value in metadata.items() if key in MPRIS_METADATA_TYPES}
+        return self._variant("a{sv}", entries)
+
+    def _property_variant(self, name: str, value):
+        if name == "Metadata":
+            return self._metadata_variant(value)
+        return self._variant(MPRIS_PLAYER_TYPES[name], value)
+
+    def _get_property(self, _connection, _sender, _path, interface, name):
+        if interface == MPRIS_ROOT_INTERFACE:
+            signature, value = MPRIS_ROOT_PROPERTIES[name]
+            return self._variant(signature, value)
+        if name == "Position":
+            return self._variant("x", mpris_position_us(self.backend.mpris_position_ms() / 1000))
+        if self._last is None:
+            self._last = mpris_properties(self.backend.mpris_status())
+        return self._property_variant(name, self._last[name])
+
+    def _set_property(self, _connection, _sender, _path, interface, name, value) -> bool:
+        if interface != MPRIS_PLAYER_INTERFACE:
+            return False
+        try:
+            commands = mpris_property_commands(name, value.unpack())
+            for command in commands or []:
+                self.backend.mpris_command(command)
+            return commands is not None
+        except Exception:
+            return False
+
+    def _method_call(self, _connection, _sender, _path, interface, method, parameters, invocation) -> None:
+        try:
+            if interface == MPRIS_ROOT_INTERFACE:
+                invocation.return_value(None)  # Raise and Quit do nothing: the plugin has no window to show
+                return
+            args = parameters.unpack() if parameters is not None else ()
+            status = self.backend.mpris_status()
+            commands = mpris_method_commands(method, args, status)
+            if commands is None:
+                invocation.return_dbus_error(
+                    "org.freedesktop.DBus.Error.NotSupported", f"{method} is not supported")
+                return
+            for command in commands:
+                self.backend.mpris_command(command)
+            invocation.return_value(None)
+            if method in ("Seek", "SetPosition") and commands and commands[0].startswith("seek:"):
+                ratio = float(commands[0].partition(":")[2])
+                duration = _finite_number(status.get("duration"), 0, 60 * 60 * 24 * 7) or 0
+                self._emit_seeked(mpris_position_us(ratio * duration))
+        except Exception:
+            try:
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed", "request failed")
+            except Exception:
+                pass
+
+    def _emit_seeked(self, position_us: int) -> None:
+        if self.connection is not None:
+            self.connection.emit_signal(
+                None, MPRIS_OBJECT_PATH, MPRIS_PLAYER_INTERFACE, "Seeked",
+                self._variant("(x)", (position_us,)))
+
+    def update(self, status: Mapping[str, object]) -> None:
+        """Emit PropertiesChanged for what differs from the last emitted values."""
+        if not self.owned or self.connection is None:
+            return
+        try:
+            current = mpris_properties(status)
+            changed = mpris_changed(self._last, current)
+            self._last = current
+            if changed:
+                self.connection.emit_signal(
+                    None, MPRIS_OBJECT_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                    self._variant("(sa{sv}as)", (
+                        MPRIS_PLAYER_INTERFACE,
+                        {name: self._property_variant(name, value) for name, value in changed.items()},
+                        [],
+                    )))
+        except Exception:
+            pass
+
+
 class ClientConnection:
     def __init__(self, connection: socket.socket):
         self.connection = connection
