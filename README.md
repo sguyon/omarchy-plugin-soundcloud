@@ -18,7 +18,11 @@ without official SoundCloud API credentials.
 - Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and
   Shift+Tab switch tabs, Space plays or pauses, Left/Right seek, PageDown or
   Shift+Right next, PageUp or Shift+Left previous, Shift+Up/Down volume, l like,
-  Shift+L repeat, Shift+S shuffle, m mute, Esc close
+  Shift+L repeat, Shift+S shuffle, m mute, q queue, Esc close
+- Queue button (the last stop of the tab row, with a badge counting the tracks still to
+  come): shows the playing track and what follows, each row marked "added by you" when you
+  queued it. Click a row, or select it and press Enter, to play it. Tab and Shift+Tab
+  reach it after History
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
@@ -26,7 +30,7 @@ without official SoundCloud API credentials.
   History also lists what you play here, because SoundCloud does not record it
 - Play any SoundCloud track link from the clipboard with a key binding, with a
   notification naming the track
-- Library link that opens your SoundCloud Library in the browser
+- Library arrow at the end of the tab row that opens your SoundCloud Library in the browser
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 

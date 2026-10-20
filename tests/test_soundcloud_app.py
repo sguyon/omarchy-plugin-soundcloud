@@ -5643,6 +5643,108 @@ class SettingsStatusFieldsTest(unittest.TestCase):
             self.assertNotIn(key, status)
 
 
+class QueueViewTest(unittest.TestCase):
+    """The rows the queue view lists: PlayQueue.view and the edits behind its buttons."""
+
+    def queue(self, count=5, index=0, **options):
+        app = load_module()
+        queue = app.PlayQueue(**options)
+        queue.replace([self.row(n) for n in range(1, count + 1)], index, "home")
+        return queue
+
+    def row(self, number):
+        return PlayQueueTest.row(None, number)
+
+    def test_the_view_orders_played_current_explicit_then_the_rest(self):
+        queue = self.queue(5, index=1)
+        queue.play_next(self.row(5))
+
+        rows, cursor, explicit_count = queue.view()
+
+        self.assertEqual([row["title"] for row in rows],
+                         ["Song 1", "Song 2", "Song 5", "Song 3", "Song 4"])
+        self.assertEqual((cursor, explicit_count), (1, 1))
+        self.assertEqual([row["current"] for row in rows], [False, True, False, False, False])
+        self.assertEqual([row["explicit"] for row in rows], [False, False, True, False, False])
+
+    def test_a_played_explicit_item_stays_marked_explicit(self):
+        queue = self.queue(3)
+        queue.play_next(self.row(3))
+        queue.advance(True)
+
+        rows, cursor, explicit_count = queue.view()
+
+        self.assertEqual([(row["title"], row["explicit"]) for row in rows],
+                         [("Song 1", False), ("Song 3", True), ("Song 2", False)])
+        self.assertEqual((cursor, explicit_count), (1, 0))
+
+    def test_the_view_is_capped_and_keeps_the_current_row_in_it(self):
+        queue = self.queue(100, index=99)
+        for number in range(200, 260):
+            queue.play_next(self.row(number))
+
+        rows, cursor, _count = queue.view(100)
+
+        self.assertEqual(len(rows), 100)
+        self.assertTrue(rows[cursor]["current"])
+
+    def test_an_empty_queue_has_no_current_row(self):
+        rows, cursor, explicit_count = self.queue(0).view()
+
+        self.assertEqual((rows, cursor, explicit_count), ([], -1, 0))
+
+    def test_remove_takes_out_queued_rows_but_never_the_playing_one(self):
+        queue = self.queue(5, index=2)
+        queue.play_next(self.row(1))
+
+        self.assertTrue(queue.remove("soundcloud:tracks:4"))
+        self.assertFalse(queue.remove("soundcloud:tracks:3"))   # playing
+        self.assertFalse(queue.remove("soundcloud:tracks:99"))
+        self.assertFalse(queue.remove(None))
+        self.assertTrue(queue.remove("soundcloud:tracks:1"))    # the earlier row and the queued copy
+
+        self.assertEqual([row["title"] for row in queue.items], ["Song 2", "Song 3", "Song 5"])
+        self.assertEqual((queue.current["title"], queue.explicit), ("Song 3", []))
+
+    def test_remove_before_the_cursor_moves_the_cursor_with_the_current_row(self):
+        queue = self.queue(5, index=3)
+
+        queue.remove("soundcloud:tracks:1")
+        queue.remove("soundcloud:tracks:2")
+
+        self.assertEqual((queue.cursor, queue.current["title"]), (1, "Song 4"))
+
+    def test_clear_keeps_only_the_current_track(self):
+        queue = self.queue(5, index=2)
+        queue.play_next(self.row(5))
+
+        queue.clear()
+
+        self.assertEqual([row["title"] for row in queue.items], ["Song 3"])
+        self.assertEqual((queue.cursor, queue.explicit, queue.can_next), (0, [], False))
+        empty = self.queue(0)
+        empty.clear()
+        self.assertEqual((empty.items, empty.current), ([], None))
+
+    def test_the_explicit_flag_survives_a_save_and_load(self):
+        app = load_module()
+        queue = self.queue(3, index=0)
+        queue.play_next(self.row(7))
+
+        loaded = app.PlayQueue.from_dict(queue.to_dict(1000))
+
+        self.assertEqual(loaded.items, queue.items)
+        self.assertEqual(loaded.explicit, queue.explicit)
+        self.assertIs(loaded.explicit[0]["explicit"], True)
+
+    def test_a_stored_current_flag_is_ignored(self):
+        app = load_module()
+        queue = app.PlayQueue()
+        queue.replace([{**self.row(1), "current": True}], 0)
+
+        self.assertNotIn("current", queue.items[0])
+
+
 class BarWidgetTest(unittest.TestCase):
     def test_runtime_commands_use_one_persistent_socket(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
@@ -5753,12 +5855,22 @@ class BarWidgetTest(unittest.TestCase):
     def test_library_link_opens_the_soundcloud_library_in_the_browser_apart_from_the_tabs(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertLess(qml.index('text: "History"'), qml.index('text: "Library'))
+        self.assertLess(qml.index('text: "History"'), qml.index('tooltipText: "Open your Library'))
         self.assertIn(
             'Quickshell.execDetached(["omarchy", "launch", "browser", "https://soundcloud.com/you/library"])',
             qml,
         )
         self.assertNotIn("selectTab(\"library\")", qml)
+
+    def test_queue_button_follows_the_tabs_and_opens_a_view_that_reads_the_queue(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertLess(qml.index('text: "History"'), qml.index('text: "Queue"'))
+        self.assertIn("onClicked: root.toggleQueue()", qml)
+        self.assertIn('sendCommand("queue", "queue")', qml)
+        self.assertIn("visible: root.running && root.loggedIn && root.queueOpen", qml)
+        self.assertIn("SoundCloudModel.queuePlayCommand(item.playbackId)", qml)
+        self.assertIn('text === "q"', qml)
 
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
@@ -5770,7 +5882,7 @@ class BarWidgetTest(unittest.TestCase):
     def test_popup_has_larger_scrollable_home_and_feed_browser(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
-        self.assertIn("Style.space(408)", qml)
+        self.assertIn("Style.space(456)", qml)
         self.assertIn("Style.space(480)", qml)
         self.assertIn('text: "Home"', qml)
         self.assertIn('text: "Feed"', qml)

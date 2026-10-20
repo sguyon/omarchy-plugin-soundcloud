@@ -46,6 +46,16 @@ BarWidget {
   // When the last seek went out (Left/Right follow the website: max(5, n)
   // seconds, one per 200 ms).
   property double lastSeekAt: 0
+  // The queue view replaces the track list below the tabs; queueData is the
+  // last `queue` response ({cursor, items, explicit_count}).
+  property bool queueOpen: false
+  property var queueData: ({})
+  property bool queueRequestPending: false
+  property bool queueStale: false
+  // Keyboard selection in the queue view, by track id so it follows a row that
+  // moves ("" = none).
+  property string queueSelectedId: ""
+  readonly property var queueRows: SoundCloudModel.upcomingQueue(queueData)
   property int activeSelectionRequestId: 0
   property string selectedTab: "home"
   property var tracks: []
@@ -124,17 +134,30 @@ BarWidget {
 
   function close() {
     popupOpen = false
+    queueOpen = false
     selectedRow = -1
+    queueSelectedId = ""
   }
 
   // Keyboard actions (see PanelKeyCatcher below).
   function moveSelectedRow(delta) {
+    if (queueOpen) {
+      queueSelectedId = SoundCloudModel.queueSelectionAfterMove(queueRows, queueSelectedId, delta)
+      var at = SoundCloudModel.queueIndexOf(queueRows, queueSelectedId)
+      if (at >= 0) queueList.positionViewAtIndex(at, ListView.Contain)
+      return
+    }
     selectedRow = SoundCloudModel.moveSelection(selectedRow, delta, tracks.length)
     if (selectedRow >= 0) trackList.positionViewAtIndex(selectedRow, ListView.Contain)
   }
 
-  // Enter plays the selected row from its list, like a click on it.
+  // Enter plays the selected row from its list or from the queue, like a click on it.
   function playSelectedRow() {
+    if (queueOpen) {
+      var queued = queueRows[SoundCloudModel.queueIndexOf(queueRows, queueSelectedId)]
+      if (queued && queued.current !== true) sendUi(SoundCloudModel.queuePlayCommand(queued.playbackId))
+      return
+    }
     var track = tracks[selectedRow]
     if (!track) return
     var command = SoundCloudModel.playFromCommand(selectedTab, track.playbackId)
@@ -242,6 +265,7 @@ BarWidget {
 
   function selectTab(tab) {
     selectedTab = tab
+    queueOpen = false
     selectedRow = -1
     tracks = tracksFor(tab)
     tracksLoading = true
@@ -333,10 +357,34 @@ BarWidget {
     likeBusy = sendCommand((liked ? "unlike:" : "like:") + playbackId, "like") > 0
   }
 
-  // Fire-and-forget commands (volume). The answer only matters when it fails;
+  // Fire-and-forget commands (volume, queue). The answer only matters when it fails;
   // state comes back through the status.
   function sendUi(command) {
     return command !== "" && sendCommand(command, "ui") > 0
+  }
+
+  // Tab and Shift+Tab: the four tabs, then Queue as the fifth stop.
+  function selectStop(stop) {
+    if (stop === "queue") {
+      if (!queueOpen) toggleQueue()
+    } else {
+      selectTab(stop)
+    }
+  }
+
+  function toggleQueue() {
+    queueOpen = !queueOpen
+    if (queueOpen) refreshQueue()
+  }
+
+  function refreshQueue() {
+    if (!queueOpen || !backendConnected) return
+    if (queueRequestPending) {
+      queueStale = true
+      return
+    }
+    queueStale = false
+    queueRequestPending = sendCommand("queue", "queue") > 0
   }
 
   // One call per volume step (VolumeControl adds the wheel events up into
@@ -411,6 +459,7 @@ BarWidget {
     socketBuffer = ""
     pendingRequests = ({})
     tracksRequestPending = false
+    queueRequestPending = false
     homeLoadMorePending = false
     feedLoadMorePending = false
     likesLoadMorePending = false
@@ -599,6 +648,15 @@ BarWidget {
       likeBusy = false
       if (message.ok !== true) lastError = String(message.error || "SoundCloud could not update this like")
       else if (SoundCloudModel.isCurrentTrack(message.playbackId, root.playbackId)) liked = message.liked === true
+    } else if (kind === "queue") {
+      queueRequestPending = false
+      if (message.ok !== false && message.queue) queueData = message.queue
+      else if (message.ok === false) lastError = String(message.error || "SoundCloud could not read the queue")
+      queueSelectedId = SoundCloudModel.queueSelectionAfterUpdate(queueRows, queueSelectedId)
+      if (queueStale) refreshQueue()
+    } else if (kind === "ui") {
+      if (message.ok !== true || message.error) lastError = String(message.error || "SoundCloud action failed")
+      else uiRefreshTimer.restart()
     } else if (kind === "action") {
       actionBusy = false
       if (message.ok !== true) lastError = String(message.error || "SoundCloud action failed")
@@ -635,6 +693,8 @@ BarWidget {
   }
 
   onBackendConnectedChanged: initializeConnection()
+  onQueueCursorChanged: refreshQueue()
+  onQueueLengthChanged: refreshQueue()
 
   visible: true
   implicitWidth: row.implicitWidth + Style.space(14)
@@ -682,7 +742,7 @@ BarWidget {
     owner: root
     open: root.popupOpen
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(408))
+    contentWidth: popup.fittedContentWidth(Style.space(456))
     contentHeight: popup.fittedContentHeight(Style.space(480))
 
     // KeyboardPanel catches clicks on the whole screen and hands a bar click on
@@ -703,9 +763,10 @@ BarWidget {
       }
     }
 
-    // Keys: Esc closes, Up/Down (or j/k) move the selection, Enter plays it,
-    // Tab/Shift+Tab switch tabs, Space plays or pauses, Left/Right seek (5 s,
-    // longer while held), m mutes. AppKeys adds PageDown/Shift+Right next,
+    // Keys: Esc closes, Up/Down (or j/k) move the selection (in the list or the
+    // queue), Enter plays it, Tab/Shift+Tab switch tabs and Queue, Space plays or
+    // pauses, Left/Right seek (5 s, longer while held), q the queue, m mutes.
+    // AppKeys adds PageDown/Shift+Right next,
     // PageUp/Shift+Left previous, Shift+Up/Down volume, l like, Shift+L repeat
     // and Shift+S shuffle. j/k stay list keys (Omarchy), so unlike the website
     // they do not skip tracks. The content sits inside the key
@@ -728,10 +789,15 @@ BarWidget {
         else if (root.running && root.loggedIn && root.hasTrack) root.runAction("play-pause")
       }
       onTabRequested: function(direction) {
-        if (root.running && root.loggedIn) root.selectTab(SoundCloudModel.cycleTab(root.selectedTab, direction))
+        if (root.running && root.loggedIn) root.selectStop(SoundCloudModel.cycleTab(
+          SoundCloudModel.currentStop(root.selectedTab, root.queueOpen), direction))
       }
       onTextKey: function(text) {
-        if (text === "m" || text === "M") root.sendUi("mute")
+        if (text === "q" || text === "Q") {
+          if (root.running && root.loggedIn) root.toggleQueue()
+        } else if (text === "m" || text === "M") {
+          root.sendUi("mute")
+        }
       }
 
     AppKeys {
@@ -1052,10 +1118,11 @@ BarWidget {
           spacing: Style.space(8)
 
           Button {
+            id: homeTab
             text: "Home"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: root.selectedTab === "home"
+            selected: !root.queueOpen && root.selectedTab === "home"
             onClicked: root.selectTab("home")
           }
 
@@ -1063,7 +1130,7 @@ BarWidget {
             text: "Feed"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: root.selectedTab === "feed"
+            selected: !root.queueOpen && root.selectedTab === "feed"
             onClicked: root.selectTab("feed")
           }
 
@@ -1071,7 +1138,7 @@ BarWidget {
             text: "Likes"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: root.selectedTab === "likes"
+            selected: !root.queueOpen && root.selectedTab === "likes"
             onClicked: root.selectTab("likes")
           }
 
@@ -1079,17 +1146,99 @@ BarWidget {
             text: "History"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: root.selectedTab === "history"
+            selected: !root.queueOpen && root.selectedTab === "history"
             onClicked: root.selectTab("history")
           }
         }
 
-        // Opens SoundCloud's Library in the browser, so it sits apart from the in-popup tabs.
+        // Queue is a tab-like stop behind a divider: while its view is open it is the
+        // only selected item. The badge shows how many tracks are still to come. The
+        // divider has the same gap on both sides (the tab spacing) and is shorter
+        // than a tab.
+        Row {
+          anchors.left: tabRow.right
+          anchors.leftMargin: tabRow.spacing
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: tabRow.spacing
+
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.max(1, Style.space(1))
+            height: Math.round(homeTab.implicitHeight * 0.5)
+            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.28)
+          }
+
+          Button {
+            id: queueButton
+            // Glyphs are drawn centred on the whole line box, a pixel above the label's
+            // x-height centre: nudge them down to line up with the text.
+            readonly property real iconNudge: Math.max(1, Math.round(Style.space(1)))
+            foreground: root.bar.foreground
+            selected: root.queueOpen
+            // Same height and padding as a text tab (its own row is empty, the
+            // content below is drawn over it); the width only fits the content.
+            implicitHeight: homeTab.implicitHeight
+            implicitWidth: queueContent.implicitWidth + horizontalPadding * 2
+              + _reservedBorderLeft + _reservedBorderRight
+            onClicked: root.toggleQueue()
+
+            Row {
+              id: queueContent
+              anchors.centerIn: parent
+              spacing: Style.spacing.controlGap
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenterOffset: queueButton.iconNudge
+                textFormat: Text.PlainText
+                text: "󰐑"
+                color: queueButton.selected ? queueButton._selectedColor : root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "Queue"
+                color: queueButton.selected ? queueButton._selectedColor : root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: queueButton.selected
+              }
+
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenterOffset: queueButton.iconNudge
+                visible: queueBadge.text !== ""
+                width: Math.max(height, queueBadge.implicitWidth + Style.space(8))
+                height: queueBadge.implicitHeight + Style.space(2)
+                radius: height / 2
+                color: Color.accent
+
+                Text {
+                  id: queueBadge
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: SoundCloudModel.queueBadgeText(SoundCloudModel.upcomingCount(root.queueLength, root.queueCursor))
+                  color: root.bar.background
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+        }
+
+        // Opens SoundCloud's Library in the browser, so it sits apart from the in-popup
+        // tabs. Only the arrow, to leave room for the Queue button.
         Button {
           anchors.right: parent.right
           anchors.rightMargin: Style.space(6)
-          text: "Library ↗"
+          anchors.verticalCenter: parent.verticalCenter
+          text: "↗"
           foreground: root.bar.foreground
+          tooltipText: "Open your Library on SoundCloud"
           onClicked: {
             Quickshell.execDetached(["omarchy", "launch", "browser", "https://soundcloud.com/you/library"])
             root.close()
@@ -1101,7 +1250,7 @@ BarWidget {
         width: parent.width
         height: Math.max(0, parent.height - y - (errorText.visible
           ? errorText.implicitHeight + parent.spacing : 0))
-        visible: root.running && root.loggedIn
+        visible: root.running && root.loggedIn && !root.queueOpen
 
         ListView {
           id: trackList
@@ -1305,6 +1454,172 @@ BarWidget {
         }
       }
 
+      // The queue replaces the track list; the tabs above stay in place.
+      Item {
+        id: queueView
+        width: parent.width
+        height: Math.max(0, parent.height - y - (errorText.visible
+          ? errorText.implicitHeight + parent.spacing : 0))
+        visible: root.running && root.loggedIn && root.queueOpen
+
+        // One slim row: how many tracks follow.
+        Item {
+          id: queueHeader
+          width: parent.width
+          height: queueCount.implicitHeight + Style.space(8)
+
+          Text {
+            id: queueCount
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: SoundCloudModel.queueCountText(root.queueRows)
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        ListView {
+          id: queueList
+          anchors.top: queueHeader.bottom
+          anchors.topMargin: Style.space(4)
+          anchors.bottom: parent.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(6)
+          clip: true
+          spacing: Style.space(3)
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.queueRows
+
+          delegate: Item {
+            required property var modelData
+            width: queueList.width
+            height: Style.space(40)
+            property var item: modelData
+            property bool isCurrent: item.current === true
+            property string artworkId: String(item.artworkId || "")
+            property string itemArtDataUrl: String(root.trackArtworkData[artworkId] || "")
+
+            Component.onCompleted: root.requestTrackArtwork(artworkId)
+            onArtworkIdChanged: root.requestTrackArtwork(artworkId)
+
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.spacing.labelGap
+              color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+              visible: queueRowMouse.enabled && queueRowMouse.containsMouse
+            }
+
+            Rectangle {
+              anchors.right: queueArtwork.left
+              anchors.rightMargin: Style.space(3)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(3)
+              height: Style.space(30)
+              radius: width / 2
+              color: Color.accent
+              visible: isCurrent
+            }
+
+            // Keyboard selection.
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.spacing.labelGap
+              color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+              border.width: 1
+              border.color: Color.accent
+              visible: String(item.playbackId || "") === root.queueSelectedId && root.queueSelectedId !== ""
+            }
+
+            // Clicking a row plays it (the playing row has nothing to play).
+            MouseArea {
+              id: queueRowMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              enabled: !isCurrent
+              onClicked: root.sendUi(SoundCloudModel.queuePlayCommand(item.playbackId))
+            }
+
+            BorderSurface {
+              id: queueArtwork
+              width: Style.space(36)
+              height: Style.space(36)
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              radius: Style.spacing.labelGap
+              color: Style.normalFillFor(root.bar.foreground, Color.accent)
+              borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+
+              Image {
+                anchors.fill: parent
+                anchors.margins: Style.space(2)
+                fillMode: Image.PreserveAspectCrop
+                asynchronous: true
+                sourceSize.width: 80
+                sourceSize.height: 80
+                source: itemArtDataUrl
+                visible: itemArtDataUrl !== ""
+              }
+
+              Text {
+                anchors.centerIn: parent
+                visible: itemArtDataUrl === ""
+                textFormat: Text.PlainText
+                text: "󰐑"
+                color: root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+            }
+
+            Column {
+              anchors.left: queueArtwork.right
+              anchors.leftMargin: Style.space(9)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              Text {
+                width: parent.width
+                text: item.title || "Untitled"
+                textFormat: Text.PlainText
+                color: isCurrent ? Color.accent : root.bar.foreground
+                font.bold: isCurrent
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                text: SoundCloudModel.queueRowLabel(item) || String(item.artist || "")
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+          }
+        }
+
+        Text {
+          anchors.centerIn: queueList
+          visible: queueList.count === 0
+          textFormat: Text.PlainText
+          text: "The queue is empty"
+          color: root.dim
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.body
+        }
+      }
+
       Text {
         width: parent.width
         visible: root.running && !root.loggedIn
@@ -1363,6 +1678,16 @@ BarWidget {
     interval: 100
     repeat: false
     onTriggered: root.refreshTracks()
+  }
+
+  // After a volume or queue command, read back the state it changed.
+  Timer {
+    id: uiRefreshTimer
+    interval: 150
+    onTriggered: {
+      root.sendCommand("status", "status")
+      root.refreshQueue()
+    }
   }
 
   Timer {

@@ -96,8 +96,9 @@ function selectionAfterUpdate(index, count, reset) {
   return reset === true ? -1 : clampSelection(index, count)
 }
 
-// Tab and Shift+Tab walk the four tabs in order and wrap around.
-var tabStops = ["home", "feed", "likes", "history"]
+// Tab and Shift+Tab walk the four tabs and then Queue (the fifth stop, at the
+// right end of the tab row) in order and wrap around.
+var tabStops = ["home", "feed", "likes", "history", "queue"]
 
 function cycleTab(tab, direction, tabs) {
   var list = Array.isArray(tabs) && tabs.length > 0 ? tabs : tabStops
@@ -105,6 +106,28 @@ function cycleTab(tab, direction, tabs) {
   if (at < 0) return list[0]
   var step = Number(direction) < 0 ? -1 : 1
   return list[(at + step + list.length) % list.length]
+}
+
+// The stop that looks selected: Queue while its view is open, else the tab.
+function currentStop(selectedTab, queueOpen) {
+  return queueOpen === true ? "queue" : selectedTab
+}
+
+// The tracks still to come: the badge on the Queue button counts these (the same
+// number as "N next" in the queue view), not the whole queue with the tracks
+// that already played.
+function upcomingCount(length, cursor) {
+  var total = Math.max(0, Math.floor(Number(length) || 0))
+  var at = Math.floor(Number(cursor))
+  if (!Number.isFinite(at) || at < 0) return total
+  return Math.max(0, total - at - 1)
+}
+
+// Count badge on the Queue button: empty (hidden) at 0, "99+" from 100.
+function queueBadgeText(length) {
+  var count = Math.max(0, Math.floor(Number(length) || 0))
+  if (count === 0) return ""
+  return count > 99 ? "99+" : String(count)
 }
 
 function isCurrentSelectionResponse(activeRequestId, responseId) {
@@ -256,6 +279,73 @@ function repeatMode(value) {
   return value === "one" || value === "all" ? value : "none"
 }
 
+var trackIdPattern = /^soundcloud:tracks:[1-9][0-9]*$/
+
+// Commands for one track by id; "" if the id is not a track id.
+function queuePlayCommand(playbackId) {
+  return trackIdPattern.test(String(playbackId || "")) ? "queue-play:" + playbackId : ""
+}
+
+function queueRemoveCommand(playbackId) {
+  return trackIdPattern.test(String(playbackId || "")) ? "queue-remove:" + playbackId : ""
+}
+
+// The small label under a queue row.
+function queueRowLabel(item) {
+  item = item || {}
+  if (item.current === true) return "playing now"
+  if (item.explicit === true) return "added by you"
+  return ""
+}
+
+// What the queue view lists: the current track and everything after it.
+function upcomingQueue(queue) {
+  var items = queue && Array.isArray(queue.items) ? queue.items : []
+  var start = 0
+  for (var index = 0; index < items.length; index++) {
+    if (items[index] && items[index].current === true) { start = index; break }
+  }
+  return items.slice(start)
+}
+
+function queueIndexOf(items, playbackId) {
+  var list = Array.isArray(items) ? items : []
+  for (var index = 0; index < list.length; index++) {
+    if (list[index] && String(list[index].playbackId || "") === String(playbackId || "") && playbackId) return index
+  }
+  return -1
+}
+
+// Keyboard selection in the queue view is kept by track id, so it follows a row
+// that moves. Up/Down walk the rows and stop at the ends; the first move from
+// "nothing selected" lands on the first row after the playing one (or the playing
+// one if it is alone).
+function queueSelectionAfterMove(items, selectedId, delta) {
+  var list = Array.isArray(items) ? items : []
+  if (list.length === 0) return ""
+  var at = queueIndexOf(list, selectedId)
+  var next
+  if (at < 0) {
+    next = list.length > 1 ? 1 : 0
+    if (Number(delta) < 0) next = list.length - 1
+  } else {
+    next = Math.max(0, Math.min(list.length - 1, at + Math.sign(Number(delta) || 0)))
+  }
+  return String(list[next].playbackId || "")
+}
+
+// The selection is dropped when its track left the queue.
+function queueSelectionAfterUpdate(items, selectedId) {
+  return queueIndexOf(items, selectedId) >= 0 ? String(selectedId) : ""
+}
+
+// The dim text on the queue toolbar: how many tracks follow the playing one.
+function queueCountText(items) {
+  var list = Array.isArray(items) ? items : []
+  var following = list.length - (list.length > 0 && list[0] && list[0].current === true ? 1 : 0)
+  return following > 0 ? following + " next" : "Empty"
+}
+
 // Next and Previous follow the queue; an older backend that does not report it keeps them on.
 function queueButtonEnabled(actionBusy, hasTrack, allowed) {
   return actionBusy !== true && hasTrack === true && allowed !== false
@@ -385,6 +475,9 @@ if (typeof module !== "undefined") {
     moveSelection: moveSelection,
     selectionAfterUpdate: selectionAfterUpdate,
     cycleTab: cycleTab,
+    currentStop: currentStop,
+    queueBadgeText: queueBadgeText,
+    upcomingCount: upcomingCount,
     isCurrentSelectionResponse: isCurrentSelectionResponse,
     isCurrentTrack: isCurrentTrack,
     errorShownOnRow: errorShownOnRow,
@@ -407,6 +500,14 @@ if (typeof module !== "undefined") {
     sliderDisplayValue: sliderDisplayValue,
     volumeSetCommand: volumeSetCommand,
     repeatMode: repeatMode,
+    queuePlayCommand: queuePlayCommand,
+    queueRemoveCommand: queueRemoveCommand,
+    queueRowLabel: queueRowLabel,
+    upcomingQueue: upcomingQueue,
+    queueIndexOf: queueIndexOf,
+    queueCountText: queueCountText,
+    queueSelectionAfterMove: queueSelectionAfterMove,
+    queueSelectionAfterUpdate: queueSelectionAfterUpdate,
     queueButtonEnabled: queueButtonEnabled,
     barIconColor: barIconColor,
     seekRepeatCount: seekRepeatCount,

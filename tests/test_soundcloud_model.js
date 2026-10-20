@@ -95,12 +95,29 @@ assert.equal(model.selectionAfterUpdate(3, 20, false), 3);
 assert.equal(model.selectionAfterUpdate(3, 2, false), 1);
 assert.equal(model.selectionAfterUpdate(3, 20, true), -1);
 
-// Tab cycling wraps both ways through the four tabs; an unknown tab starts at the first.
+// Tab cycling wraps both ways through the four tabs and Queue; an unknown tab starts at the first.
 assert.equal(model.cycleTab("home", 1), "feed");
-assert.equal(model.cycleTab("history", 1), "home");
-assert.equal(model.cycleTab("home", -1), "history");
+assert.equal(model.cycleTab("history", 1), "queue");
+assert.equal(model.cycleTab("queue", 1), "home");
+assert.equal(model.cycleTab("home", -1), "queue");
+assert.equal(model.cycleTab("queue", -1), "history");
 assert.equal(model.cycleTab("likes", -1), "feed");
 assert.equal(model.cycleTab("nope", 1), "home");
+assert.equal(model.currentStop("likes", false), "likes");
+assert.equal(model.currentStop("likes", true), "queue");
+
+// Queue count badge: hidden at 0 or junk, capped at 99+.
+assert.equal(model.queueBadgeText(0), "");
+assert.equal(model.queueBadgeText(undefined), "");
+assert.equal(model.queueBadgeText(-3), "");
+// the badge counts the tracks still to come, not the whole queue
+for (const [length, cursor, want] of [[24, 21, 2], [24, 23, 0], [24, 0, 23], [5, -1, 5], [0, 0, 0], [3, 9, 0], [undefined, undefined, 0]]) {
+  assert.equal(model.upcomingCount(length, cursor), want, `upcomingCount(${length}, ${cursor})`);
+}
+assert.equal(model.queueBadgeText(12), "12");
+assert.equal(model.queueBadgeText("7"), "7");
+assert.equal(model.queueBadgeText(99), "99");
+assert.equal(model.queueBadgeText(100), "99+");
 
 assert.equal(model.isCurrentTrack("soundcloud:tracks:9", "soundcloud:tracks:9"), true);
 assert.equal(model.isCurrentTrack("soundcloud:tracks:8", "soundcloud:tracks:9"), false);
@@ -214,6 +231,44 @@ assert.equal(model.steppedVolume(undefined, -120), 0.95);
 // Repeat mode: anything but one or all means off.
 assert.equal(model.repeatMode("one"), "one");
 assert.equal(model.repeatMode("bogus"), "none");
+
+// Queue commands take real track ids only.
+const t1 = "soundcloud:tracks:1", t2 = "soundcloud:tracks:2", t3 = "soundcloud:tracks:3";
+assert.equal(model.queuePlayCommand(t2), "queue-play:" + t2);
+assert.equal(model.queueRemoveCommand("soundcloud:tracks:7"), "queue-remove:soundcloud:tracks:7");
+for (const bad of ["", "7", "soundcloud:tracks:0", undefined, "queue-clear"]) {
+  assert.equal(model.queuePlayCommand(bad), "");
+  assert.equal(model.queueRemoveCommand(bad), "");
+}
+
+// Queue rows: label by origin; the view starts at the current track.
+assert.equal(model.queueRowLabel({ current: true, explicit: true }), "playing now");
+assert.equal(model.queueRowLabel({ explicit: true }), "added by you");
+assert.equal(model.queueRowLabel({}), "");
+assert.equal(model.queueRowLabel(undefined), "");
+const queue = { items: [{ id: "a" }, { id: "b", current: true }, { id: "c" }] };
+assert.deepEqual(model.upcomingQueue(queue).map((item) => item.id), ["b", "c"]);
+assert.deepEqual(model.upcomingQueue({ items: [{ id: "a" }] }).map((item) => item.id), ["a"]);
+assert.deepEqual(model.upcomingQueue(undefined), []);
+
+// Keyboard selection in the queue view follows the track id.
+const rows = [{ playbackId: t1, current: true }, { playbackId: t2 }, { playbackId: t3 }];
+assert.equal(model.queueCountText(rows), "2 next");
+assert.equal(model.queueCountText([rows[0]]), "Empty");
+assert.equal(model.queueCountText([rows[1], rows[2]]), "2 next");
+assert.equal(model.queueCountText([]), "Empty");
+assert.equal(model.queueIndexOf(rows, t3), 2);
+assert.equal(model.queueIndexOf(rows, ""), -1);
+assert.equal(model.queueSelectionAfterMove(rows, "", 1), t2);
+assert.equal(model.queueSelectionAfterMove(rows, "", -1), t3);
+assert.equal(model.queueSelectionAfterMove(rows, t2, 1), t3);
+assert.equal(model.queueSelectionAfterMove(rows, t3, 1), t3);
+assert.equal(model.queueSelectionAfterMove(rows, t2, -1), t1);
+assert.equal(model.queueSelectionAfterMove(rows, t1, -1), t1);
+assert.equal(model.queueSelectionAfterMove([rows[0]], "", 1), t1);
+assert.equal(model.queueSelectionAfterMove([], "", 1), "");
+assert.equal(model.queueSelectionAfterUpdate(rows, t2), t2);
+assert.equal(model.queueSelectionAfterUpdate([rows[0]], t2), "");
 
 // A track clicked in a list plays from that list; a new click replaces a pending one.
 assert.equal(
