@@ -37,6 +37,9 @@ BarWidget {
   // Return emits returnRequested and then activateRequested; Space only the
   // latter. This flag tells the two apart.
   property bool returnHeld: false
+  // When the last seek went out (Left/Right follow the website: max(5, n)
+  // seconds, one per 200 ms).
+  property double lastSeekAt: 0
   property int activeSelectionRequestId: 0
   property string selectedTab: "home"
   property var tracks: []
@@ -129,6 +132,18 @@ BarWidget {
     var track = tracks[selectedRow]
     if (!track || !/^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))) return
     runAction("play", track.playbackId)
+  }
+
+  // direction is -1 or +1; seekKeys (below) counts the key repeats.
+  function seekKey(direction) {
+    if (!running || !loggedIn || !hasTrack) return
+    var now = Date.now()
+    if (!SoundCloudModel.seekDue(now, lastSeekAt)) return
+    lastSeekAt = now
+    var seconds = SoundCloudModel.seekSeconds(direction, seekKeys.repeats)
+    position = SoundCloudModel.seekedPosition(position, seconds, duration)
+    optimisticPositionAt = now
+    sendUi(SoundCloudModel.seekByCommand(seconds))
   }
 
   // Shortcuts from AppKeys (volume, like); the mapping is SoundCloudModel.keyAction.
@@ -667,17 +682,20 @@ BarWidget {
     }
 
     // Keys: Esc closes, Up/Down (or j/k) move the selection, Enter plays it,
-    // Tab/Shift+Tab switch tabs, Space plays or pauses, m mutes. AppKeys adds
+    // Tab/Shift+Tab switch tabs, Space plays or pauses, Left/Right seek (5 s,
+    // longer while held), m mutes. AppKeys adds
     // Shift+Up/Down volume and l like. j/k stay list keys (Omarchy), so unlike
     // the website they do not skip tracks. The content sits inside the key
     // catcher, so the catcher sees the keys first.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      Keys.forwardTo: [appKeys]
+      // Forwarded keys reach seekKeys first, which counts the repeats.
+      Keys.forwardTo: [appKeys, seekKeys]
       onCloseRequested: root.close()
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveSelectedRow(dy)
+        else if (dx !== 0) root.seekKey(dx)
       }
       onReturnRequested: root.returnHeld = true
       onActivateRequested: {
@@ -697,6 +715,8 @@ BarWidget {
       id: appKeys
       onTriggered: function(action) { root.appKey(action) }
     }
+
+    SeekKeys { id: seekKeys }
 
     Column {
       id: content

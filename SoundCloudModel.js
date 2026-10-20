@@ -275,6 +275,44 @@ function actionRepeats(action) {
   return action === "volume-up" || action === "volume-down"
 }
 
+// Left and Right seek like the website: a step is max(5, n) seconds where n counts
+// the key-repeat events since the key went down (a fresh press resets it, only the
+// seek keys count), and at most one seek goes out every 200 ms. The backend command
+// `seek-by:<signed seconds>` clamps to the track.
+var seekMinSeconds = 5
+var seekIntervalMs = 200
+
+function seekRepeatCount(previous, isAutoRepeat) {
+  var count = Math.max(0, Math.floor(Number(previous) || 0))
+  return isAutoRepeat === true ? count + 1 : 0
+}
+
+function seekSeconds(direction, repeats) {
+  var sign = Number(direction) < 0 ? -1 : (Number(direction) > 0 ? 1 : 0)
+  var count = Math.max(0, Math.floor(Number(repeats) || 0))
+  return sign * Math.max(seekMinSeconds, count)
+}
+
+// True when enough time has passed since the last seek that went out; a clock that
+// moved backwards also counts as due.
+function seekDue(now, lastAt) {
+  var last = Number(lastAt)
+  if (lastAt === undefined || lastAt === null || !Number.isFinite(last)) return true
+  var elapsed = Number(now) - last
+  return !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= seekIntervalMs
+}
+
+function seekByCommand(seconds) {
+  var value = Math.round(Number(seconds))
+  if (!Number.isFinite(value) || value === 0) return ""
+  return "seek-by:" + value
+}
+
+// Keys that seek: Left and Right only (h and l are no longer aliases: l likes).
+function isSeekKey(key) {
+  return key === 0x01000012 || key === 0x01000014
+}
+
 // A status position that arrives within `windowMs` of an optimistic position
 // (set by a seek) is older than the seek and is ignored.
 var optimisticPositionMs = 500
@@ -338,6 +376,11 @@ if (typeof module !== "undefined") {
     sliderDisplayValue: sliderDisplayValue,
     volumeSetCommand: volumeSetCommand,
     barIconColor: barIconColor,
+    seekRepeatCount: seekRepeatCount,
+    seekSeconds: seekSeconds,
+    seekDue: seekDue,
+    seekByCommand: seekByCommand,
+    isSeekKey: isSeekKey,
     keyAction: keyAction,
     actionRepeats: actionRepeats,
     positionFromStatus: positionFromStatus,

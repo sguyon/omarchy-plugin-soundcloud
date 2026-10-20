@@ -211,6 +211,46 @@ assert.equal(model.steppedVolume(0.02, -120), 0);
 assert.equal(model.steppedVolume(0.3, 0), 0.3);
 assert.equal(model.steppedVolume(undefined, -120), 0.95);
 
+// Seek keys: max(5, n) seconds, at most one seek per 200 ms.
+assert.equal(model.seekRepeatCount(0, false), 0);
+assert.equal(model.seekRepeatCount(7, false), 0);
+assert.equal(model.seekRepeatCount(0, true), 1);
+assert.equal(model.seekRepeatCount(4, true), 5);
+assert.equal(model.seekRepeatCount(undefined, true), 1);
+assert.equal(model.seekSeconds(1, 0), 5);
+assert.equal(model.seekSeconds(-1, 3), -5);
+assert.equal(model.seekSeconds(1, 5), 5);
+assert.equal(model.seekSeconds(1, 6), 6);
+assert.equal(model.seekSeconds(-1, 12), -12);
+assert.equal(model.seekSeconds(0, 12), 0);
+assert.equal(model.seekSeconds(1, undefined), 5);
+// One seek per 200 ms; the first one and a clock that went back are always due.
+assert.equal(model.seekDue(1000, undefined), true);
+assert.equal(model.seekDue(1000, null), true);
+assert.equal(model.seekDue(1000, 0), true);
+assert.equal(model.seekDue(1199, 1000), false);
+assert.equal(model.seekDue(1200, 1000), true);
+assert.equal(model.seekDue(900, 1000), true);
+assert.equal(model.seekDue(NaN, 1000), true);
+assert.equal(model.seekByCommand(5), "seek-by:5");
+assert.equal(model.seekByCommand(-12), "seek-by:-12");
+assert.equal(model.seekByCommand(0), "");
+assert.equal(model.seekByCommand("x"), "");
+assert.equal(model.isSeekKey(0x01000012), true);
+assert.equal(model.isSeekKey(0x01000014), true);
+assert.equal(model.isSeekKey(0x4c), false); // l likes now
+assert.equal(model.isSeekKey(0x48), false);
+assert.equal(model.isSeekKey(0x01000013), false);
+assert.equal(model.isSeekKey(0x4a), false);
+// A held key: presses at 50 ms (autorepeat) go out every 200 ms with a growing step.
+{
+  let count = 0, last, sent = [];
+  for (let at = 0; at <= 1000; at += 50) {
+    count = model.seekRepeatCount(count, at > 0);
+    if (model.seekDue(at, last)) { sent.push(model.seekSeconds(1, count)); last = at; }
+  }
+  assert.deepEqual(sent, [5, 5, 8, 12, 16, 20]);
+}
 // Keys handled before the key catcher.
 const SH = 0x02000000, CT = 0x04000000, AL = 0x08000000;
 assert.equal(model.keyAction(0x01000013, SH, ""), "volume-up");
