@@ -1603,6 +1603,132 @@ class FakeSoundCloudApi:
             raise OSError("like request failed with HTTP 403")
 
 
+class StatusSplitTest(unittest.TestCase):
+    PAGE = {
+        "playerPresent": True, "playing": False, "title": "Page title", "artist": "",
+        "artUrl": "", "loggedIn": True, "url": "https://soundcloud.com/feed",
+        "duration": 0, "position": 0,
+    }
+
+    def gst_status(self, **overrides):
+        return {
+            "playerPresent": True, "playbackState": "playing", "playing": True,
+            "playbackId": "soundcloud:tracks:5", "title": "Song", "artist": "Band",
+            "artUrl": "", "duration": 200.0, "position": 12.5, "waveform": [10, 20],
+            **overrides,
+        }
+
+    def cache(self, app, **payload):
+        cache = app.PageStatusCache(lambda script, callback: None, "script")
+        cache.update({**self.PAGE, **payload})
+        return cache
+
+    def test_merged_status_keeps_the_keys_the_widget_receives(self):
+        app = load_module()
+        gst = self.gst_status()
+
+        merged = app.validate_status_payload(app.merge_status(self.cache(app).values, gst))
+        before = app.validate_status_payload({**self.PAGE, **gst})
+
+        self.assertEqual(set(merged), set(before))
+        self.assertEqual(merged["title"], "Song")
+        self.assertEqual(merged["position"], 12.5)
+        self.assertEqual(merged["waveform"], [10, 20])
+        self.assertTrue(merged["loggedIn"])
+        self.assertEqual(merged["url"], "https://soundcloud.com/feed")
+
+    def test_idle_status_comes_from_the_cache_without_page_metadata(self):
+        app = load_module()
+        idle = self.gst_status(
+            playerPresent=False, playbackState="idle", playing=False, playbackId="",
+            title="", artist="", duration=0.0, position=0.0, waveform=[],
+        )
+
+        merged = app.validate_status_payload(app.merge_status(self.cache(app).values, idle))
+
+        self.assertEqual(merged["playbackState"], "idle")
+        self.assertEqual(merged["title"], "")
+        self.assertTrue(merged["loggedIn"])
+        self.assertTrue(merged["playerPresent"])
+        self.assertNotIn("error", merged)
+
+    def test_page_error_keeps_the_previous_cache_values(self):
+        app = load_module()
+        cache = self.cache(app)
+
+        changed = cache.update({"error": "refusing untrusted page"})
+        merged = app.validate_status_payload(app.merge_status(cache.values, self.gst_status()))
+
+        self.assertFalse(changed)
+        self.assertTrue(merged["loggedIn"])
+        self.assertEqual(merged["url"], "https://soundcloud.com/feed")
+        self.assertEqual(merged["error"], "refusing untrusted page")
+        self.assertEqual(merged["title"], "Song")
+
+    def test_playback_error_wins_over_the_page_error(self):
+        app = load_module()
+        cache = self.cache(app)
+        cache.update({"error": "refusing untrusted page"})
+
+        merged = app.merge_status(cache.values, self.gst_status(error="Stream failed"))
+
+        self.assertEqual(merged["error"], "Stream failed")
+
+    def test_update_reports_only_login_and_url_changes(self):
+        app = load_module()
+        cache = self.cache(app)
+
+        self.assertFalse(cache.update({**self.PAGE, "position": 30, "title": "Other"}))
+        self.assertTrue(cache.update({**self.PAGE, "url": "https://soundcloud.com/discover"}))
+        self.assertTrue(cache.update({**self.PAGE, "loggedIn": False}))
+        self.assertEqual(cache.values["error"], "")
+
+    def test_slow_page_never_blocks_the_fast_status(self):
+        app = load_module()
+        asked = []
+        cache = app.PageStatusCache(lambda script, callback: asked.append(callback), "script")
+        positions = iter([1.0, 1.5, 2.0])
+
+        cache.poll()
+        cache.poll()
+        statuses = [
+            app.merge_status(cache.values, self.gst_status(position=next(positions)))
+            for _ in range(3)
+        ]
+
+        self.assertEqual(len(asked), 1)
+        self.assertEqual([status["position"] for status in statuses], [1.0, 1.5, 2.0])
+        self.assertFalse(statuses[0]["loggedIn"])
+        asked[0](self.PAGE)
+        cache.poll()
+        self.assertEqual(len(asked), 2)
+
+    def test_first_publish_carries_login_once_the_cache_is_seeded(self):
+        app = load_module()
+        seen = []
+        cache = app.PageStatusCache(lambda script, callback: callback(self.PAGE), "script")
+        self.assertFalse(cache.seeded)
+
+        cache.poll(lambda changed: seen.append(
+            (changed, app.merge_status(cache.values, self.gst_status())["loggedIn"])
+        ))
+
+        self.assertTrue(cache.seeded)
+        self.assertEqual(seen, [(True, True)])
+
+    def test_every_caller_waiting_on_a_pending_poll_is_told(self):
+        app = load_module()
+        asked = []
+        cache = app.PageStatusCache(lambda script, callback: asked.append(callback), "script")
+        seen = []
+
+        cache.poll(seen.append)
+        cache.poll(seen.append)
+        asked[0](self.PAGE)
+
+        self.assertEqual(seen, [True, True])
+
+
 def like_item(track_id, **overrides):
     track = {
         "id": track_id,

@@ -72,6 +72,8 @@ HLS_MAX_WORKERS = 2
 HLS_OPERATION_SECONDS = 45.0
 ARTWORK_HOSTS = {"i1.sndcdn.com"}
 MAX_WAVEFORM_BARS = 200
+STATUS_INTERVAL_MS = 500
+PAGE_STATUS_INTERVAL_SECONDS = 3
 # SoundCloud's bot protection (DataDome) shows its captcha in an iframe from here.
 BOT_CHECK_HOSTS = {"geo.captcha-delivery.com"}
 SOUNDCLOUD_WEB_HOSTS = {
@@ -1457,6 +1459,69 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
     }
 
 
+def merge_status(page_cache: dict[str, object], gst_status: dict[str, object]) -> dict[str, object]:
+    # Playback fields come from GStreamer; only the page knows login and URL.
+    merged = dict(gst_status)
+    merged["loggedIn"] = page_cache.get("loggedIn") is True
+    merged["url"] = page_cache.get("url", "")
+    merged["playerPresent"] = (
+        gst_status.get("playerPresent") is True or page_cache.get("playerPresent") is True
+    )
+    error = gst_status.get("error") or page_cache.get("error")
+    if error:
+        merged["error"] = error
+    return merged
+
+
+class PageStatusCache:
+    """Slow-changing facts from the hidden page, polled so the fast status tick never waits."""
+
+    def __init__(self, evaluate, script: str):
+        self.evaluate = evaluate
+        self.script = script
+        self.values: dict[str, object] = {
+            "loggedIn": False, "url": "", "playerPresent": False, "error": "",
+        }
+        self.seeded = False
+        self.waiting: list = []
+        self.pending = False
+
+    def update(self, payload: object) -> bool:
+        """Store a page answer. Returns True when loggedIn or url changed."""
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("error"):
+            # Keep the previous values; the page may only be navigating
+            self.values["error"] = str(payload["error"])[:100]
+            return False
+        before = (self.values["loggedIn"], self.values["url"])
+        url = payload.get("url")
+        self.values.update({
+            "loggedIn": payload.get("loggedIn") is True,
+            "url": url if isinstance(url, str) else "",
+            "playerPresent": payload.get("playerPresent") is True,
+            "error": "",
+        })
+        self.seeded = True
+        return before != (self.values["loggedIn"], self.values["url"])
+
+    def poll(self, callback=None) -> None:
+        if callback:
+            self.waiting.append(callback)
+        if self.pending:
+            return
+        self.pending = True
+
+        def finished(payload):
+            self.pending = False
+            changed = self.update(payload)
+            waiting, self.waiting = self.waiting, []
+            for notify in waiting:
+                notify(changed)
+
+        self.evaluate(self.script, finished)
+
+
 def validate_waveform(value: object) -> list[int]:
     if not isinstance(value, list) or len(value) > MAX_WAVEFORM_BARS:
         return []
@@ -2804,7 +2869,8 @@ def build_application(show_on_start: bool = False):
             self.window = None
             self.webview = None
             self.status_subscribers = StatusSubscribers()
-            self.status_evaluation_pending = False
+            self.page_status = PageStatusCache(self._evaluate, status_script())
+            self.status_hold_until = 0.0
             self.artwork_cache = ArtworkCache()
             self.playback = GstPlayback(
                 Gst,
@@ -2855,7 +2921,8 @@ def build_application(show_on_start: bool = False):
             self._create_window()
             self.hold()
             self.control_server.start()
-            GLib.timeout_add(750, self._publish_status)
+            GLib.timeout_add(STATUS_INTERVAL_MS, self._publish_status)
+            GLib.timeout_add_seconds(PAGE_STATUS_INTERVAL_SECONDS, self._poll_page_status)
             GLib.timeout_add_seconds(5, self._check_installation)
             if show_on_start:
                 self.show_login()
@@ -3238,9 +3305,6 @@ def build_application(show_on_start: bool = False):
             GLib.idle_add(self._publish_status_once)
 
         def _secure_status(self, payload):
-            if self.playback.state != "idle":
-                base = payload if isinstance(payload, dict) else {}
-                payload = {**base, **self.playback.status()}
             state = validate_status_payload(payload)
             if state is None:
                 return {}
@@ -3289,17 +3353,25 @@ def build_application(show_on_start: bool = False):
             self._publish_status()
             return False
 
+        def build_status(self):
+            return self._secure_status(
+                merge_status(self.page_status.values, self.playback.status())
+            )
+
         def _publish_status(self):
-            if not self.status_subscribers or self.status_evaluation_pending:
+            if not self.status_subscribers:
                 return True
-            self.status_evaluation_pending = True
+            if not self.page_status.seeded and time.monotonic() < self.status_hold_until:
+                # The first publish waits briefly for the page so it carries loggedIn
+                return True
+            self.status_subscribers.publish({"running": True, **self.build_status()})
+            return True
 
-            def finished(payload):
-                self.status_evaluation_pending = False
-                state = self._secure_status(payload)
-                self.status_subscribers.publish({"running": True, **state})
-
-            self._evaluate(status_script(), finished)
+        def _poll_page_status(self):
+            if self.status_subscribers:
+                self.page_status.poll(
+                    lambda changed: self._publish_status_once() if changed else None
+                )
             return True
 
         def _resolution_timed_out(self, generation):
@@ -3320,20 +3392,23 @@ def build_application(show_on_start: bool = False):
         def _handle_command(self, command, connection, request_id):
             command = normalize_backend_command(command)
             if command == "status":
-                self._evaluate(
-                    status_script(),
-                    lambda payload: self._respond(
-                        connection,
-                        request_id,
-                        {"ok": True, "running": True, **self._secure_status(payload)},
-                    ),
+                self.page_status.poll()
+                self._respond(
+                    connection,
+                    request_id,
+                    {"ok": True, "running": True, **self.build_status()},
                 )
             elif command == "subscribe":
                 self.status_subscribers.add(connection)
                 self.had_subscriber = True
                 self.disconnect_generation += 1
                 self._respond(connection, request_id, {"ok": True, "running": True})
-                GLib.idle_add(self._publish_status_once)
+                if self.page_status.seeded:
+                    GLib.idle_add(self._publish_status_once)
+                    self._poll_page_status()
+                else:
+                    self.status_hold_until = time.monotonic() + 2.0
+                    self.page_status.poll(lambda _changed: self._publish_status_once())
             elif (source := api_list_source_from_command(command, "tracks:")) is not None:
                 # These lists are fetched here, but playing one needs the request context the
                 # page only records on Home and Feed, so keep the page on one of them.
