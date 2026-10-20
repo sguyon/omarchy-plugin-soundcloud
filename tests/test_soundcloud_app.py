@@ -2771,6 +2771,124 @@ class PlayQueueTest(unittest.TestCase):
             self.assertEqual(queue.advance(True)["title"], "Song 7")
             self.assertFalse(queue.can_next)
 
+    def test_added_rows_interact_with_the_list_and_other_queue_operations(self):
+        with self.subTest('added rows survive a new list and come after it'):
+            queue = self.queue(3)
+            queue.add_last(self.row(20))
+
+            queue.replace([self.row(30), self.row(31)], 0, "feed")
+
+            self.assertEqual(self.titles(queue.added), ["Song 20"])
+            self.assertEqual([queue.advance(True)["title"] for _ in range(2)], ["Song 31", "Song 20"])
+        with self.subTest('added rows play before repeat all wraps'):
+            queue = self.queue(2, repeat="all")
+            queue.add_last(self.row(20))
+
+            order = [queue.advance(True)["title"] for _ in range(3)]
+
+            self.assertEqual(order, ["Song 2", "Song 20", "Song 1"])
+        with self.subTest('play next takes over a row that was added'):
+            queue = self.queue(2)
+            queue.add_last(self.row(20))
+
+            queue.play_next(self.row(20))
+
+            self.assertEqual((self.titles(queue.explicit), queue.added), (["Song 20"], []))
+        with self.subTest('remove clear and mark dead also reach added rows'):
+            queue = self.queue(3)
+            for number in (20, 21, 22):
+                queue.add_last(self.row(number))
+
+            self.assertTrue(queue.remove("soundcloud:tracks:20"))
+            queue.mark_dead("https://soundcloud.com/artist/song-21")
+            self.assertEqual(self.titles(queue.added), ["Song 22"])
+            queue.clear()
+
+            self.assertEqual((queue.added, self.titles(queue.items)), ([], ["Song 1"]))
+        with self.subTest('view lists added rows last and marks them'):
+            queue = self.queue(3)
+            queue.play_next(self.row(10))
+            queue.add_last(self.row(20))
+
+            rows, cursor, explicit = queue.view()
+
+            self.assertEqual(self.ids(rows), ["1", "10", "2", "3", "20"])
+            self.assertEqual((cursor, explicit), (0, 1))
+            self.assertEqual([(row["explicit"], row["added"]) for row in rows],
+                             [(False, False), (True, False), (False, False), (False, False), (True, True)])
+
+    def test_jump_to_rules(self):
+        with self.subTest('jump to moves the cursor inside the list without reordering'):
+            queue = self.queue(4)
+
+            self.assertEqual(queue.jump_to("soundcloud:tracks:3")["title"], "Song 3")
+            self.assertEqual(queue.jump_to("https://soundcloud.com/artist/song-1")["title"], "Song 1")
+
+            self.assertEqual((self.ids(queue.items), queue.cursor), (["1", "2", "3", "4"], 0))
+            self.assertIsNone(queue.jump_to("soundcloud:tracks:99"))
+            self.assertIsNone(queue.jump_to(""))
+            self.assertIsNone(queue.jump_to(None))
+            self.assertIsNone(queue.jump_to(7))
+        with self.subTest('jump to a waiting row enters the list after the cursor'):
+            queue = self.queue(4, index=1)
+            queue.play_next(self.row(10))
+            queue.add_last(self.row(20))
+
+            self.assertEqual(queue.jump_to("soundcloud:tracks:20")["title"], "Song 20")
+            self.assertEqual(self.ids(queue.items), ["1", "2", "20", "3", "4"])
+            self.assertEqual((queue.cursor, self.titles(queue.explicit), queue.added), (2, ["Song 10"], []))
+        with self.subTest('jump to a row also waiting in the list does not play it twice'):
+            queue = self.queue(4)
+            queue.play_next(self.row(3))
+
+            queue.jump_to("soundcloud:tracks:3")
+
+            self.assertEqual((self.ids(queue.items), queue.cursor, queue.explicit), (["1", "3", "2", "4"], 1, []))
+
+    def test_move_rules(self):
+        with self.subTest('move reorders inside a group and clamps'):
+            queue = self.queue(5)
+            for number in (10, 11, 12):
+                queue.play_next(self.row(number))
+            for number in (20, 21):
+                queue.add_last(self.row(number))
+
+            self.assertTrue(queue.move("soundcloud:tracks:12", -1))
+            self.assertTrue(queue.move("soundcloud:tracks:10", 99))
+            self.assertTrue(queue.move("soundcloud:tracks:21", -99))
+            self.assertTrue(queue.move("soundcloud:tracks:3", 1))
+            self.assertTrue(queue.move("soundcloud:tracks:5", -99))
+            self.assertTrue(queue.move("soundcloud:tracks:2", 0))
+
+            self.assertEqual(self.ids(queue.explicit), ["12", "11", "10"])
+            self.assertEqual(self.ids(queue.added), ["21", "20"])
+            self.assertEqual(self.ids(queue.items), ["1", "5", "2", "4", "3"])
+            self.assertEqual(queue.cursor, 0)
+        with self.subTest('move counts places the way the view shows them'):
+            queue = self.queue(5)
+            queue.play_next(self.row(3))  # hidden from the list part of the view
+            rows, _cursor, _count = queue.view()
+            self.assertEqual(self.ids(rows), ["1", "3", "2", "4", "5"])
+
+            queue.move("soundcloud:tracks:2", 1)
+
+            rows, _cursor, _count = queue.view()
+            self.assertEqual(self.ids(rows), ["1", "3", "4", "2", "5"])
+        with self.subTest('move refuses the playing row played rows and bad input'):
+            queue = self.queue(4, index=1)
+            before = self.ids(queue.items)
+
+            self.assertFalse(queue.move("soundcloud:tracks:2", 1))   # playing
+            self.assertFalse(queue.move("soundcloud:tracks:1", 1))   # played
+            self.assertFalse(queue.move("soundcloud:tracks:99", 1))
+            self.assertFalse(queue.move("", 1))
+            self.assertFalse(queue.move(None, 1))
+            self.assertFalse(queue.move("soundcloud:tracks:3", "1"))
+            self.assertFalse(queue.move("soundcloud:tracks:3", 1.5))
+            self.assertFalse(queue.move("soundcloud:tracks:3", True))
+
+            self.assertEqual((self.ids(queue.items), queue.cursor), (before, 1))
+
 class TrackLikesTest(unittest.TestCase):
     def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
         app = load_module()
@@ -3857,6 +3975,22 @@ class GstVolumeTest(unittest.TestCase):
         player.toggle_mute()
 
         self.assertEqual(player.volume_status(), {"volume": 0.2, "muted": True})
+
+
+class TrackFlagsTest(unittest.TestCase):
+    def test_the_row_validator_keeps_the_flags_only_when_true(self):
+        app = load_module()
+        base = PlayQueueTest.row(None, 1)
+
+        kept = app.validate_tracks_payload({"tracks": [
+            {**base, "encrypted": True, "auto": True, "explicit": True, "added": True, "current": True}]})["tracks"][0]
+        dropped = app.validate_tracks_payload({"tracks": [
+            {**base, "encrypted": "yes", "auto": 1, "explicit": False, "added": 0, "current": None}]})["tracks"][0]
+
+        for flag in ("encrypted", "auto", "explicit", "added", "current"):
+            self.assertIs(kept[flag], True)
+            self.assertNotIn(flag, dropped)
+        self.assertEqual(dropped, app.validate_tracks_payload({"tracks": [base]})["tracks"][0])
 
 
 class SettingsStatusFieldsTest(unittest.TestCase):

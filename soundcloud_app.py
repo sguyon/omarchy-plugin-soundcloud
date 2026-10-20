@@ -59,6 +59,8 @@ API_TRACK_LISTS = {
     "history": "/me/play-history/tracks",
 }
 MAX_PLAY_COUNT = 10**12
+# Optional boolean keys of a track row: only present when true.
+TRACK_FLAGS = ("encrypted", "auto", "explicit", "added", "current")
 MAX_TRACK_DURATION_MS = 7 * 24 * 60 * 60 * 1000
 MAX_ARTWORK_BYTES = 131072
 MAX_ARTWORK_PIXELS = 1024 * 1024
@@ -888,6 +890,119 @@ class PlayQueue:
             return False
         self._added.append({**clean[0], "explicit": True, "added": True})
         return True
+
+    def _upcoming_list_positions(self) -> list[int]:
+        """Positions in the list of the rows shown after the "play next" ones."""
+        pending = {row["url"] for row in self._explicit}
+        return [n for n in range(self._cursor + 1, len(self._items))
+                if self._items[n]["url"] not in pending]
+
+    def jump_to(self, track_id: object) -> dict[str, object] | None:
+        """Put the cursor on a queued track, by playback id or URL, and return it to play.
+
+        A row from the list, played or not, just takes the cursor. A "play next" or "add to
+        queue" row joins the list right after the cursor, as it does when it comes up."""
+        if not isinstance(track_id, str) or not track_id:
+            return None
+
+        def wanted(row):
+            return track_id in (row.get("playbackId"), row.get("url"))
+
+        for waiting in (self._explicit, self._added):
+            for position, row in enumerate(waiting):
+                if wanted(row):
+                    del waiting[position]
+                    self._enter(row)
+                    return self.current
+        for position, row in enumerate(self._items):
+            if wanted(row):
+                self._cursor = position
+                return self.current
+        return None
+
+    def move(self, track_id: object, offset: object) -> bool:
+        """Move a queued row up (negative) or down by `offset` places inside its group, stopping
+        at the group's ends. The groups are the "play next" rows, the list rows still to come
+        and the "add to queue" rows. The playing and already played rows can't move."""
+        if (not isinstance(track_id, str) or not track_id
+                or isinstance(offset, bool) or not isinstance(offset, int)):
+            return False
+
+        def wanted(row):
+            return track_id in (row.get("playbackId"), row.get("url"))
+
+        for group in (self._explicit, self._added):
+            for position, row in enumerate(group):
+                if wanted(row):
+                    group.insert(max(0, min(position + offset, len(group) - 1)), group.pop(position))
+                    return True
+        slots = self._upcoming_list_positions()
+        for place, position in enumerate(slots):
+            if wanted(self._items[position]):
+                target = slots[max(0, min(place + offset, len(slots) - 1))]
+                self._items.insert(target, self._items.pop(position))
+                return True
+        return False
+
+    def view(self, limit: int = MAX_TRACKS) -> tuple[list[dict[str, object]], int, int]:
+        """The rows to show as (rows, cursor, explicit count): what was played and the current
+        track, then the "play next" items, then the rest of the list. Each row says if it is
+        `explicit`, `auto` or `current`; the cursor is the current row's index (-1 if none)."""
+        current = self._cursor if 0 <= self._cursor < len(self._items) else -1
+        pending = {row["url"] for row in self._explicit}
+        rows = [dict(row) for row in self._items[:current + 1]]
+        for row in rows:
+            row["explicit"] = row.get("explicit") is True
+            row["auto"] = row.get("auto") is True
+            row["current"] = False
+        if rows:
+            rows[-1]["current"] = True
+        rows += [{**row, "explicit": True, "auto": False, "current": False} for row in self._explicit]
+        rows += [
+            {**row, "explicit": row.get("explicit") is True, "auto": row.get("auto") is True,
+             "current": False}
+            for row in self._items[current + 1:] if row["url"] not in pending
+        ]
+        rows += [{**row, "explicit": True, "added": True, "auto": False, "current": False}
+                 for row in self._added]
+        for row in rows:
+            row["added"] = row.get("added") is True
+        if len(rows) > limit:
+            start = max(0, min(current - 10, len(rows) - limit))
+            rows, current = rows[start:start + limit], current - start
+        return rows, current if current >= 0 else -1, len(self._explicit)
+
+    def remove(self, track_id: object) -> bool:
+        """Take a queued track out, by playback id. The playing track can't be removed."""
+        if not isinstance(track_id, str) or not track_id:
+            return False
+
+        def wanted(row):
+            return track_id in (row.get("playbackId"), row.get("url"))
+
+        removed = len(self._explicit) + len(self._added)
+        self._explicit = [row for row in self._explicit if not wanted(row)]
+        self._added = [row for row in self._added if not wanted(row)]
+        removed -= len(self._explicit) + len(self._added)
+        keep = []
+        cursor = self._cursor
+        for position, row in enumerate(self._items):
+            if position != cursor and wanted(row):
+                removed += 1
+                if position < cursor:
+                    self._cursor -= 1
+            else:
+                keep.append(row)
+        self._items = keep
+        return removed > 0
+
+    def clear(self) -> None:
+        """Keep only the current track, as the website's clear does."""
+        current = self.current
+        self._items = [current] if current is not None else []
+        self._explicit = []
+        self._added = []
+        self._cursor = 0
 
     def _step(self, automatic: bool) -> dict[str, object] | None:
         """Move to the next track and return it, or return None and stay."""
@@ -1866,6 +1981,8 @@ def validate_tracks_payload(payload: object) -> dict[str, object] | None:
                     item.get("durationMs"), 0, MAX_TRACK_DURATION_MS
                 ),
                 **({"playedAt": played_at} if played_at else {}),
+                # optional flags, kept only when true
+                **{flag: True for flag in TRACK_FLAGS if item.get(flag) is True},
             }
         )
     return {"tracks": tracks}
