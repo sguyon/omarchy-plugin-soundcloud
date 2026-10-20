@@ -2693,6 +2693,17 @@ class PlayQueueTest(unittest.TestCase):
             self.assertEqual(queue.advance(True)["title"], "Song 10")
             self.assertEqual(queue.advance(True)["title"], "Song 21")
 
+    def test_step_back_from_goes_before_the_given_track_whatever_the_cursor_is(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n) for n in range(1, 5)], 3, "likes")
+
+        self.assertEqual(queue.step_back_from(self.row(3)["url"])["playbackId"], self.row(2)["playbackId"])
+        self.assertEqual(queue.cursor, 1)
+        self.assertEqual(queue.step_back_from(self.row(1)["url"])["playbackId"], self.row(1)["playbackId"])
+        self.assertEqual(queue.cursor, 0)
+        self.assertIsNone(queue.step_back_from("https://soundcloud.com/nobody/nothing"))
+        self.assertIsNone(load_module().PlayQueue().step_back_from("x"))
+
     def test_previous_rules(self):
         with self.subTest('previous restarts after the threshold and goes back before it'):
             app = load_module()
@@ -5517,6 +5528,22 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual((len(self.evaluated), self.application.playback.state), (started, "error"))
         self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
 
+    def test_earbud_gestures_skip_tracks_that_cant_play(self):
+        self.gesture(start=2, count=5)
+        rows = self.application.queue.items
+        rows[2]["encrypted"] = True
+        self.app_gesture("next")
+        self.assertEqual(self.started_id(), "4")
+
+        rows[1]["encrypted"] = True
+        self.resolve()
+        self.app_gesture("previous")
+        self.assertEqual(self.started_id(), "1")
+
+    def app_gesture(self, kind):
+        self.application.mpris_gesture(kind, True, self.application.queue.current["url"])
+        self.glib.run_idle()
+
     # MPRIS keeps the track on show after an error
 
     def test_mpris_keeps_title_and_artist_when_the_track_errors(self):
@@ -5630,6 +5657,181 @@ class QueuePlaybackTest(unittest.TestCase):
         def return_value(self, _value): self.result = "ok"
         def return_dbus_error(self, name, _message): self.result = name
 
+    def gesture(self, start=3, count=5, playing=True, settings=None):
+        """A queue of `count` tracks playing (or paused) on track `start`, and a service on a fake clock."""
+        self.build(settings=settings)
+        self.fill("home", count)
+        self.command(f"play-from:home:soundcloud:tracks:{start}")
+        self.resolve()
+        if not playing:
+            self.application.playback.toggle()
+            self.settle()
+        self.now = 50.0
+        self.service = self.app.MprisService(None, None, self.application, bus_type=0, clock=lambda: self.now)
+
+    def settle(self):
+        """Deliver the bus message that follows a play/pause change, as GStreamer would."""
+        player = self.application.playback
+        if player.current is not None and player.current.states \
+                and player.current.states[-1] in (self.gst.State.PLAYING, self.gst.State.PAUSED):
+            deliver(player, "state", player.current.states[-1])
+
+    def press(self, method="PlayPause", after=0.2):
+        self.now += after
+        invocation = self.Invocation()
+        self.service._method_call(None, None, None, "org.mpris.MediaPlayer2.Player",
+                                  method, None, invocation)
+        self.assertEqual(invocation.result, "ok")
+        self.settle()
+
+    def current_id(self):
+        return self.application.queue.current["playbackId"].rpartition(":")[2]
+
+    def test_double_and_triple_presses_skip_and_keep_the_play_state(self):
+        with self.subTest('a double press while playing pauses then skips and keeps playing'):
+            self.gesture()
+            self.press("Pause", 0)
+            self.assertEqual(self.application.playback.state, "paused")  # the trade-off: an instant toggle
+
+            self.press("Play")
+            self.assertEqual((self.current_id(), self.started_id()), ("4", "4"))
+            self.resolve()
+
+            self.assertEqual(self.application.playback.state, "playing")
+        with self.subTest('a double press while paused skips and plays the next track'):
+            self.gesture(playing=False)
+            self.press("Play", 0)
+            self.assertEqual(self.application.playback.state, "playing")
+
+            self.press("Pause")
+            self.resolve()
+
+            self.assertEqual((self.current_id(), self.started_id()), ("4", "4"))
+            self.assertEqual(self.application.playback.state, "playing")
+        with self.subTest('a triple press goes to the track before the original one'):
+            self.gesture()
+            self.press("Pause", 0)
+            self.press("Play")
+            self.resolve()
+            self.press("Pause")
+
+            self.assertEqual(self.current_id(), "2")  # before track 3, not before track 4
+            self.assertEqual(self.started_id(), "2")
+            self.resolve()
+            self.assertEqual(self.application.playback.state, "playing")
+            self.assertEqual(self.application.queue.length, 5)
+        with self.subTest('a triple press while paused plays the earlier track'):
+            self.gesture(playing=False)
+            for method in ("Play", "Pause", "Play"):
+                self.press(method)
+            self.resolve()
+
+            self.assertEqual((self.current_id(), self.started_id()), ("2", "2"))
+            self.assertEqual(self.application.playback.state, "playing")
+
+    def test_the_third_press_supersedes_a_start_still_resolving(self):
+        self.gesture()
+        self.press("Pause", 0)
+        self.press("Play")  # track 4 is resolving and never finishes
+        stale = self.evaluated[-1]
+        self.press("Pause")
+        self.resolve()
+        stale[1](True)  # the old page answer arrives late
+
+        self.assertEqual((self.current_id(), self.application.playback.state), ("2", "playing"))
+        self.assertEqual(self.application.playback.metadata["playbackId"], "soundcloud:tracks:2")
+
+    def test_further_presses_do_nothing(self):
+        self.gesture()
+        for _ in range(3):
+            self.press()
+        self.resolve()
+        started = len(self.evaluated)
+
+        self.press()
+        self.press()
+
+        self.assertEqual((len(self.evaluated), self.current_id()), (started, "2"))
+        self.assertEqual(self.application.playback.state, "playing")
+
+    def test_slow_presses_are_plain_toggles(self):
+        self.gesture()
+        self.press("PlayPause", 0)
+        self.assertEqual(self.application.playback.state, "paused")
+        self.press("PlayPause", 2.0)
+        self.assertEqual(self.application.playback.state, "playing")
+        self.assertEqual(self.current_id(), "3")
+
+    def test_multi_press_with_no_track_to_go_to_changes_nothing(self):
+        with self.subTest('the last track has no next and the music is left as it was'):
+            self.gesture(start=5)
+            self.press("Pause", 0)
+            self.press("Play")
+
+            self.assertEqual((self.current_id(), self.application.playback.state), ("5", "playing"))
+        with self.subTest('a one track queue never skips'):
+            self.gesture(start=1, count=1)
+            for method in ("Pause", "Play"):
+                self.press(method)
+            self.assertEqual(self.current_id(), "1")
+            self.assertEqual(self.application.playback.state, "playing")
+            self.press("Pause")  # the third press restarts the only track, still playing
+            self.assertEqual((self.current_id(), self.application.playback.state), ("1", "playing"))
+            self.assertEqual(self.application.playback.current.seeks[-1], 0)
+        with self.subTest('an empty queue does not crash'):
+            self.build()
+            self.now = 50.0
+            self.service = self.app.MprisService(None, None, self.application, bus_type=0, clock=lambda: self.now)
+            for method in ("Play", "Pause", "Play", "Pause"):
+                self.press(method)
+            # Each toggle (and the restore after a skip with nothing to skip to) only asks the page to
+            # play or pause; the queue stays empty and nothing starts.
+            self.assertEqual((len(self.evaluated), self.application.queue.length), (3, 0))
+
+    def test_a_failed_resolve_after_the_skip_is_handled_by_the_usual_path(self):
+        self.gesture()
+        self.press("Pause", 0)
+        self.press("Play")
+        self.resolve(ok=False)
+
+        self.assertEqual(self.application.playback.state, "error")
+        self.assertEqual(self.current_id(), "4")
+
+    def test_next_and_previous_over_dbus_keep_their_meaning(self):
+        self.gesture()
+        self.press("Next", 0)
+        self.assertEqual(self.current_id(), "4")
+        self.press("Previous")
+        self.assertEqual(self.current_id(), "3")
+        self.press("Next")
+        self.press("Next")
+        self.assertEqual(self.current_id(), "5")
+
+    def test_the_setting_off_makes_play_and_pause_plain_toggles(self):
+        self.gesture()
+        self.assertTrue(self.command("multipress:off").reply["ok"])
+        self.assertIs(self.application.build_status()["multiPress"], False)
+        self.press("Pause", 0)
+        self.press("Play")
+
+        self.assertEqual((self.current_id(), self.application.playback.state), ("3", "playing"))
+
+    def test_the_setting_is_a_command_a_status_key_and_saved(self):
+        self.build()
+        self.assertIs(self.application.build_status()["multiPress"], True)
+        self.assertFalse(self.command("multipress:maybe").reply["ok"])
+        self.assertIs(self.command("multipress:off").reply["multiPress"], False)
+        self.glib.run_idle()
+        self.assertIs(self.saved_settings()["multiPress"], False)
+        self.assertIs(self.application.autoplay, True)
+        self.command("multipress:on")
+        self.assertIs(self.application.multipress, True)
+
+    def test_saved_multi_press_off_is_restored(self):
+        self.build(settings={"v": 1, "volume": 1.0, "muted": False, "autoplay": True,
+                             "notify": True, "multiPress": False})
+        self.assertIs(self.application.build_status()["multiPress"], False)
+
 
 class CheckResultTest(unittest.TestCase):
     def test_dependency_check_is_machine_readable(self):
@@ -5729,7 +5931,8 @@ class SettingsCommandParsingTest(unittest.TestCase):
 
 
 class SettingsStoreTest(unittest.TestCase):
-    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True}
+    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True,
+                "multiPress": True}
 
     def store(self, content=None):
         app = load_module()
@@ -5762,9 +5965,11 @@ class SettingsStoreTest(unittest.TestCase):
     def test_settings_round_trip_privately(self):
         _app, store, path = self.store()
 
-        store.save({"v": 1, "volume": 0.35, "muted": True, "autoplay": False})
+        store.save({"v": 1, "volume": 0.35, "muted": True, "autoplay": False,
+                    "multiPress": False})
 
-        self.assertEqual(store.load(), {"v": 1, "volume": 0.35, "muted": True, "autoplay": False})
+        self.assertEqual(store.load(), {
+            "v": 1, "volume": 0.35, "muted": True, "autoplay": False, "multiPress": False})
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_only_the_known_keys_are_kept_so_a_new_setting_is_added_on_purpose(self):
@@ -5772,8 +5977,9 @@ class SettingsStoreTest(unittest.TestCase):
 
         store.save({"v": 1, "volume": 0.5, "muted": False, "autoplay": True, "somethingNew": True})
 
-        self.assertEqual(store.load(), {"v": 1, "volume": 0.5, "muted": False, "autoplay": True})
-        self.assertEqual(set(app.DEFAULT_SETTINGS), {"v", "volume", "muted", "autoplay"})
+        self.assertEqual(store.load(), {
+            "v": 1, "volume": 0.5, "muted": False, "autoplay": True, "multiPress": True})
+        self.assertEqual(set(app.DEFAULT_SETTINGS), {"v", "volume", "muted", "autoplay", "multiPress"})
 
 
 class GstVolumeTest(unittest.TestCase):
@@ -5931,6 +6137,13 @@ class SettingsStatusFieldsTest(unittest.TestCase):
             self.assertNotIn(key, status)
         self.assertEqual(status["trackUrl"], "")
         self.assertNotIn("volume", app.validate_status_payload({**self.BASE, "volume": float("nan")}))
+
+    def test_multi_press_passes_only_as_a_bool(self):
+        app = load_module()
+
+        self.assertIs(app.validate_status_payload({**self.BASE, "multiPress": False})["multiPress"], False)
+        self.assertNotIn("multiPress", app.validate_status_payload({**self.BASE, "multiPress": 1}))
+        self.assertNotIn("multiPress", app.validate_status_payload(self.BASE))
 
     def test_a_payload_without_the_new_keys_is_unchanged(self):
         app = load_module()
@@ -6595,6 +6808,72 @@ class MprisCommandMappingTest(unittest.TestCase):
     def test_unknown_method_is_none(self):
         self.assertIsNone(self.commands("Explode"))
         self.assertIsNone(self.commands("OpenUri", "https://soundcloud.com/a/b"))
+
+
+class MultiPressTest(unittest.TestCase):
+    def setUp(self):
+        self.app = load_module()
+        self.now = 100.0
+        self.machine = self.app.MultiPress(window=0.7, clock=lambda: self.now)
+
+    def press(self, after=0.0, playing=True, origin="a"):
+        self.now += after
+        return self.machine.press(playing, origin)
+
+    def test_a_single_press_toggles(self):
+        action = self.press()
+        self.assertEqual((action.kind, action.playing_before, action.origin), ("toggle", True, "a"))
+
+    def test_a_double_press_is_next_and_remembers_the_state_from_before_the_first(self):
+        self.press(playing=False, origin="a")
+        action = self.press(0.3, playing=True, origin="b")  # the first press started the music
+        self.assertEqual((action.kind, action.playing_before, action.origin), ("next", False, "a"))
+
+    def test_a_triple_press_is_previous_relative_to_the_original_track(self):
+        self.press(origin="a")
+        self.press(0.3, origin="b")
+        action = self.press(0.3, origin="c")
+        self.assertEqual((action.kind, action.playing_before, action.origin), ("previous", True, "a"))
+
+    def test_more_presses_are_ignored_until_the_window_closes(self):
+        for _ in range(3):
+            self.press(0.2)
+        self.assertEqual(self.press(0.2).kind, "ignore")
+        self.assertEqual(self.press(0.2).kind, "ignore")
+        self.assertEqual(self.press(0.8).kind, "toggle")  # a new gesture
+
+    def test_slow_presses_stay_independent_toggles(self):
+        for _ in range(4):
+            self.assertEqual(self.press(1.5).kind, "toggle")
+
+    def test_the_window_boundary(self):
+        self.press()
+        self.assertEqual(self.press(0.69).kind, "next")
+        machine = self.app.MultiPress(window=0.7, clock=lambda: self.now)
+        machine.press(True, "a")
+        self.now += 0.7  # exactly the window: too late
+        self.assertEqual(machine.press(True, "a").kind, "toggle")
+
+    def test_the_window_runs_from_the_previous_press_not_the_first(self):
+        self.press()
+        self.press(0.6)
+        self.assertEqual(self.press(0.6).kind, "previous")  # 1.2 s after the first
+
+    def test_a_new_gesture_forgets_the_old_one(self):
+        self.press(playing=False, origin="a")
+        self.press(0.2)
+        action = self.press(2.0, playing=True, origin="z")
+        self.assertEqual((action.kind, action.playing_before, action.origin), ("toggle", True, "z"))
+
+    def test_reset_starts_over(self):
+        self.press()
+        self.machine.reset()
+        self.assertEqual(self.press(0.1).kind, "toggle")
+
+    def test_a_clock_that_goes_backwards_starts_a_new_gesture(self):
+        self.press()
+        self.assertEqual(self.press(-5.0).kind, "toggle")
+
 
 
 class FakeMprisBackend:

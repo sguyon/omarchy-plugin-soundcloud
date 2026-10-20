@@ -16,6 +16,9 @@ without official SoundCloud API credentials.
 - Media keys, `playerctl` and the shell's media display work: the backend shows up on the
   session bus as an MPRIS player named SoundCloud, with the title, artist, cover and position,
   and play, pause, next, previous, seek, volume, repeat and shuffle
+- Earbuds that only send play/pause: a second press within 0.7 s skips to the next track and
+  a third to the one before. It is on by default; the popup has no switch for it, the backend
+  takes `multipress:on` and `multipress:off` on its socket
 - Volume icon in the popup: click to mute, scroll over it or hover for a slider to
   change the level. The player's own volume (not the system volume) is saved between sessions
 - Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and
@@ -199,7 +202,8 @@ not require another sign-in:
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached track lists (Home, Feed, Likes, History, and the tracks you
   played here), with titles, artists, and links
-- `settings.json`: the volume level, whether it is muted and whether Autoplay is on
+- `settings.json`: the volume level, whether it is muted, whether Autoplay is on and
+  whether earbud multi-press is on
 - `queue.json`: the play queue (titles, artists, links), its repeat and shuffle
   settings, and where you stopped in the current track
 

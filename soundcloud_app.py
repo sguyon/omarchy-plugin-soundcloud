@@ -36,7 +36,7 @@ import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, cast
+from typing import Mapping, NamedTuple, cast
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -1161,6 +1161,20 @@ class PlayQueue:
         items, explicit, added, cursor = snapshot
         self._items, self._explicit, self._added, self._cursor = list(items), list(explicit), list(added), cursor
 
+    def step_back_from(self, url: object) -> dict[str, object] | None:
+        """Put the cursor on the track before the one with this URL and return it.
+
+        Used by the earbud triple press, which skips back relative to the track that played when
+        the gesture started, whatever the double press did to the cursor since. The first track
+        has nothing before it, so it comes back itself. None when the URL is not in the list.
+        """
+        for position, item in enumerate(self._items):
+            if item["url"] == url:
+                self._cursor = max(0, position - 1)
+                return self.current
+        return None
+
+
     def mark_dead(self, track_id: object) -> dict[str, object] | None:
         """Drop a track that can't play, by playback id or URL. Returns what to play now, if any."""
         if not isinstance(track_id, str) or not track_id:
@@ -2012,7 +2026,7 @@ def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         fields["volume"] = volume
-    for key in ("muted", "autoplay"):
+    for key in ("muted", "autoplay", "multiPress"):
         if isinstance(payload.get(key), bool):
             fields[key] = payload[key]
     if "trackUrl" in payload:
@@ -2255,7 +2269,9 @@ def sanitize_queue(payload: object) -> dict[str, object]:
     }
 
 
-DEFAULT_SETTINGS: dict[str, object] = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True}
+DEFAULT_SETTINGS: dict[str, object] = {
+    "v": 1, "volume": 1.0, "muted": False, "autoplay": True, "multiPress": True,
+}
 
 
 def sanitize_settings(payload: object) -> dict[str, object]:
@@ -2266,14 +2282,14 @@ def sanitize_settings(payload: object) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         settings["volume"] = volume
-    for key in ("muted", "autoplay"):
+    for key in ("muted", "autoplay", "multiPress"):
         if isinstance(payload.get(key), bool):
             settings[key] = payload[key]
     return settings
 
 
 class SettingsStore:
-    """Volume, mute and the autoplay choice in `settings.json`."""
+    """Volume, mute, autoplay and earbud multi-press choices in `settings.json`."""
 
     def __init__(self, directory_fd: int, maximum_bytes: int = MAX_SETTINGS_BYTES):
         self._store = PrivateJsonStore(directory_fd, "settings.json", maximum_bytes)
@@ -3902,6 +3918,55 @@ def mpris_property_commands(name: str, value: object) -> list[str] | None:
     return None
 
 
+MULTIPRESS_WINDOW_SECONDS = 0.7
+MULTIPRESS_METHODS = ("Play", "Pause", "PlayPause")
+
+
+class MultiPressAction(NamedTuple):
+    kind: str  # "toggle" (first press, act as usual), "next", "previous" or "ignore"
+    playing_before: bool  # whether the music played before the gesture began
+    origin: object  # the track (its URL) that was current when the gesture began
+
+
+class MultiPress:
+    """Turns the Play and Pause calls of one earbud gesture into toggle, next or previous.
+
+    Earbuds (checked with AirPods 4) only ever send Play and Pause, never Next or Previous, so a
+    double press shows up as two toggles in a row. A press within MULTIPRESS_WINDOW_SECONDS of the
+    previous one belongs to the same gesture: the second means next, the third the track before
+    the one that played when the gesture began, and later ones are ignored. Each press restarts
+    the window, so a burst stays one gesture. Play, Pause and PlayPause count the same.
+
+    Trade-off: the first press of a gesture still toggles at once (we cannot know whether more
+    presses follow), so a double press pauses or resumes for an instant before the skip puts the
+    play/pause state back. Waiting out the window first would delay every single press instead.
+    """
+
+    def __init__(self, window: float = MULTIPRESS_WINDOW_SECONDS, clock=time.monotonic):
+        self.window = window
+        self.clock = clock
+        self._count = 0
+        self._last = 0.0
+        self._playing_before = False
+        self._origin: object = None
+
+    def reset(self) -> None:
+        self._count = 0
+
+    def press(self, playing: bool, origin: object) -> MultiPressAction:
+        """Register a press. `playing` and `origin` describe the state just before it."""
+        now = self.clock()
+        if self._count and 0 <= now - self._last < self.window:
+            self._count += 1
+        else:
+            self._count = 1
+            self._playing_before = bool(playing)
+            self._origin = origin
+        self._last = now
+        kind = {1: "toggle", 2: "next", 3: "previous"}.get(self._count, "ignore")
+        return MultiPressAction(kind, self._playing_before, self._origin)
+
+
 class MprisService:
     """Shows the player on the session bus as an MPRIS player so media keys and playerctl work.
 
@@ -3912,9 +3977,10 @@ class MprisService:
     """
 
     def __init__(self, Gio, GLib, backend, bus_name: str = MPRIS_BUS_NAME, bus_type=None,
-                 connection=None):
+                 clock=time.monotonic, connection=None):
         self.Gio, self.GLib, self.backend = Gio, GLib, backend
         self._given_connection = connection
+        self.multipress = MultiPress(clock=clock)
         self.bus_name = bus_name
         self.bus_type = bus_type if bus_type is not None else Gio.BusType.SESSION
         self.owned = False
@@ -4021,6 +4087,20 @@ class MprisService:
             args = parameters.unpack() if parameters is not None else ()
             status = self.backend.mpris_status()
             commands = mpris_method_commands(method, args, status)
+            if (commands is not None and method in MULTIPRESS_METHODS
+                    and getattr(self.backend, "multipress", False)):
+                state = status.get("playbackState")
+                press = self.multipress.press(
+                    state in ("playing", "buffering", "resolving"), status.get("trackUrl", ""))
+                if press.kind == "ignore":
+                    commands = []
+                elif press.kind != "toggle":
+                    self.backend.mpris_gesture(press.kind, press.playing_before, press.origin)
+                    # Publish the new track before the reply, so the shell's media OSD reads it.
+                    update = getattr(self.backend, "_mpris_update", None)
+                    if update is not None:
+                        update()
+                    commands = []
             if commands is None:
                 invocation.return_dbus_error(
                     "org.freedesktop.DBus.Error.NotSupported", f"{method} is not supported")
@@ -4390,6 +4470,7 @@ def build_application(show_on_start: bool = False):
             self.queue_finished = False  # the last queued track ended and nothing followed
             self.queue_save_pending = False
             self.autoplay = saved_settings["autoplay"] is True
+            self.multipress = saved_settings["multiPress"] is True
             self.settings_save_pending = False
             self.autoplay_loading = False
             self.run_in_thread = lambda target: threading.Thread(target=target, daemon=True).start()
@@ -4630,7 +4711,9 @@ def build_application(show_on_start: bool = False):
             self.settings_save_pending = False
             try:
                 settings_store.save({
-                    "v": 1, **self.playback.volume_status(), "autoplay": self.autoplay,
+                    "v": 1, **self.playback.volume_status(),
+                    "autoplay": self.autoplay,
+                    "multiPress": self.multipress,
                 })
             except OSError:
                 pass
@@ -5254,6 +5337,7 @@ def build_application(show_on_start: bool = False):
                 **queue_status(self.queue),
                 **self.playback.volume_status(),
                 "autoplay": self.autoplay,
+                "multiPress": self.multipress,
                 "trackUrl": track_url,
             }
             if not status.get("error") and time.monotonic() < self.notice_until:
@@ -5302,6 +5386,57 @@ def build_application(show_on_start: bool = False):
                 self._handle_command(command, None, None)
             except Exception:
                 pass
+
+        def mpris_gesture(self, kind, play_after, origin_url):
+            """An earbud double or triple press: next, or the track before `origin_url`.
+
+            Skipping always ends with the music playing, like the Next key of any player (`play_after`
+            is kept for callers but ignored). Everything goes through the queue and the usual start
+            path, so the generation guards apply: a later press supersedes a start still resolving.
+            """
+            play_after = True
+            try:
+                before_url = (self.queue.current or {}).get("url")
+                direction = 1 if kind == "next" else -1
+                row, skipped = self._user_step(direction, (
+                    (lambda: self._next_playable(True)) if kind == "next"
+                    else lambda: self.queue.step_back_from(origin_url)))
+                self._queue_changed()
+                if row is None:
+                    if skipped:
+                        self._show_notice(NO_PLAYABLE_MESSAGE)
+                        self._publish_status_once()
+                    self._mpris_restore_playing(play_after)
+                elif row.get("url") == before_url and self.playback.active:
+                    self.playback.seek_seconds(0.0)  # a one-track queue: start the track over
+                    self._mpris_restore_playing(play_after)
+                elif play_after:
+                    if skipped:
+                        self._show_notice(self.auto_skip.notice())
+                    self._play_when_page_ready(row, None, None, direction=direction)
+                else:
+                    self._park_paused(row)
+            except Exception:
+                pass
+
+        def _mpris_restore_playing(self, want_playing):
+            """Undo what the first press of a gesture did to play/pause."""
+            resolving = self.playback.state == "resolving"
+            if self.playback.active:
+                if self.playback.playing != want_playing:
+                    self.playback.toggle()
+            elif resolving and not want_playing and self.queue.current is not None:
+                self._park_paused(self.queue.current)
+            elif not resolving and want_playing:
+                self._handle_command("play-pause", None, None)
+
+        def _park_paused(self, row):
+            """Show `row` as the paused current track at 0:00 without starting it, like after a restart."""
+            self.pending_start += 1
+            self.selection_generation = (self.selection_generation + 1) % (2**31)
+            self.playback.stop()
+            self.restored_position_ms = 0
+            self._publish_status_once()
 
         def _mpris_update(self):
             if self.mpris is not None and self.mpris.owned:
@@ -5643,6 +5778,16 @@ def build_application(show_on_start: bool = False):
                 self._respond(
                     connection, request_id,
                     {"ok": ok, "running": True, **self.playback.volume_status()},
+                    publish_status=True,
+                )
+            elif command.startswith("multipress:"):
+                enabled = on_off_from_command(command, "multipress")
+                if enabled is not None:
+                    self.multipress = enabled
+                    self._settings_changed()
+                self._respond(
+                    connection, request_id,
+                    {"ok": enabled is not None, "running": True, "multiPress": self.multipress},
                     publish_status=True,
                 )
             elif command.startswith("autoplay:"):
