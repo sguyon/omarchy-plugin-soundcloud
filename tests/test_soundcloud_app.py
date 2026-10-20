@@ -2917,6 +2917,127 @@ class SeekCommandTest(unittest.TestCase):
         self.assertTrue(self.command("seek:0.5").reply["ok"])
 
 
+class PlayLinkCommandTest(unittest.TestCase):
+    """The play-url socket command, through the real application class."""
+
+    build = SeekCommandTest.build
+    command = SeekCommandTest.command
+    LINK = "https://soundcloud.com/artist/song-50"
+
+    def setUp(self):
+        self.build()
+        self.application.run_in_thread = lambda target: target()
+
+    def stub_links(self, track="row", error=None):
+        """Make the link lookup answer without the network; returns the texts it was asked for."""
+        calls = []
+
+        def resolve_link(text):
+            calls.append(text)
+            if error is not None:
+                raise error
+            return self.app.track_from_entry(like_item(50)) if track == "row" else track
+
+        self.application.track_likes.resolve_link = resolve_link
+        return calls
+
+    def run_link(self, command):
+        connection = self.command(command)
+        self.glib.run_idle()  # the lookup finished off the main loop and now reports back
+        return connection
+
+    def test_a_link_plays_once_the_page_is_on_a_track_source(self):
+        calls = self.stub_links()
+        page = type("Page", (), {"uri": "https://soundcloud.com/you/likes", "get_uri": lambda s: s.uri,
+                                 "is_loading": lambda s: False, "load_uri": lambda s, uri: None})()
+        self.application.webview = page
+
+        self.run_link("play-url:" + self.LINK)
+
+        self.assertEqual(calls, [self.LINK])
+        self.assertIn("soundcloud:tracks:50", self.application.playback_tracks)
+        self.assertEqual(self.evaluated, [])  # waits for the page: nothing is started yet
+        self.assertEqual(len(self.glib.timers), 1)
+        callback, args = self.glib.timers.pop()
+        page.uri = "https://soundcloud.com/discover"
+        self.assertFalse(callback(*args))
+        self.assertEqual(len(self.evaluated), 1)  # the stream lookup for the track
+
+    def test_the_link_lookup_runs_off_the_main_loop(self):
+        self.stub_links()
+        started = []
+        self.application.run_in_thread = started.append
+
+        connection = self.command("play-url:" + self.LINK)
+
+        self.assertEqual((len(started), connection.sent), (1, []))  # handed to a thread, no reply yet
+        started[0]()
+        self.glib.run_idle()
+        self.assertIn("soundcloud:tracks:50", self.application.playback_tracks)
+
+    def test_link_errors_keep_the_user_facing_messages_in_the_reply(self):
+        calls = self.stub_links()
+        app = self.app
+
+        for text, message in (
+            ("not a link", app.NOT_SOUNDCLOUD_MESSAGE),
+            ("https://example.com/a/b", app.NOT_SOUNDCLOUD_MESSAGE),
+            ("https://soundcloud.com/artist", app.ARTIST_PAGE_MESSAGE),
+            ("https://soundcloud.com/artist/sets/mix", app.PLAYLIST_MESSAGE),
+            ("https://soundcloud.com/artist/song/extra", app.NOT_A_TRACK_MESSAGE),
+            ("", "Copy a single SoundCloud track link first"),
+        ):
+            reply = self.run_link("play-url:" + text).reply
+            self.assertEqual((reply["ok"], reply["error"]), (False, message), text)
+        self.assertEqual(calls, [])  # nothing was looked up
+
+    def test_link_lookup_errors_reach_the_reply(self):
+        app = self.app
+
+        for error, message in (
+            (app.LinkError(app.PLAYLIST_MESSAGE), app.PLAYLIST_MESSAGE),
+            (app.LinkError(app.CANT_PLAY_MESSAGE), app.CANT_PLAY_MESSAGE),
+            (PermissionError("no"), "Sign in to SoundCloud first"),
+            (OSError("down"), "Couldn't reach SoundCloud. Try again"),
+        ):
+            self.stub_links(error=error)
+            reply = self.run_link("play-url:" + self.LINK).reply
+            self.assertEqual((reply["ok"], reply["error"]), (False, message))
+        self.stub_links(track=None)
+        self.assertEqual(self.run_link("play-url:" + self.LINK).reply["error"], app.CANT_PLAY_MESSAGE)
+        self.assertEqual(self.application.playback_tracks, {})
+
+    def test_hostile_links_are_refused_before_any_lookup(self):
+        calls = self.stub_links()
+
+        for text in (
+            "https%3A%2F%2Fsoundcloud.com%2Fa%2Fb%0Ahttps%3A%2F%2Fevil.example%2Fx",
+            "https://soundcloud.com/a/b%0D%0AHost:%20evil",
+            "https://user:pw@soundcloud.com/a/b",
+            "https://soundcloud.com:8443/a/b",
+            "https://soundcloud.com.evil.example/a/b",
+            "https://evil.example/https://soundcloud.com/a/b",
+            "ftp://soundcloud.com/a/b",
+            "javascript:alert(1)",
+            "https://soundcloud.com/a/b\x00",
+            "https://soundcloud.com/../../etc/passwd",
+            "https://on.soundcloud.com/a/b",
+            "https://soundcloud.com/" + "a" * 300 + "/b",
+        ):
+            reply = self.run_link("play-url:" + text).reply
+            self.assertFalse(reply["ok"], text)
+            self.assertTrue(reply["error"], text)
+        self.assertEqual(calls, [])
+
+    def test_an_oversize_link_is_refused(self):
+        calls = self.stub_links()
+
+        reply = self.run_link("play-url:https://soundcloud.com/a/" + "b" * 3000).reply
+
+        self.assertEqual((reply["ok"], reply["error"]), (False, "That link is too long"))
+        self.assertEqual(calls, [])
+
+
 class ApiReplyHardeningTest(unittest.TestCase):
     """A cut or garbled API reply is a network error, and a like always gets its answer.
 
@@ -2956,6 +3077,13 @@ class ApiReplyHardeningTest(unittest.TestCase):
         connection = FakeConnection()
         self.application.dispatch_slots.acquire()
         self.application._handle_command(text, connection, 7)
+        return connection
+
+    LINK = "https://soundcloud.com/artist/song-50"
+
+    def run_link(self, command):
+        connection = self.command(command)
+        self.glib.run_idle()  # the lookup finished off the main loop and now reports back
         return connection
 
     def truncated_api(self):
@@ -3002,15 +3130,28 @@ class ApiReplyHardeningTest(unittest.TestCase):
                          (False, "SoundCloud could not update this like"))
         self.assertEqual(self.application.dispatch_slots._value, free)
 
-    def test_an_unexpected_error_in_a_like_thread_still_replies_and_frees_the_slot(self):
+    def test_a_cut_reply_still_answers_a_pasted_link_and_frees_the_slot(self):
+        self.build()
+        self.truncated_api()
+        free = self.application.dispatch_slots._value
+
+        reply = self.run_link("play-url:" + self.LINK).reply
+
+        self.assertEqual((reply["ok"], reply["error"]), (False, "Couldn't reach SoundCloud. Try again"))
+        self.assertEqual(self.application.dispatch_slots._value, free)
+
+    def test_an_unexpected_error_in_a_like_or_link_thread_still_replies_and_frees_the_slot(self):
         self.build()
         free = self.application.dispatch_slots._value
         self.application.track_likes.set_liked = mock.Mock(side_effect=RuntimeError("boom"))
+        self.application.track_likes.resolve_link = mock.Mock(side_effect=RuntimeError("boom"))
 
         like = self.command("like:soundcloud:tracks:5")
+        link = self.run_link("play-url:" + self.LINK)
         self.glib.run_idle()
 
         self.assertFalse(like.reply["ok"])
+        self.assertFalse(link.reply["ok"])
         self.assertEqual(self.application.dispatch_slots._value, free)
 
 

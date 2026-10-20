@@ -3585,6 +3585,75 @@ def build_application(show_on_start: bool = False):
                 self.track_cache_save_pending = True
                 GLib.idle_add(self._save_track_cache)
 
+        def _remember_playback_track(self, track):
+            """Make a track playable by id. Rows are validated the same way list rows are."""
+            checked = validate_tracks_payload({"tracks": [track]})
+            if checked is None or not checked["tracks"] or not checked["tracks"][0]["playbackId"]:
+                return False
+            row = checked["tracks"][0]
+            self.playback_tracks[row["playbackId"]] = row
+            while len(self.playback_tracks) > MAX_TRACKS * 2:
+                self.playback_tracks.pop(next(iter(self.playback_tracks)))
+            return True
+
+        def _keep_page_on_track_source(self):
+            """Playback needs the request context the page only records on Home and Feed."""
+            if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
+                self.webview.load_uri(source_uri("home"))
+
+        def _play_when_page_ready(self, playback_id, connection, request_id):
+            """Start playback once the page is on Home or Feed, so its request context exists."""
+            self._keep_page_on_track_source()
+            deadline = time.monotonic() + 20.0
+
+            def check():
+                ready = (
+                    self.webview
+                    and is_track_source_page(self.webview.get_uri() or "")
+                    and not self.webview.is_loading()
+                )
+                if ready or time.monotonic() > deadline:
+                    self._handle_command("play:" + playback_id, connection, request_id)
+                    return False
+                return True
+
+            GLib.timeout_add(250, check)
+
+        def _play_link(self, link_text, connection, request_id):
+            """Play a pasted track link. The link is checked here the way the CLI checks it; the
+            lookup runs off the main loop and always reports back."""
+
+            def fail(message):
+                self._respond(connection, request_id, {"ok": False, "running": True, "error": message})
+                return False
+
+            try:
+                parse_track_link(link_text)
+            except LinkError as problem:
+                return fail(str(problem))
+
+            def link_resolved(track, error):
+                if track is None or not self._remember_playback_track(track):
+                    return fail(error or CANT_PLAY_MESSAGE)
+                self._play_when_page_ready(track["playbackId"], connection, request_id)
+                return False
+
+            def resolve_link():
+                track, error = None, ""
+                try:
+                    track = self.track_likes.resolve_link(link_text)
+                except LinkError as problem:
+                    error = str(problem)
+                except PermissionError:
+                    error = "Sign in to SoundCloud first"
+                except Exception:
+                    error = "Couldn't reach SoundCloud. Try again"
+                finally:
+                    GLib.idle_add(link_resolved, track, error)
+
+            self.run_in_thread(resolve_link)
+            return False
+
         def _load_api_list(self, source, reset):
             """Fetch one page of an account list on a worker thread; False if one is already loading."""
             state = self.api_lists[source]
@@ -3877,10 +3946,7 @@ def build_application(show_on_start: bool = False):
                     self.status_hold_until = time.monotonic() + 2.0
                     self.page_status.poll(lambda _changed: self._publish_status_once())
             elif (source := api_list_source_from_command(command, "tracks:")) is not None:
-                # These lists are fetched here, but playing one needs the request context the
-                # page only records on Home and Feed, so keep the page on one of them.
-                if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
-                    self.webview.load_uri(source_uri("home"))
+                self._keep_page_on_track_source()
                 cached = self._secure_tracks({"tracks": self.track_cache.get(source, [])})
                 if time.monotonic() - self.api_lists[source]["loaded_at"] > API_LIST_REFRESH_SECONDS[source]:
                     self._load_api_list(source, reset=True)
@@ -4083,6 +4149,8 @@ def build_application(show_on_start: bool = False):
                      **({} if done else {"error": "Can't seek"})},
                     publish_status=True,
                 )
+            elif command.startswith("play-url:"):
+                self._play_link(command.removeprefix("play-url:"), connection, request_id)
             elif (playback_id := playback_id_from_command(command)) is not None:
                 metadata = self.playback_tracks.get(playback_id)
                 if metadata is None:
