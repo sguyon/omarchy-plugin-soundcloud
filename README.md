@@ -11,12 +11,14 @@ without official SoundCloud API credentials.
 ## Features
 
 - Current track, artist, and artwork, with the bar icon highlighted during playback
-- Play/pause, previous, and next controls
+- Play/pause, previous, and next controls, with a play queue that continues with the
+  next track and survives a restart
 - Volume icon in the popup: click to mute, scroll over it or hover for a slider to
   change the level. The player's own volume (not the system volume) is saved between sessions
 - Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and
-  Shift+Tab switch tabs, Space plays or pauses, Left/Right seek, Shift+Up/Down volume,
-  l like, m mute, Esc close
+  Shift+Tab switch tabs, Space plays or pauses, Left/Right seek, PageDown or
+  Shift+Right next, PageUp or Shift+Left previous, Shift+Up/Down volume, l like,
+  Shift+L repeat, Shift+S shuffle, m mute, Esc close
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
@@ -181,6 +183,8 @@ not require another sign-in:
 - `tracks.json`: the cached track lists (Home, Feed, Likes, History, and the tracks you
   played here), with titles, artists, and links
 - `settings.json`: the volume level and whether it is muted
+- `queue.json`: the play queue (titles, artists, links), its repeat and shuffle
+  settings, and where you stopped in the current track
 
 The runtime directory `$XDG_RUNTIME_DIR/omarchy-soundcloud/` (lock file and the
 optional `pagination.log`) is also kept until logout.
@@ -235,8 +239,15 @@ widget talks to the backend over a private Unix socket.
   The backend then plays it with GStreamer, directly for progressive streams and
   through a bounded segment fetcher for HLS. A track that does not resolve within
   15 seconds shows an error.
-- Play/pause and seek control GStreamer when it is playing. Otherwise they, and
-  previous/next, control SoundCloud's own web player.
+- Selecting a track in Home, Feed, Likes or History makes that list the play queue,
+  starting at the track. Next and previous move through it (previous restarts the
+  track after 3 seconds), a track that ends starts the next one, and a track that
+  can't play is skipped when it was started automatically. The queue, its repeat
+  and shuffle settings, and the playback position are saved in
+  `~/.local/share/omarchy-soundcloud/queue.json`; after a restart the last track
+  shows as paused where you left it, and play resumes from there.
+- Play/pause and seek control GStreamer when it is playing. Otherwise they control
+  SoundCloud's own web player. Previous and next never touch it.
 - On Hyprland the backend sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` to avoid
   WebKitGTK rendering crashes.
 
