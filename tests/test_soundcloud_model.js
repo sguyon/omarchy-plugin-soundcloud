@@ -211,6 +211,21 @@ assert.equal(model.steppedVolume(0.02, -120), 0);
 assert.equal(model.steppedVolume(0.3, 0), 0.3);
 assert.equal(model.steppedVolume(undefined, -120), 0.95);
 
+// A track clicked in a list plays from that list; a new click replaces a pending one.
+assert.equal(
+  model.playFromCommand("likes", "soundcloud:tracks:42"),
+  "play-from:likes:soundcloud:tracks:42",
+);
+for (const [tab, id] of [["library", "soundcloud:tracks:42"], ["home", "42"], ["home", ""], ["home", "soundcloud:tracks:0"], [undefined, undefined]]) {
+  assert.equal(model.playFromCommand(tab, id), "");
+}
+assert.equal(model.isSelectionAction("play-from"), true);
+assert.equal(model.isSelectionAction("play"), true);
+assert.equal(model.isSelectionAction("next"), false);
+assert.equal(model.canStartAction(true, true, "play-from"), true);
+assert.equal(model.canStartAction(true, true, "next"), false);
+assert.equal(model.canStartAction(true, false, "play-from"), false);
+
 // Seek keys: max(5, n) seconds, at most one seek per 200 ms.
 assert.equal(model.seekRepeatCount(0, false), 0);
 assert.equal(model.seekRepeatCount(7, false), 0);

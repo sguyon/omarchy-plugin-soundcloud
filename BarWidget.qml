@@ -127,11 +127,12 @@ BarWidget {
     if (selectedRow >= 0) trackList.positionViewAtIndex(selectedRow, ListView.Contain)
   }
 
-  // Enter plays the selected row, like a click on it.
+  // Enter plays the selected row from its list, like a click on it.
   function playSelectedRow() {
     var track = tracks[selectedRow]
-    if (!track || !/^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))) return
-    runAction("play", track.playbackId)
+    if (!track) return
+    var command = SoundCloudModel.playFromCommand(selectedTab, track.playbackId)
+    if (command !== "" && (!actionBusy || selectionBusy)) runAction("play-from", command)
   }
 
   // direction is -1 or +1; seekKeys (below) counts the key repeats.
@@ -356,6 +357,7 @@ BarWidget {
     if (action === "launch") return "show"
     if (action === "seek") return "seek:" + String(value)
     if (action === "play") return "play:" + String(value)
+    if (action === "play-from") return String(value)
     return action
   }
 
@@ -416,7 +418,7 @@ BarWidget {
       return true
     }
     actionBusy = true
-    selectionBusy = action === "play"
+    selectionBusy = SoundCloudModel.isSelectionAction(action)
     lastError = ""
     var sentId = sendCommand(commandValue(action, value), selectionBusy ? "selection" : "action")
     if (sentId > 0) {
@@ -1232,7 +1234,7 @@ BarWidget {
               enabled: (!root.actionBusy || root.selectionBusy)
                 && /^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))
               onClicked: {
-                root.runAction("play", modelData.playbackId)
+                root.runAction("play-from", SoundCloudModel.playFromCommand(root.selectedTab, modelData.playbackId))
               }
             }
           }

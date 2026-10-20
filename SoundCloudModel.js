@@ -58,8 +58,20 @@ function pendingLabel(playbackState) {
   return ""
 }
 
+// Starting a track from a list (play-from) or by id (play) replaces what is loading.
+function isSelectionAction(action) {
+  return action === "play" || action === "play-from"
+}
+
 function canStartAction(actionBusy, selectionBusy, action) {
-  return !actionBusy || (selectionBusy === true && action === "play")
+  return !actionBusy || (selectionBusy === true && isSelectionAction(action))
+}
+
+// The command that plays a track from the list it was clicked in, or "" if the ids are not valid.
+function playFromCommand(tab, playbackId) {
+  var validTab = tab === "home" || tab === "feed" || tab === "likes" || tab === "history"
+  var validId = /^soundcloud:tracks:[1-9][0-9]*$/.test(String(playbackId || ""))
+  return validTab && validId ? "play-from:" + tab + ":" + playbackId : ""
 }
 
 // Keyboard selection in the track list: -1 means no row is selected.
@@ -349,7 +361,9 @@ if (typeof module !== "undefined") {
     shouldPreservePlaybackMetadata: shouldPreservePlaybackMetadata,
     selectionIsPending: selectionIsPending,
     pendingLabel: pendingLabel,
+    isSelectionAction: isSelectionAction,
     canStartAction: canStartAction,
+    playFromCommand: playFromCommand,
     clampSelection: clampSelection,
     moveSelection: moveSelection,
     selectionAfterUpdate: selectionAfterUpdate,

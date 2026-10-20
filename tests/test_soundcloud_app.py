@@ -5775,7 +5775,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('text: "Home"', qml)
         self.assertIn('text: "Feed"', qml)
         self.assertIn("ListView {", qml)
-        self.assertIn('root.runAction("play"', qml)
+        self.assertIn('root.runAction("play-from"', qml)
         self.assertIn("modelData.playbackId", qml)
         self.assertNotIn('root.runAction("play-url"', qml)
 
@@ -5786,7 +5786,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("root.loggedIn && !reportsLoggedOut", qml)
         self.assertNotIn('root.title = track.title || ""', qml)
         self.assertIn("(!root.actionBusy || root.selectionBusy)", qml)
-        self.assertIn('selectionBusy = action === "play"', qml)
+        self.assertIn('selectionBusy = SoundCloudModel.isSelectionAction(action)', qml)
         self.assertIn("activeSelectionRequestId = sentId", qml)
         self.assertIn("isCurrentSelectionResponse(activeSelectionRequestId, message.id)", qml)
         self.assertIn("SoundCloudModel.selectionIsPending(playbackState)", qml)
