@@ -565,7 +565,6 @@ assert.equal(model.pasteNotice(null), "");
 // Clear queue confirmation: stays only while the same queue is shown.
 {
   const rows = [{ playbackId: "a" }, { playbackId: "b" }];
-  assert.equal(model.clearConfirmDelay(), 12000);
   assert.equal(model.queueSignature(rows), "a|b");
   assert.equal(model.queueSignature(null), "");
   assert.equal(model.clearConfirmStays("a|b", rows, true), true);
@@ -574,10 +573,6 @@ assert.equal(model.pasteNotice(null), "");
   assert.equal(model.clearConfirmStays("a|b", [rows[1], rows[0]], true), false);
   assert.equal(model.clearConfirmStays(null, rows, true), false);
   assert.equal(model.clearConfirmStays("", [], true), false);
-  assert.equal(model.clearConfirmCountdownRuns("a|b", false), true);
-  assert.equal(model.clearConfirmCountdownRuns("a|b", true), false);
-  assert.equal(model.clearConfirmCountdownRuns("", false), true);
-  assert.equal(model.clearConfirmCountdownRuns(null, false), false);
 }
 
 // OSD command and rate limit.

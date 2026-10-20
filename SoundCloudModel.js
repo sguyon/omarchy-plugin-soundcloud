@@ -693,19 +693,9 @@ function pasteNotice(message) {
   return title === "" ? "Playing the link" : "Playing: " + title
 }
 
-// Clear queue asks first: the toolbar switches to a confirm state that is
-// dropped after clearConfirmMs of the pointer being away from the toolbar, when
-// the queue view closes or when the queue changes (the signature is what was in
-// the queue when it was armed).
-var clearConfirmMs = 12000
-function clearConfirmDelay() { return clearConfirmMs }
-
-// The countdown runs only while a confirmation is pending and the pointer is
-// away from the toolbar; coming back stops it, leaving starts it afresh.
-function clearConfirmCountdownRuns(armedSignature, pointerOverToolbar) {
-  return typeof armedSignature === "string" && pointerOverToolbar !== true
-}
-
+// Clear queue asks first: the toolbar switches to a confirm state that is dropped when
+// the queue view closes or when the queue changes (the signature is what was in the
+// queue when it was armed).
 function queueSignature(rows) {
   var ids = []
   var list = Array.isArray(rows) ? rows : []
@@ -872,10 +862,8 @@ if (typeof module !== "undefined") {
     errorClearedByCommand: errorClearedByCommand,
     pasteRequest: pasteRequest,
     pasteNotice: pasteNotice,
-    clearConfirmDelay: clearConfirmDelay,
     queueSignature: queueSignature,
     clearConfirmStays: clearConfirmStays,
-    clearConfirmCountdownRuns: clearConfirmCountdownRuns,
     osdCommand: osdCommand,
     osdDue: osdDue,
     sameLevels: sameLevels,

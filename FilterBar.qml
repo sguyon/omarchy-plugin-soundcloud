@@ -3,7 +3,7 @@ import QtQuick.Controls
 import "SoundCloudModel.js" as SoundCloudModel
 
 // The filter field over the track list: a magnifier, the text, the result count
-// ("2 of 24") and a clear button. It is transparent; the owner draws Omarchy's
+// ("2 of 24") and a clear button. It is transparent; the item that uses it draws Omarchy's
 // text field surface behind it (and its border insets around it) and the
 // tooltip on countItem. Keys while it has focus: Esc clears the text, and on an
 // empty field closes it (closeRequested); Down, Tab and Enter ask for the list

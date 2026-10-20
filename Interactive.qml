@@ -3,9 +3,9 @@ import QtQuick
 // The one pointer behaviour for every clickable thing in the popup, matching
 // Omarchy's controls (Button, PanelActionButton): the pointing hand while it
 // can be clicked, the plain arrow while it cannot, and hover and pressed state
-// for the owner to draw (hot / held). Omarchy dims or tints with its Style
+// for the item that uses it to draw (hot / held). Omarchy dims or tints with its Style
 // helpers; this file only holds the state so it can be tested with Qt Quick
-// Test (no Quickshell imports), the owner draws it with Style.hoverFillFor and
+// Test (no Quickshell imports); the item draws it with Style.hoverFillFor and
 // Style.pressedFillFor.
 //
 // `clickable` replaces `enabled`: the area stays enabled so a disabled thing

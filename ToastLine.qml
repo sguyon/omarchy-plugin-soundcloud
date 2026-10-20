@@ -12,7 +12,7 @@ Text {
 
   property color infoColor: "gray"
   property color errorColor: "red"
-  // Set by the owner to hide the line without ending its time (an error that
+  // Set by the item that uses the line, to hide it without ending its time (an error that
   // is already shown on a track row).
   property bool suppressed: false
   // Durations in milliseconds; tests shorten them.
