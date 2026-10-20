@@ -4107,6 +4107,26 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual(len(self.evaluated), started)
         self.assertEqual(self.application.queue.cursor, 1)
 
+    def test_seek_by_command_seeks_relative_to_the_position(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        pipeline = self.application.playback.current
+        pipeline.position = 40 * 10**9
+
+        reply = self.command("seek-by:5")
+        self.assertTrue(reply.reply["ok"])
+        self.assertEqual(pipeline.seeks[-1], 45 * 10**9)
+        self.assertFalse(self.command("seek-by:nope").reply["ok"])
+        self.assertFalse(self.command("seek-by:").reply["ok"])
+
+    def test_seek_by_command_with_nothing_loaded_is_not_ok(self):
+        self.build()
+
+        self.assertFalse(self.command("seek-by:5").reply["ok"])
+        self.assertEqual(self.evaluated, [])
+
     def test_next_and_previous_with_nothing_to_go_to_return_not_ok(self):
         self.build()
         self.assertFalse(self.command("next").reply["ok"])
@@ -4399,6 +4419,57 @@ class QueuePlaybackTest(unittest.TestCase):
 
     # volume, settings
 
+    def saved_settings(self):
+        fd = os.open(self.queue_file.parent, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        return self.app.SettingsStore(fd).load()
+
+    def test_volume_commands_change_the_status_and_are_saved_privately(self):
+        self.build()
+
+        reply = self.command("volume:0.4")
+        self.assertEqual((reply.reply["ok"], reply.reply["volume"], reply.reply["muted"]), (True, 0.4, False))
+        self.assertEqual(self.command("mute").reply["muted"], True)
+        status = self.application.build_status()
+        self.assertEqual((status["volume"], status["muted"]), (0.4, True))  # mute keeps the volume
+        self.assertEqual(self.command("volume-step:-0.1").reply["volume"], 0.3)
+        self.assertFalse(self.application.build_status()["muted"])
+        self.assertFalse(self.command("volume:loud").reply["ok"])
+        self.assertFalse(self.command("volume-step:inf").reply["ok"])
+        self.assertEqual(self.application.playback.volume, 0.3)
+        self.command("volume:0")
+        self.assertTrue(self.application.build_status()["muted"])
+
+        self.assertFalse((self.queue_file.parent / "settings.json").exists())  # debounced
+        self.glib.run_idle()
+        self.assertEqual(self.saved_settings()["volume"], 0.0)
+        self.assertTrue(self.saved_settings()["muted"])
+        self.assertEqual(stat.S_IMODE((self.queue_file.parent / "settings.json").stat().st_mode), 0o600)
+
+    def test_a_volume_set_before_a_track_applies_to_the_next_one(self):
+        self.build()
+        self.fill("home", 2)
+        self.command("volume:0.25")
+
+        self.command("play:soundcloud:tracks:1")
+        self.resolve()
+
+        self.assertEqual(self.application.playback.current.properties["volume"], 0.25)
+
+    def test_saved_settings_are_restored_at_startup(self):
+        self.build(settings={"v": 1, "volume": 0.3, "muted": True})
+
+        status = self.application.build_status()
+
+        self.assertEqual((status["volume"], status["muted"]), (0.3, True))
+
+    def test_defaults_without_a_settings_file(self):
+        self.build()
+
+        status = self.application.build_status()
+
+        self.assertEqual((status["volume"], status["muted"]), (1.0, False))
+
     def play_last_of_two(self):
         self.fill("home", 2)
         self.command("play-from:home:soundcloud:tracks:2")
@@ -4443,6 +4514,16 @@ class QueuePlaybackTest(unittest.TestCase):
         self.application.track_likes.load_token = lambda: "token"
         self.application.track_likes.request = self.app.soundcloud_api_request
 
+    def test_a_cut_api_reply_is_an_oserror(self):
+        app = load_module()
+        import http.client
+
+        class Cut:
+            def open(self, _request, timeout=None): raise http.client.CannotSendRequest()
+
+        with mock.patch.object(app, "_api_opener", Cut()), self.assertRaises(OSError):
+            app.soundcloud_api_request("GET", "/me", "token")
+
     def test_a_cut_reply_ends_a_list_load_and_the_tab_can_refresh(self):
         self.build()
         self.truncated_api()
@@ -4462,6 +4543,60 @@ class QueuePlaybackTest(unittest.TestCase):
         self.glib.run_idle()
 
         self.assertFalse(self.application.api_lists["likes"]["loading"])
+
+    def test_a_cut_reply_still_answers_a_pasted_link_and_frees_the_slot(self):
+        self.build()
+        self.truncated_api()
+        free = self.application.dispatch_slots._value
+
+        reply = self.run_link("play-url:" + self.LINK).reply
+
+        self.assertEqual((reply["ok"], reply["error"]), (False, "Couldn't reach SoundCloud. Try again"))
+        self.assertEqual(self.application.dispatch_slots._value, free)
+
+    def test_a_cut_reply_still_answers_a_like_and_frees_the_slot(self):
+        self.build()
+        self.truncated_api()
+        free = self.application.dispatch_slots._value
+
+        reply = self.command("like:soundcloud:tracks:5")
+        self.glib.run_idle()
+
+        self.assertEqual((reply.reply["ok"], reply.reply["error"]),
+                         (False, "SoundCloud could not update this like"))
+        self.assertEqual(self.application.dispatch_slots._value, free)
+
+    def test_an_unexpected_error_in_a_like_or_link_thread_still_replies_and_frees_the_slot(self):
+        self.build()
+        free = self.application.dispatch_slots._value
+        self.application.track_likes.set_liked = mock.Mock(side_effect=RuntimeError("boom"))
+        self.application.track_likes.resolve_link = mock.Mock(side_effect=RuntimeError("boom"))
+
+        like = self.command("like:soundcloud:tracks:5")
+        link = self.run_link("play-url:" + self.LINK)
+        self.glib.run_idle()
+
+        self.assertFalse(like.reply["ok"])
+        self.assertFalse(link.reply["ok"])
+        self.assertEqual(self.application.dispatch_slots._value, free)
+
+    # seek values
+
+    def test_a_seek_to_a_non_finite_ratio_is_refused(self):
+        self.build()
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        seeks = self.application.playback.current.seeks
+
+        for value in ("nan", "inf", "-inf", "1e400"):
+            with self.subTest(value=value):
+                reply = self.command("seek:" + value).reply
+                self.assertEqual((reply["ok"], reply["error"]), (False, "invalid seek position"))
+        self.assertEqual(seeks, [])
+        self.assertTrue(self.command("seek:0.5").reply["ok"])
+
+    # queue view and edits
 
     def test_the_queue_command_lists_marked_rows_capped_at_100(self):
         with self.subTest('the queue command lists the rows with their marks'):
@@ -4937,6 +5072,41 @@ class QueuePlaybackTest(unittest.TestCase):
 
         self.assertFalse(self.application.build_status().get("error"))
 
+    def test_hostile_links_are_refused_before_any_lookup(self):
+        self.play_four()
+        calls = self.stub_links()
+
+        for text in (
+            "https%3A%2F%2Fsoundcloud.com%2Fa%2Fb%0Ahttps%3A%2F%2Fevil.example%2Fx",  # two lines
+            "https://soundcloud.com/a/b%0D%0AHost:%20evil",
+            "https://user:pw@soundcloud.com/a/b",
+            "https://soundcloud.com:8443/a/b",
+            "https://soundcloud.com.evil.example/a/b",
+            "https://evil.example/https://soundcloud.com/a/b",
+            "ftp://soundcloud.com/a/b",
+            "javascript:alert(1)",
+            "https://soundcloud.com/a/b\x00",
+            "https://soundcloud.com/../../etc/passwd",
+            "https://on.soundcloud.com/a/b",
+            "%2F%2F",
+            "https://soundcloud.com/" + "a" * 300 + "/b",
+        ):
+            for prefix in ("link-next:", "link-play:"):
+                reply = self.run_link(prefix + text).reply
+                self.assertFalse(reply["ok"], text)
+                self.assertTrue(reply["error"], text)
+        self.assertEqual(calls, [])
+
+    def test_an_oversize_link_is_refused(self):
+        self.play_four()
+        calls = self.stub_links()
+
+        for text in ("https://soundcloud.com/a/" + "b" * 3000, "%2F" * 3000):
+            reply = self.run_link("link-next:" + text).reply
+            self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "That link is too long")
+        self.assertEqual(calls, [])
+
     def test_links_parse_with_their_mode_and_decode_only_a_wholly_encoded_link(self):
         app = load_module()
 
@@ -4947,6 +5117,57 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertIsNone(app.link_from_command("link:x"))
         self.assertIsNone(app.link_from_command("link-nextx"))
         self.assertIsNone(app.link_from_command("play-url:https://a/b"))
+
+    def test_a_short_link_follows_the_redirect_rule_before_it_is_looked_up(self):
+        self.play_four()
+        request, calls = make_resolver({"/resolve?url=https%3A%2F%2Fsoundcloud.com%2Fartist%2Fsong-50":
+                                        track_payload(50)})
+        self.application.track_likes.load_token = lambda: "token"
+        self.application.track_likes.request = request
+        followed = []
+
+        def follow(url, opener=None):
+            followed.append(url)
+            return self.redirect
+
+        with mock.patch.object(self.app, "follow_short_link", follow):
+            self.redirect = "https://example.com/elsewhere/page"
+            bad = self.run_link("link-next:https://on.soundcloud.com/AbC123").reply
+            self.redirect = "https://soundcloud.com/artist/song-50?si=tracking"
+            good = self.run_link("link-next:https://on.soundcloud.com/AbC123").reply
+
+        self.assertEqual((bad["ok"], bad["error"]), (False, "That short link doesn't lead to SoundCloud"))
+        self.assertEqual((good["ok"], good["queued"]), (True, True))
+        self.assertEqual(followed, ["https://on.soundcloud.com/AbC123"] * 2)
+        self.assertEqual([row["playbackId"] for row in self.application.queue.explicit],
+                         ["soundcloud:tracks:50"])
+        self.assertEqual([path for _method, path in calls if path != "/me"],
+                         ["/resolve?url=https%3A%2F%2Fsoundcloud.com%2Fartist%2Fsong-50"])
+
+    def test_the_link_lookup_runs_off_the_main_loop(self):
+        self.play_four()
+        self.stub_links()
+        started = []
+        self.application.run_in_thread = started.append
+
+        connection = self.command("link-next:" + self.LINK)
+
+        self.assertEqual((len(started), connection.sent), (1, []))  # handed to a thread, no reply yet
+        started[0]()
+        self.glib.run_idle()
+        self.assertTrue(connection.reply["queued"])
+
+    def test_play_url_still_plays_through_the_shared_link_code(self):
+        self.play_four()
+        calls = self.stub_links()
+
+        reply = self.run_link("play-url:" + self.LINK)
+        self.resolve()
+
+        self.assertTrue(reply.reply["ok"])
+        self.assertEqual((calls, self.queue_ids()), ([self.LINK], ["50"]))
+
+    # encrypted-only tracks
 
     def test_picking_an_encrypted_only_track_fails_at_once_with_the_real_reason(self):
         self.build()
@@ -5116,322 +5337,6 @@ class QueuePlaybackTest(unittest.TestCase):
         def __init__(self): self.result = "pending"
         def return_value(self, _value): self.result = "ok"
         def return_dbus_error(self, name, _message): self.result = name
-
-
-class SeekCommandTest(unittest.TestCase):
-    """The seek and seek-by socket commands, through the real application class."""
-
-    def build(self, settings=None):
-        self.app = load_module()
-        self.glib, self.gst = FakeGLib(), fake_gst()
-        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        data = self.data = directory / "data" / "omarchy-soundcloud"
-        data.mkdir(parents=True, mode=0o700)
-        if settings is not None:
-            (data / "settings.json").write_text(json.dumps(settings))
-            os.chmod(data / "settings.json", 0o600)
-        Gtk = type("Gtk", (), {"Application": type("Application", (), {
-            "__init__": lambda self, **_kw: None, "hold": lambda self: None,
-            "quit": lambda self: None, "do_shutdown": lambda self: None,
-        })})
-        Gio = type("Gio", (), {"ApplicationFlags": type("F", (), {"NON_UNIQUE": 0})})
-        patches = (
-            mock.patch.object(self.app, "_load_gi",
-                              lambda: (Gio, self.glib, self.gst, Gtk, None, None)),
-            mock.patch.object(self.app, "profile_paths", lambda env=None: self.app.ProfilePaths(
-                data, directory / "cache", data / "cookies.sqlite")),
-            mock.patch.object(self.app, "runtime_socket_path",
-                              lambda env=None: directory / "run" / "omarchy-soundcloud" / "control.sock"),
-            mock.patch.object(self.app, "prepare_runtime_socket_path", lambda path: None),
-        )
-        for patch in patches:
-            self.enterContext(patch)
-        self.application = self.app.build_application()
-        self.addCleanup(self.application.playback.close)
-        self.addCleanup(self.application.artwork_cache.close)
-        self.addCleanup(self.application.list_artwork_cache.close)
-        self.evaluated = []
-        self.application._evaluate = lambda script, callback: self.evaluated.append((script, callback))
-        return self.application
-
-    def command(self, text):
-        connection = FakeConnection()
-        self.application.dispatch_slots.acquire()
-        self.application._handle_command(text, connection, 7)
-        return connection
-
-    def start(self):
-        playback = self.application.playback
-        playback.begin({"title": "A", "playbackId": "soundcloud:tracks:1"})
-        self.assertTrue(playback.play("https://x.sndcdn.com/a", {"title": "A"}))
-        return playback.current
-
-    def test_seek_by_command_seeks_relative_to_the_position(self):
-        self.build()
-        pipeline = self.start()
-        pipeline.position = 40 * 10**9
-
-        reply = self.command("seek-by:5")
-
-        self.assertTrue(reply.reply["ok"])
-        self.assertEqual(pipeline.seeks[-1], 45 * 10**9)
-        self.assertFalse(self.command("seek-by:nope").reply["ok"])
-        self.assertFalse(self.command("seek-by:").reply["ok"])
-
-    def test_seek_by_command_with_nothing_loaded_is_not_ok(self):
-        self.build()
-
-        self.assertFalse(self.command("seek-by:5").reply["ok"])
-        self.assertEqual(self.evaluated, [])
-
-    def test_a_seek_to_a_non_finite_ratio_is_refused(self):
-        self.build()
-        seeks = self.start().seeks
-
-        for value in ("nan", "inf", "-inf", "1e400"):
-            with self.subTest(value=value):
-                reply = self.command("seek:" + value).reply
-                self.assertEqual((reply["ok"], reply["error"]), (False, "invalid seek position"))
-        self.assertEqual(seeks, [])
-        self.assertTrue(self.command("seek:0.5").reply["ok"])
-
-
-class PlayLinkCommandTest(unittest.TestCase):
-    """The play-url socket command, through the real application class."""
-
-    build = SeekCommandTest.build
-    command = SeekCommandTest.command
-    LINK = "https://soundcloud.com/artist/song-50"
-
-    def setUp(self):
-        self.build()
-        self.application.run_in_thread = lambda target: target()
-
-    def stub_links(self, track="row", error=None):
-        """Make the link lookup answer without the network; returns the texts it was asked for."""
-        calls = []
-
-        def resolve_link(text):
-            calls.append(text)
-            if error is not None:
-                raise error
-            return self.app.track_from_entry(like_item(50)) if track == "row" else track
-
-        self.application.track_likes.resolve_link = resolve_link
-        return calls
-
-    def run_link(self, command):
-        connection = self.command(command)
-        self.glib.run_idle()  # the lookup finished off the main loop and now reports back
-        return connection
-
-    def test_a_link_plays_once_the_page_is_on_a_track_source(self):
-        calls = self.stub_links()
-        page = type("Page", (), {"uri": "https://soundcloud.com/you/likes", "get_uri": lambda s: s.uri,
-                                 "is_loading": lambda s: False, "load_uri": lambda s, uri: None})()
-        self.application.webview = page
-
-        self.run_link("play-url:" + self.LINK)
-
-        self.assertEqual(calls, [self.LINK])
-        self.assertIn("soundcloud:tracks:50", self.application.playback_tracks)
-        self.assertEqual(self.evaluated, [])  # waits for the page: nothing is started yet
-        self.assertEqual(len(self.glib.timers), 1)
-        callback, args = self.glib.timers.pop()
-        page.uri = "https://soundcloud.com/discover"
-        self.assertFalse(callback(*args))
-        self.assertEqual(len(self.evaluated), 1)  # the stream lookup for the track
-
-    def test_the_link_lookup_runs_off_the_main_loop(self):
-        self.stub_links()
-        started = []
-        self.application.run_in_thread = started.append
-
-        connection = self.command("play-url:" + self.LINK)
-
-        self.assertEqual((len(started), connection.sent), (1, []))  # handed to a thread, no reply yet
-        started[0]()
-        self.glib.run_idle()
-        self.assertIn("soundcloud:tracks:50", self.application.playback_tracks)
-
-    def test_link_errors_keep_the_user_facing_messages_in_the_reply(self):
-        calls = self.stub_links()
-        app = self.app
-
-        for text, message in (
-            ("not a link", app.NOT_SOUNDCLOUD_MESSAGE),
-            ("https://example.com/a/b", app.NOT_SOUNDCLOUD_MESSAGE),
-            ("https://soundcloud.com/artist", app.ARTIST_PAGE_MESSAGE),
-            ("https://soundcloud.com/artist/sets/mix", app.PLAYLIST_MESSAGE),
-            ("https://soundcloud.com/artist/song/extra", app.NOT_A_TRACK_MESSAGE),
-            ("", "Copy a single SoundCloud track link first"),
-        ):
-            reply = self.run_link("play-url:" + text).reply
-            self.assertEqual((reply["ok"], reply["error"]), (False, message), text)
-        self.assertEqual(calls, [])  # nothing was looked up
-
-    def test_link_lookup_errors_reach_the_reply(self):
-        app = self.app
-
-        for error, message in (
-            (app.LinkError(app.PLAYLIST_MESSAGE), app.PLAYLIST_MESSAGE),
-            (app.LinkError(app.CANT_PLAY_MESSAGE), app.CANT_PLAY_MESSAGE),
-            (PermissionError("no"), "Sign in to SoundCloud first"),
-            (OSError("down"), "Couldn't reach SoundCloud. Try again"),
-        ):
-            self.stub_links(error=error)
-            reply = self.run_link("play-url:" + self.LINK).reply
-            self.assertEqual((reply["ok"], reply["error"]), (False, message))
-        self.stub_links(track=None)
-        self.assertEqual(self.run_link("play-url:" + self.LINK).reply["error"], app.CANT_PLAY_MESSAGE)
-        self.assertEqual(self.application.playback_tracks, {})
-
-    def test_hostile_links_are_refused_before_any_lookup(self):
-        calls = self.stub_links()
-
-        for text in (
-            "https%3A%2F%2Fsoundcloud.com%2Fa%2Fb%0Ahttps%3A%2F%2Fevil.example%2Fx",
-            "https://soundcloud.com/a/b%0D%0AHost:%20evil",
-            "https://user:pw@soundcloud.com/a/b",
-            "https://soundcloud.com:8443/a/b",
-            "https://soundcloud.com.evil.example/a/b",
-            "https://evil.example/https://soundcloud.com/a/b",
-            "ftp://soundcloud.com/a/b",
-            "javascript:alert(1)",
-            "https://soundcloud.com/a/b\x00",
-            "https://soundcloud.com/../../etc/passwd",
-            "https://on.soundcloud.com/a/b",
-            "https://soundcloud.com/" + "a" * 300 + "/b",
-        ):
-            reply = self.run_link("play-url:" + text).reply
-            self.assertFalse(reply["ok"], text)
-            self.assertTrue(reply["error"], text)
-        self.assertEqual(calls, [])
-
-    def test_an_oversize_link_is_refused(self):
-        calls = self.stub_links()
-
-        reply = self.run_link("play-url:https://soundcloud.com/a/" + "b" * 3000).reply
-
-        self.assertEqual((reply["ok"], reply["error"]), (False, "That link is too long"))
-        self.assertEqual(calls, [])
-
-
-class ApiReplyHardeningTest(unittest.TestCase):
-    """A cut or garbled API reply is a network error, and a like always gets its answer.
-
-    The application class runs with fake GTK and GStreamer and a temporary profile.
-    """
-
-    def build(self):
-        self.app = load_module()
-        self.glib = FakeGLib()
-        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        data = directory / "data" / "omarchy-soundcloud"
-        data.mkdir(parents=True, mode=0o700)
-        Gtk = type("Gtk", (), {"Application": type("Application", (), {
-            "__init__": lambda self, **_kw: None, "hold": lambda self: None,
-            "quit": lambda self: None, "do_shutdown": lambda self: None,
-        })})
-        Gio = type("Gio", (), {"ApplicationFlags": type("F", (), {"NON_UNIQUE": 0})})
-        Gst = type("Gst", (), {"init": staticmethod(lambda _value: None)})
-        patches = (
-            mock.patch.object(self.app, "_load_gi", lambda: (Gio, self.glib, Gst, Gtk, None, None)),
-            mock.patch.object(self.app, "profile_paths", lambda env=None: self.app.ProfilePaths(
-                data, directory / "cache", data / "cookies.sqlite")),
-            mock.patch.object(self.app, "runtime_socket_path",
-                              lambda env=None: directory / "run" / "omarchy-soundcloud" / "control.sock"),
-            mock.patch.object(self.app, "prepare_runtime_socket_path", lambda path: None),
-        )
-        for patch in patches:
-            self.enterContext(patch)
-        self.application = self.app.build_application()
-        self.application.run_in_thread = lambda target: target()
-        self.addCleanup(self.application.playback.close)
-        self.addCleanup(self.application.artwork_cache.close)
-        self.addCleanup(self.application.list_artwork_cache.close)
-        return self.application
-
-    def command(self, text):
-        connection = FakeConnection()
-        self.application.dispatch_slots.acquire()
-        self.application._handle_command(text, connection, 7)
-        return connection
-
-    LINK = "https://soundcloud.com/artist/song-50"
-
-    def run_link(self, command):
-        connection = self.command(command)
-        self.glib.run_idle()  # the lookup finished off the main loop and now reports back
-        return connection
-
-    def truncated_api(self):
-        """Make every API call except /me fail the way a cut connection does."""
-        import http.client
-
-        class Response:
-            def __init__(self, body, fail): self.body, self.fail = body, fail
-            def __enter__(self): return self
-            def __exit__(self, *_exc): return False
-            def read(self, _size=-1):
-                if self.fail:
-                    raise http.client.IncompleteRead(b"{", 100)
-                return self.body
-
-        class Opener:
-            def open(self, request, timeout=None):
-                is_me = request.full_url.endswith("/me")
-                return Response(b'{"id": 42}', fail=not is_me)
-
-        self.enterContext(mock.patch.object(self.app, "_api_opener", Opener()))
-        self.application.track_likes.load_token = lambda: "token"
-        self.application.track_likes.request = self.app.soundcloud_api_request
-
-    def test_a_cut_api_reply_is_an_oserror(self):
-        app = load_module()
-        import http.client
-
-        class Cut:
-            def open(self, _request, timeout=None): raise http.client.CannotSendRequest()
-
-        with mock.patch.object(app, "_api_opener", Cut()), self.assertRaises(OSError):
-            app.soundcloud_api_request("GET", "/me", "token")
-
-    def test_a_cut_reply_still_answers_a_like_and_frees_the_slot(self):
-        self.build()
-        self.truncated_api()
-        free = self.application.dispatch_slots._value
-
-        reply = self.command("like:soundcloud:tracks:5")
-        self.glib.run_idle()
-
-        self.assertEqual((reply.reply["ok"], reply.reply["error"]),
-                         (False, "SoundCloud could not update this like"))
-        self.assertEqual(self.application.dispatch_slots._value, free)
-
-    def test_a_cut_reply_still_answers_a_pasted_link_and_frees_the_slot(self):
-        self.build()
-        self.truncated_api()
-        free = self.application.dispatch_slots._value
-
-        reply = self.run_link("play-url:" + self.LINK).reply
-
-        self.assertEqual((reply["ok"], reply["error"]), (False, "Couldn't reach SoundCloud. Try again"))
-        self.assertEqual(self.application.dispatch_slots._value, free)
-
-    def test_an_unexpected_error_in_a_like_or_link_thread_still_replies_and_frees_the_slot(self):
-        self.build()
-        free = self.application.dispatch_slots._value
-        self.application.track_likes.set_liked = mock.Mock(side_effect=RuntimeError("boom"))
-        self.application.track_likes.resolve_link = mock.Mock(side_effect=RuntimeError("boom"))
-
-        like = self.command("like:soundcloud:tracks:5")
-        link = self.run_link("play-url:" + self.LINK)
-        self.glib.run_idle()
-
-        self.assertFalse(like.reply["ok"])
-        self.assertFalse(link.reply["ok"])
-        self.assertEqual(self.application.dispatch_slots._value, free)
 
 
 class CheckResultTest(unittest.TestCase):
@@ -5736,63 +5641,6 @@ class SettingsStatusFieldsTest(unittest.TestCase):
 
         for key in ("volume", "muted", "trackUrl"):
             self.assertNotIn(key, status)
-
-
-class VolumeCommandTest(unittest.TestCase):
-    """The volume socket commands, through the real application class."""
-
-    build = SeekCommandTest.build
-    command = SeekCommandTest.command
-    start = SeekCommandTest.start
-
-    def saved_settings(self):
-        fd = os.open(self.data, os.O_RDONLY)
-        self.addCleanup(os.close, fd)
-        return self.app.SettingsStore(fd).load()
-
-    def test_volume_commands_change_the_status_and_are_saved_privately(self):
-        self.build()
-
-        reply = self.command("volume:0.4")
-        self.assertEqual((reply.reply["ok"], reply.reply["volume"], reply.reply["muted"]), (True, 0.4, False))
-        self.assertEqual(self.command("mute").reply["muted"], True)
-        status = self.application.build_status()
-        self.assertEqual((status["volume"], status["muted"]), (0.4, True))  # mute keeps the volume
-        self.assertEqual(self.command("volume-step:-0.1").reply["volume"], 0.3)
-        self.assertFalse(self.application.build_status()["muted"])
-        self.assertFalse(self.command("volume:loud").reply["ok"])
-        self.assertFalse(self.command("volume-step:inf").reply["ok"])
-        self.assertEqual(self.application.playback.volume, 0.3)
-        self.command("volume:0")
-        self.assertTrue(self.application.build_status()["muted"])
-
-        self.assertFalse((self.data / "settings.json").exists())  # debounced
-        self.glib.run_idle()
-        self.assertEqual(self.saved_settings()["volume"], 0.0)
-        self.assertTrue(self.saved_settings()["muted"])
-        self.assertEqual(stat.S_IMODE((self.data / "settings.json").stat().st_mode), 0o600)
-
-    def test_a_volume_set_before_a_track_applies_to_the_next_one(self):
-        self.build()
-        self.command("volume:0.25")
-
-        pipeline = self.start()
-
-        self.assertEqual(pipeline.properties["volume"], 0.25)
-
-    def test_saved_settings_are_restored_at_startup(self):
-        self.build(settings={"v": 1, "volume": 0.3, "muted": True})
-
-        status = self.application.build_status()
-
-        self.assertEqual((status["volume"], status["muted"]), (0.3, True))
-
-    def test_defaults_without_a_settings_file(self):
-        self.build()
-
-        status = self.application.build_status()
-
-        self.assertEqual((status["volume"], status["muted"]), (1.0, False))
 
 
 class BarWidgetTest(unittest.TestCase):
