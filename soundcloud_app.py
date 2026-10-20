@@ -687,6 +687,27 @@ def queue_next_from_command(command: str) -> str | None:
     return value if is_playback_id(value) else None
 
 
+def queue_add_from_command(command: str) -> str | None:
+    value = command.removeprefix("queue-add:") if command.startswith("queue-add:") else None
+    return value if is_playback_id(value) else None
+
+
+def queue_play_from_command(command: str) -> str | None:
+    value = command.removeprefix("queue-play:") if command.startswith("queue-play:") else None
+    return value if is_playback_id(value) else None
+
+
+def queue_move_from_command(command: str) -> tuple[str, int] | None:
+    """`queue-move:<playback id>:<signed offset>` as (playback id, offset), the offset clamped
+    to the queue size. Offsets are whole numbers with an optional sign, at most four digits."""
+    if not command.startswith("queue-move:"):
+        return None
+    track_id, _, offset = command.removeprefix("queue-move:").rpartition(":")
+    if not is_playback_id(track_id) or re.fullmatch(r"[+-]?[0-9]{1,4}", offset) is None:
+        return None
+    return track_id, max(-MAX_TRACKS, min(MAX_TRACKS, int(offset)))
+
+
 def repeat_from_command(command: str, current: str) -> str | None:
     """The mode a `repeat` command asks for: bare `repeat` cycles none, one, all."""
     if command == "repeat":
@@ -720,6 +741,11 @@ def _command_number(command: str, prefix: str, minimum: float, maximum: float) -
     except ValueError:
         return None
     return max(minimum, min(maximum, number)) if math.isfinite(number) else None
+
+
+def queue_remove_from_command(command: str) -> str | None:
+    value = command.removeprefix("queue-remove:") if command.startswith("queue-remove:") else None
+    return value if is_playback_id(value) else None
 
 
 def track_like_from_command(command: str) -> tuple[str, bool] | None:
@@ -4698,6 +4724,23 @@ def build_application(show_on_start: bool = False):
             )
             return False
 
+        def _queue_payload(self):
+            """The queue as the popup shows it: validated rows (at most 100) and the cursor."""
+            rows, cursor, explicit_count = self.queue.view(MAX_TRACKS)
+            result = self._secure_tracks({"tracks": rows})
+            if result is None:
+                rows, cursor, explicit_count, result = [], -1, 0, {"tracks": []}
+            for row, source in zip(result["tracks"], rows):
+                # the row validator leaves false flags out; the popup always gets all four
+                for flag in ("explicit", "added", "auto", "current"):
+                    row[flag] = source.get(flag) is True
+            return {"queue": {
+                "cursor": cursor,
+                "items": result["tracks"],
+                "explicit_count": explicit_count,
+                "added_count": len(self.queue.added),
+            }}
+
         def _publish_status_once(self):
             self._publish_status()
             return False
@@ -5022,6 +5065,39 @@ def build_application(show_on_start: bool = False):
                      **({} if row is not None else {"error": "SoundCloud track details are not ready"})},
                     publish_status=True,
                 )
+            elif command.startswith("queue-add:"):
+                row = self.playback_tracks.get(queue_add_from_command(command))
+                added = row is not None and self.queue.add_last(row)
+                if added:
+                    self._queue_changed()
+                self._respond(
+                    connection,
+                    request_id,
+                    {"ok": row is not None, "running": True, "added": added,
+                     **({} if row is not None else {"error": "SoundCloud track details are not ready"})},
+                    publish_status=True,
+                )
+            elif command.startswith("queue-play:"):
+                row = self.queue.jump_to(queue_play_from_command(command))
+                if row is None:
+                    self._respond(
+                        connection, request_id,
+                        {"ok": False, "running": True, "error": "That track isn't in the queue"},
+                    )
+                else:
+                    self._queue_changed()
+                    self._play_when_page_ready(row, connection, request_id)
+            elif command.startswith("queue-move:"):
+                moved = queue_move_from_command(command)
+                done = moved is not None and self.queue.move(*moved)
+                if done:
+                    self._queue_changed()
+                self._respond(
+                    connection, request_id,
+                    {"ok": done, "running": True, **self._queue_payload(),
+                     **({} if done else {"error": "That track can't be moved"})},
+                    publish_status=done,
+                )
             elif command.startswith(("volume:", "volume-step:")) or command == "mute":
                 level = volume_from_command(command)
                 step = volume_step_from_command(command)
@@ -5037,6 +5113,24 @@ def build_application(show_on_start: bool = False):
                 self._respond(
                     connection, request_id,
                     {"ok": ok, "running": True, **self.playback.volume_status()},
+                    publish_status=True,
+                )
+            elif command == "queue":
+                self._respond(
+                    connection, request_id, {"ok": True, "running": True, **self._queue_payload()}
+                )
+            elif command == "queue-clear" or command.startswith("queue-remove:"):
+                if command == "queue-clear":
+                    self.queue.clear()
+                    done = True
+                else:
+                    done = self.queue.remove(queue_remove_from_command(command))
+                if done:
+                    self._queue_changed()
+                self._respond(
+                    connection, request_id,
+                    {"ok": done, "running": True, **self._queue_payload(),
+                     **({} if done else {"error": "That track can't be removed"})},
                     publish_status=True,
                 )
             elif command.startswith("seek:"):

@@ -3128,6 +3128,16 @@ class QueueCommandParsingTest(unittest.TestCase):
         self.assertIs(app.shuffle_from_command("shuffle:off", True), False)
         self.assertIsNone(app.shuffle_from_command("shuffle:maybe", True))
 
+    def test_queue_remove_needs_a_playback_id(self):
+        app = load_module()
+
+        self.assertEqual(app.queue_remove_from_command("queue-remove:soundcloud:tracks:5"),
+                         "soundcloud:tracks:5")
+        self.assertIsNone(app.queue_remove_from_command("queue-remove:5"))
+        self.assertIsNone(app.queue_remove_from_command("queue-remove:"))
+        self.assertIsNone(app.queue_remove_from_command("queue-add:soundcloud:tracks:5"))
+
+
 class QueueStatusTest(unittest.TestCase):
     BASE = {
         "playerPresent": True, "playbackState": "playing", "playing": True,
@@ -4373,6 +4383,334 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual(self.application.build_status()["error"], "Skipped 1 track that can't play")
 
     # an API reply cut short mid-body must not wedge the worker threads
+
+    def test_the_queue_command_lists_marked_rows_capped_at_100(self):
+        with self.subTest('the queue command lists the rows with their marks'):
+            self.build()
+            self.fill("home", 5)
+            self.command("play-from:home:soundcloud:tracks:2")
+            self.resolve()
+            self.command("queue-next:soundcloud:tracks:5")
+
+            reply = self.command("queue").reply
+
+            queue = reply["queue"]
+            self.assertTrue(reply["ok"])
+            self.assertEqual(set(queue), {"cursor", "items", "explicit_count", "added_count"})
+            self.assertEqual((queue["cursor"], queue["explicit_count"]), (1, 1))
+            self.assertEqual([row["playbackId"].rpartition(":")[2] for row in queue["items"]],
+                             ["1", "2", "5", "3", "4"])
+            self.assertEqual([row["current"] for row in queue["items"]], [False, True, False, False, False])
+            self.assertEqual([row["explicit"] for row in queue["items"]], [False, False, True, False, False])
+            self.assertEqual([row["auto"] for row in queue["items"]], [False] * 5)
+            self.assertIn("artworkId", queue["items"][0])
+            self.assertNotIn("artUrl", queue["items"][0])
+        with self.subTest('the queue command works when empty'):
+            self.build()
+            self.assertEqual(self.command("queue").reply["queue"],
+                             {"cursor": -1, "items": [], "explicit_count": 0, "added_count": 0})
+        with self.subTest('the queue command returns at most 100 rows'):
+            self.build()
+            self.fill("home", 100)
+            self.command("play-from:home:soundcloud:tracks:100")
+            self.resolve()
+            for number in range(200, 240):
+                row = self.row(number)
+                self.application.playback_tracks[row["playbackId"]] = row
+                self.command("queue-next:" + row["playbackId"])
+
+            queue = self.command("queue").reply["queue"]
+
+            self.assertEqual(len(queue["items"]), 100)
+            self.assertTrue(queue["items"][queue["cursor"]]["current"])
+
+    def test_queue_remove_rules(self):
+        with self.subTest('queue remove takes out a row and publishes the status'):
+            self.build()
+            self.fill("home", 4)
+            self.command("play-from:home:soundcloud:tracks:2")
+            self.resolve()
+            self.glib.timers.clear()
+
+            reply = self.command("queue-remove:soundcloud:tracks:3")
+
+            self.assertTrue(reply.reply["ok"])
+            self.assertEqual(self.queue_ids(), ["1", "2", "4"])
+            self.assertEqual([row["playbackId"].rpartition(":")[2] for row in reply.reply["queue"]["items"]],
+                             ["1", "2", "4"])
+            self.assertTrue(self.glib.timers)  # the status goes out
+            self.assertEqual(self.application.build_status()["length"], 3)
+            self.assertEqual(self.application.playback.state, "playing")
+        with self.subTest('queue remove refuses the playing track and unknown ones'):
+            self.build()
+            self.fill("home", 3)
+            self.command("play-from:home:soundcloud:tracks:2")
+            self.resolve()
+
+            self.assertFalse(self.command("queue-remove:soundcloud:tracks:2").reply["ok"])
+            self.assertFalse(self.command("queue-remove:soundcloud:tracks:99").reply["ok"])
+            self.assertFalse(self.command("queue-remove:nonsense").reply["ok"])
+
+            self.assertEqual(self.queue_ids(), ["1", "2", "3"])
+            self.assertEqual(self.application.playback.state, "playing")
+        with self.subTest('queue remove takes out a play next row'):
+            self.build()
+            self.fill("home", 4)
+            self.command("play-from:home:soundcloud:tracks:1")
+            self.resolve()
+            self.command("queue-next:soundcloud:tracks:4")
+
+            self.command("queue-remove:soundcloud:tracks:4")
+
+            self.assertEqual(self.application.queue.explicit, [])
+            self.assertEqual(self.command("queue").reply["queue"]["explicit_count"], 0)
+
+    def test_queue_clear_rules(self):
+        with self.subTest('queue clear keeps only the playing track'):
+            self.build()
+            self.fill("home", 4)
+            self.command("play-from:home:soundcloud:tracks:3")
+            self.resolve()
+            self.command("queue-next:soundcloud:tracks:1")
+
+            reply = self.command("queue-clear")
+
+            self.assertTrue(reply.reply["ok"])
+            self.assertEqual(self.queue_ids(), ["3"])
+            self.assertEqual(self.application.queue.explicit, [])
+            status = self.application.build_status()
+            self.assertEqual((status["length"], status["canNext"], status["cursor"]), (1, False, 0))
+            self.assertEqual(self.application.playback.state, "playing")
+            self.glib.run_idle()
+            self.assertTrue(self.queue_file.exists())
+        with self.subTest('queue clear on an empty queue is fine'):
+            self.build()
+
+            self.assertTrue(self.command("queue-clear").reply["ok"])
+
+    # queue-add, queue-play, queue-move
+
+    def add_rows(self, *numbers):
+        """Make rows known by id without putting them in a list."""
+        for number in numbers:
+            row = self.row(number)
+            self.application.playback_tracks[row["playbackId"]] = row
+
+    def shown_ids(self, reply):
+        return [row["playbackId"].rpartition(":")[2] for row in reply["queue"]["items"]]
+
+    def play_four(self):
+        self.build()
+        self.fill("home", 4)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+
+    def test_queue_add_rules(self):
+        with self.subTest('queue add plays after the whole list and after play next items'):
+            self.play_four()
+            self.add_rows(10, 11, 20)
+            self.glib.timers.clear()
+
+            reply = self.command("queue-add:soundcloud:tracks:10")
+            self.command("queue-add:soundcloud:tracks:11")
+            self.command("queue-next:soundcloud:tracks:20")
+
+            self.assertEqual((reply.reply["ok"], reply.reply["added"]), (True, True))
+            self.assertTrue(self.glib.timers)  # the status goes out
+            self.assertEqual(self.shown_ids(self.command("queue").reply), ["1", "20", "2", "3", "4", "10", "11"])
+            order = []
+            for _ in range(6):
+                self.command("next")
+                order.append(self.started_id())
+                self.resolve()
+            self.assertEqual(order, ["20", "2", "3", "4", "10", "11"])
+            self.assertFalse(self.application.queue.can_next)
+        with self.subTest('queue add rows are marked and counted in the queue view'):
+            self.play_four()
+            self.add_rows(10, 20)
+            self.command("queue-next:soundcloud:tracks:20")
+            self.command("queue-add:soundcloud:tracks:10")
+
+            queue = self.command("queue").reply["queue"]
+
+            last = queue["items"][-1]
+            self.assertEqual((last["playbackId"], last["added"], last["explicit"]),
+                             ("soundcloud:tracks:10", True, True))
+            self.assertEqual([row["added"] for row in queue["items"]], [False] * 5 + [True])
+            self.assertEqual((queue["explicit_count"], queue["added_count"]), (1, 1))
+        with self.subTest('queue add keeps one copy and ignores tracks already coming up'):
+            self.play_four()
+            self.add_rows(10)
+
+            self.command("queue-add:soundcloud:tracks:10")
+            again = self.command("queue-add:soundcloud:tracks:10")
+            in_list = self.command("queue-add:soundcloud:tracks:3")
+
+            self.assertEqual((again.reply["ok"], again.reply["added"]), (True, False))
+            self.assertEqual((in_list.reply["ok"], in_list.reply["added"]), (True, False))
+            self.assertEqual([row["title"] for row in self.application.queue.added], ["Song 10"])
+            self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        with self.subTest('queue add of an unknown or malformed id is refused'):
+            self.play_four()
+
+            for command in ("queue-add:soundcloud:tracks:99", "queue-add:nonsense", "queue-add:",
+                            "queue-add:soundcloud:tracks:7:8", "queue-add:" + "9" * 5000):
+                reply = self.command(command).reply
+                self.assertFalse(reply["ok"], command)
+            self.assertEqual(self.application.queue.added, [])
+        with self.subTest('queue add is saved and restored after a restart'):
+            self.play_four()
+            self.add_rows(10)
+            self.command("queue-add:soundcloud:tracks:10")
+            self.glib.run_idle()
+
+            saved = json.loads(self.queue_file.read_text())
+            self.assertEqual([row["playbackId"] for row in saved["added"]], ["soundcloud:tracks:10"])
+            self.build(saved_file=self.queue_file.read_bytes())
+            self.assertEqual([row["title"] for row in self.application.queue.added], ["Song 10"])
+        with self.subTest('a queue add works on an empty queue and plays when reached'):
+            self.build()
+            self.add_rows(10)
+
+            self.assertTrue(self.command("queue-add:soundcloud:tracks:10").reply["added"])
+            self.assertTrue(self.application.build_status()["canNext"])
+            self.command("next")
+
+            self.assertEqual(self.started_id(), "10")
+
+    def test_queue_play_rules(self):
+        with self.subTest('queue play jumps to a row of the list and keeps the queue'):
+            self.play_four()
+
+            reply = self.command("queue-play:soundcloud:tracks:3")
+            self.assertEqual(self.started_id(), "3")
+            self.resolve()
+            back = self.command("queue-play:soundcloud:tracks:2")
+            self.assertEqual(self.started_id(), "2")
+            self.resolve()
+
+            self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+            self.assertEqual(self.application.queue.cursor, 1)
+            self.assertTrue(reply.reply["ok"])
+            self.assertTrue(back.reply["ok"])
+            self.assertEqual(self.application.playback.state, "playing")
+        with self.subTest('queue play starts a play next or added row where it stands'):
+            self.play_four()
+            self.add_rows(10, 20)
+            self.command("queue-next:soundcloud:tracks:20")
+            self.command("queue-add:soundcloud:tracks:10")
+
+            self.command("queue-play:soundcloud:tracks:10")
+            self.assertEqual(self.started_id(), "10")
+            self.resolve()
+            self.command("queue-play:soundcloud:tracks:20")
+            self.assertEqual(self.started_id(), "20")
+
+            self.assertEqual((self.application.queue.explicit, self.application.queue.added), ([], []))
+            self.assertEqual(self.queue_ids(), ["1", "10", "20", "2", "3", "4"])
+            self.assertEqual(self.application.queue.current["title"], "Song 20")
+        with self.subTest('queue play of a track that is not queued changes nothing'):
+            self.play_four()
+            self.add_rows(10)
+            started = len(self.evaluated)
+
+            for command in ("queue-play:soundcloud:tracks:10", "queue-play:soundcloud:tracks:99",
+                            "queue-play:nonsense", "queue-play:", "queue-play:" + "x" * 5000):
+                reply = self.command(command).reply
+                self.assertFalse(reply["ok"], command)
+                self.assertIn("error", reply)
+
+            self.assertEqual((len(self.evaluated), self.application.queue.cursor), (started, 0))
+
+    def test_queue_move_rules(self):
+        with self.subTest('queue move reorders list rows and clamps at the ends'):
+            self.build()
+            self.fill("home", 5)
+            self.command("play-from:home:soundcloud:tracks:1")
+            self.resolve()
+            self.glib.timers.clear()
+
+            down = self.command("queue-move:soundcloud:tracks:2:+2")
+            self.assertTrue(self.glib.timers)  # the status goes out
+            self.assertEqual(self.shown_ids(down.reply), ["1", "3", "4", "2", "5"])
+            self.assertTrue(down.reply["ok"])
+            self.command("queue-move:soundcloud:tracks:5:-99")
+            self.assertEqual(self.queue_ids(), ["1", "5", "3", "4", "2"])
+            self.command("queue-move:soundcloud:tracks:5:99")
+            self.assertEqual(self.queue_ids(), ["1", "3", "4", "2", "5"])
+            self.assertEqual(self.command("queue-move:soundcloud:tracks:3:0").reply["ok"], True)
+            self.assertEqual(self.queue_ids(), ["1", "3", "4", "2", "5"])
+            self.assertEqual(self.application.playback.state, "playing")
+            self.glib.run_idle()
+            self.assertEqual([row["playbackId"].rpartition(":")[2]
+                              for row in json.loads(self.queue_file.read_text())["items"]],
+                             ["1", "3", "4", "2", "5"])
+        with self.subTest('queue move stays inside each group'):
+            self.play_four()
+            self.add_rows(10, 11, 12, 30, 31)
+            for number in (10, 11, 12):
+                self.command(f"queue-next:soundcloud:tracks:{number}")
+            for number in (30, 31):
+                self.command(f"queue-add:soundcloud:tracks:{number}")
+
+            self.command("queue-move:soundcloud:tracks:12:-1")
+            self.command("queue-move:soundcloud:tracks:10:+50")  # cannot leave the play-next group
+            self.command("queue-move:soundcloud:tracks:30:+1")
+            self.command("queue-move:soundcloud:tracks:4:-50")  # cannot leave the list rows to come
+
+            self.assertEqual([row["title"] for row in self.application.queue.explicit],
+                             ["Song 12", "Song 11", "Song 10"])
+            self.assertEqual([row["title"] for row in self.application.queue.added], ["Song 31", "Song 30"])
+            self.assertEqual(self.shown_ids(self.command("queue").reply),
+                             ["1", "12", "11", "10", "4", "2", "3", "31", "30"])
+        with self.subTest('queue move refuses the playing track played rows and unknown ones'):
+            self.build()
+            self.fill("home", 4)
+            self.command("play-from:home:soundcloud:tracks:2")
+            self.resolve()
+
+            for command in ("queue-move:soundcloud:tracks:2:1",   # playing
+                            "queue-move:soundcloud:tracks:1:1",   # already played
+                            "queue-move:soundcloud:tracks:99:1"):  # not queued
+                reply = self.command(command).reply
+                self.assertFalse(reply["ok"], command)
+                self.assertEqual(reply["error"], "That track can't be moved")
+            self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        with self.subTest('queue move with a bad offset or id is refused'):
+            self.play_four()
+
+            for command in ("queue-move:soundcloud:tracks:3:1.5", "queue-move:soundcloud:tracks:3:abc",
+                            "queue-move:soundcloud:tracks:3:", "queue-move:soundcloud:tracks:3:+",
+                            "queue-move:soundcloud:tracks:3:99999", "queue-move:soundcloud:tracks:3:1e2",
+                            "queue-move:soundcloud:tracks:3: 1", "queue-move:soundcloud:tracks:3",
+                            "queue-move:3:1", "queue-move:../etc:1", "queue-move:", "queue-move::",
+                            "queue-move:" + "9" * 5000 + ":1"):
+                self.assertFalse(self.command(command).reply["ok"], command)
+            self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+
+    def test_the_new_queue_commands_parse_strictly(self):
+        app = self.app if hasattr(self, "app") else load_module()
+
+        self.assertEqual(app.queue_add_from_command("queue-add:soundcloud:tracks:7"), "soundcloud:tracks:7")
+        self.assertEqual(app.queue_play_from_command("queue-play:soundcloud:tracks:7"), "soundcloud:tracks:7")
+        self.assertEqual(app.queue_move_from_command("queue-move:soundcloud:tracks:7:-3"),
+                         ("soundcloud:tracks:7", -3))
+        self.assertEqual(app.queue_move_from_command("queue-move:soundcloud:tracks:7:+2"),
+                         ("soundcloud:tracks:7", 2))
+        self.assertEqual(app.queue_move_from_command("queue-move:soundcloud:tracks:7:9999"),
+                         ("soundcloud:tracks:7", app.MAX_TRACKS))
+        self.assertEqual(app.queue_move_from_command("queue-move:soundcloud:tracks:7:-9999"),
+                         ("soundcloud:tracks:7", -app.MAX_TRACKS))
+        for command in ("queue-add:7", "queue-add:", "queue-add:soundcloud:tracks:0"):
+            self.assertIsNone(app.queue_add_from_command(command))
+        for command in ("queue-play:7", "queue-play:soundcloud:tracks:07"):
+            self.assertIsNone(app.queue_play_from_command(command))
+        for command in ("queue-move:soundcloud:tracks:7", "queue-move:7:1", "queue-move:soundcloud:tracks:7:1:1"):
+            self.assertIsNone(app.queue_move_from_command(command))
+
+    # pasted links
+
+    LINK = "https://soundcloud.com/artist/song-50"
 
     def test_picking_an_encrypted_only_track_fails_at_once_with_the_real_reason(self):
         self.build()
