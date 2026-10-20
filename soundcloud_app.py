@@ -2264,6 +2264,11 @@ def soundcloud_api_request(method: str, path: str, token: str, maximum: int = 25
     return json.loads(data) if data.strip() else None
 
 
+def _truncate_bytes(text: str, maximum: int) -> str:
+    """`text` cut to at most `maximum` UTF-8 bytes, at a character boundary."""
+    return text.encode("utf-8")[:maximum].decode("utf-8", "ignore")
+
+
 def track_from_entry(item: object) -> dict[str, object] | None:
     """Turn one likes or play-history entry into a track row, or None if unusable."""
     track = item.get("track") if isinstance(item, dict) else None
@@ -2283,8 +2288,8 @@ def track_from_entry(item: object) -> dict[str, object] | None:
     play_count = track.get("playback_count")
     return {
         "playbackId": f"soundcloud:tracks:{track_id}",
-        "title": title.strip()[:512],
-        "artist": str(artist)[:256],
+        "title": _truncate_bytes(title.strip()[:MAX_TITLE_BYTES], MAX_TITLE_BYTES),
+        "artist": _truncate_bytes(str(artist)[:MAX_ARTIST_BYTES], MAX_ARTIST_BYTES),
         "url": permalink[:2048],
         "artUrl": str(art_url)[:2048],
         "playCount": play_count if isinstance(play_count, int) and not isinstance(play_count, bool) else 0,

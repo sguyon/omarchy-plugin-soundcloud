@@ -1791,6 +1791,20 @@ class LikedTracksTest(unittest.TestCase):
         self.assertEqual(len(row["artist"]), 256)
         self.assertEqual(len(app.validate_tracks_payload({"tracks": [row]})["tracks"]), 1)
 
+    def test_a_long_multibyte_title_is_cut_to_the_byte_limit_so_the_page_validates(self):
+        app = load_module()
+
+        row = app.track_from_entry(like_item(9, title="\u6f22" * 300, user={"username": "\u5b57" * 300}))
+
+        self.assertLessEqual(len(row["title"].encode()), app.MAX_TITLE_BYTES)
+        self.assertLessEqual(len(row["artist"].encode()), app.MAX_ARTIST_BYTES)
+        self.assertEqual((len(row["title"]), len(row["artist"])), (170, 85))  # whole characters only
+        page = [row, app.track_from_entry(like_item(10))]
+        self.assertEqual(len(app.validate_tracks_payload({"tracks": page})["tracks"]), 2)
+        # the validator itself stays strict
+        too_long = {**page[1], "title": "\u6f22" * 300}
+        self.assertIsNone(app.validate_tracks_payload({"tracks": [too_long]}))
+
     def test_liked_tracks_load_newest_first_page_by_page(self):
         app = load_module()
         api = FakeSoundCloudApi(user_id=42, like_items=[like_item(n) for n in (1, 2, 3)])
