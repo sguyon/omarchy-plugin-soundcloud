@@ -1883,9 +1883,25 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
         "duration": duration,
         "position": min(position, duration) if duration else position,
         "waveform": validate_waveform(payload.get("waveform", [])),
-        **_setting_status_fields(payload),
         **({"error": error} if error else {}),
+        **_queue_status_fields(payload),
+        **_setting_status_fields(payload),
     }
+
+
+def _queue_status_fields(payload: dict[str, object]) -> dict[str, object]:
+    """The optional queue keys of a status payload; anything missing or invalid is left out."""
+    fields: dict[str, object] = {}
+    for key in ("canNext", "canPrevious", "shuffle"):
+        if isinstance(payload.get(key), bool):
+            fields[key] = payload[key]
+    for key in ("cursor", "length"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_TRACKS:
+            fields[key] = value
+    if payload.get("repeat") in REPEAT_MODES:
+        fields["repeat"] = payload["repeat"]
+    return fields
 
 
 def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
@@ -1898,6 +1914,35 @@ def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
         if isinstance(payload.get(key), bool):
             fields[key] = payload[key]
     return fields
+
+
+def queue_status(queue: "PlayQueue") -> dict[str, object]:
+    return {
+        "canNext": queue.can_next,
+        "canPrevious": queue.can_previous,
+        "cursor": queue.cursor,
+        "length": queue.length,
+        "repeat": queue.repeat,
+        "shuffle": queue.shuffle,
+    }
+
+
+def restored_status(row: dict[str, object], position_ms: int) -> dict[str, object]:
+    """The saved track shown as paused at its saved position, with no audio started."""
+    duration = _bounded_integer(row.get("durationMs"), 0, MAX_TRACK_DURATION_MS) / 1000
+    position = position_ms / 1000
+    return {
+        "playerPresent": True,
+        "playbackState": "paused",
+        "playing": False,
+        "playbackId": str(row.get("playbackId", "")),
+        "title": str(row.get("title", "")),
+        "artist": str(row.get("artist", "")),
+        "artUrl": str(row.get("artUrl", "")),
+        "duration": duration,
+        "position": min(position, duration) if duration else position,
+        "waveform": [],
+    }
 
 
 def merge_status(page_cache: dict[str, object], gst_status: dict[str, object]) -> dict[str, object]:

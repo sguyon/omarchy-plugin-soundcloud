@@ -3039,6 +3039,68 @@ class QueueStoreTest(unittest.TestCase):
         self.assertEqual(app.sanitize_queue({"v": True, "items": [self.row(1)]})["items"], [])
 
 
+class QueueStatusTest(unittest.TestCase):
+    BASE = {
+        "playerPresent": True, "playbackState": "playing", "playing": True,
+        "playbackId": "soundcloud:tracks:5", "title": "T", "artist": "A", "artUrl": "",
+        "loggedIn": True, "url": "https://soundcloud.com/feed", "duration": 10, "position": 1,
+    }
+
+    def test_the_old_keys_are_unchanged_and_the_queue_keys_are_optional(self):
+        app = load_module()
+        plain = app.validate_status_payload(self.BASE)
+        queue = app.PlayQueue()
+        queue.replace([PlayQueueTest.row(None, n) for n in (1, 2, 3)], 1, "home")
+
+        with_queue = app.validate_status_payload({**self.BASE, **app.queue_status(queue)})
+
+        self.assertEqual(
+            set(plain),
+            {"playerPresent", "playbackState", "playing", "playbackId", "title", "artist",
+             "artUrl", "loggedIn", "url", "duration", "position", "waveform"},
+        )
+        self.assertEqual({key: with_queue[key] for key in plain}, plain)
+        self.assertEqual(
+            {key: with_queue[key] for key in set(with_queue) - set(plain)},
+            {"canNext": True, "canPrevious": True, "cursor": 1, "length": 3,
+             "repeat": "none", "shuffle": False},
+        )
+
+    def test_invalid_queue_values_are_left_out(self):
+        app = load_module()
+        forged = {**self.BASE, "canNext": "yes", "canPrevious": 1, "cursor": -1, "length": True,
+                  "repeat": "twice", "shuffle": None}
+
+        self.assertEqual(
+            set(app.validate_status_payload(forged)), set(app.validate_status_payload(self.BASE))
+        )
+        self.assertNotIn("cursor", app.validate_status_payload({**self.BASE, "cursor": 10**6}))
+
+    def test_an_empty_queue_cannot_go_next_or_previous(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.queue_status(app.PlayQueue()),
+            {"canNext": False, "canPrevious": False, "cursor": 0, "length": 0,
+             "repeat": "none", "shuffle": False},
+        )
+
+    def test_a_restored_track_is_paused_at_its_saved_position_with_its_metadata(self):
+        app = load_module()
+        row = {**PlayQueueTest.row(None, 4), "durationMs": 200_000}
+
+        status = app.validate_status_payload(
+            {**app.restored_status(row, 61_000), "loggedIn": True}
+        )
+
+        self.assertEqual(
+            (status["playbackState"], status["playing"], status["position"], status["duration"]),
+            ("paused", False, 61.0, 200.0),
+        )
+        self.assertEqual((status["title"], status["playbackId"]), ("Song 4", "soundcloud:tracks:4"))
+        self.assertEqual(app.restored_status(row, 900_000)["position"], 200.0)
+
+
 class TrackLikesTest(unittest.TestCase):
     def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
         app = load_module()
