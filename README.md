@@ -13,6 +13,9 @@ without official SoundCloud API credentials.
 - Current track, artist, and artwork, with the bar icon highlighted during playback
 - Play/pause, previous, and next controls, with a play queue that continues with the
   next track and survives a restart
+- Media keys, `playerctl` and the shell's media display work: the backend shows up on the
+  session bus as an MPRIS player named SoundCloud, with the title, artist, cover and position,
+  and play, pause, next, previous, seek, volume, repeat and shuffle
 - Volume icon in the popup: click to mute, scroll over it or hover for a slider to
   change the level. The player's own volume (not the system volume) is saved between sessions
 - Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and

@@ -4338,6 +4338,7 @@ def build_application(show_on_start: bool = False):
             super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
             self.window = None
             self.webview = None
+            self.mpris = None
             self.status_subscribers = StatusSubscribers()
             self.page_status = PageStatusCache(self._evaluate, status_script())
             self.status_hold_until = 0.0
@@ -4408,6 +4409,7 @@ def build_application(show_on_start: bool = False):
             self._create_window()
             self.hold()
             self.control_server.start()
+            self._start_mpris()
             GLib.timeout_add(STATUS_INTERVAL_MS, self._publish_status)
             GLib.timeout_add_seconds(PAGE_STATUS_INTERVAL_SECONDS, self._poll_page_status)
             GLib.timeout_add_seconds(5, self._check_installation)
@@ -4421,6 +4423,8 @@ def build_application(show_on_start: bool = False):
         def do_shutdown(self):
             self._save_queue()
             self._save_settings()
+            if self.mpris is not None:
+                self.mpris.stop()
             self.control_server.close()
             self.playback.close()
             self.artwork_cache.close()
@@ -5257,9 +5261,9 @@ def build_application(show_on_start: bool = False):
             self._keep_failed_track(status, ("error",))
             return status
 
-        def _keep_failed_track(self, status, states):
+        def _keep_failed_track(self, status, states, with_duration=False):
             """A failed track loses its details in the player. Put the queue row's title and
-            artist back so the track stays on show; the state,
+            artist back (and its length, for MPRIS) so the track stays on show; the state,
             `playing` and the error text are left as they are."""
             row = self.queue.current
             if (row is None or status.get("playbackState") not in states
@@ -5269,8 +5273,42 @@ def build_application(show_on_start: bool = False):
                 status["title"], status["artist"] = str(row.get("title", "")), str(row.get("artist", ""))
                 if not status.get("trackUrl"):
                     status["trackUrl"] = str(row.get("url", ""))
+            if with_duration and not status.get("duration"):
+                status["duration"] = _bounded_integer(
+                    row.get("durationMs"), 0, MAX_TRACK_DURATION_MS) / 1000
+
+        def _start_mpris(self):
+            """Own the MPRIS name; without a bus, or if the name is taken, the plugin runs without it."""
+            try:
+                self.mpris = MprisService(Gio, GLib, self)
+                self.mpris.start()
+            except Exception:
+                self.mpris = None
+
+        def mpris_status(self):
+            """The validated status, with the remote artwork URL kept, for MPRIS."""
+            raw = self._raw_status()
+            # The shell's media widget hides a player without title and artist: keep the track
+            # of an error, or of a stop after one, on show.
+            self._keep_failed_track(raw, ("error", "idle"), with_duration=True)
+            return validate_status_payload(raw) or {}
+
+        def mpris_position_ms(self):
+            return self._position_ms()
+
+        def mpris_command(self, command):
+            """Run a socket command for MPRIS: no connection, request id or dispatch slot."""
+            try:
+                self._handle_command(command, None, None)
+            except Exception:
+                pass
+
+        def _mpris_update(self):
+            if self.mpris is not None and self.mpris.owned:
+                self.mpris.update(self.mpris_status())
 
         def _publish_status(self):
+            self._mpris_update()
             if not self.status_subscribers:
                 return True
             if not self.page_status.seeded and time.monotonic() < self.status_hold_until:

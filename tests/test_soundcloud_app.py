@@ -5517,6 +5517,32 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual((len(self.evaluated), self.application.playback.state), (started, "error"))
         self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
 
+    # MPRIS keeps the track on show after an error
+
+    def test_mpris_keeps_title_and_artist_when_the_track_errors(self):
+        self.build()
+        self.fill("home", 3)[1]["encrypted"] = True
+        self.command("play-from:home:soundcloud:tracks:2")
+
+        status = self.application.mpris_status()
+        properties = self.app.mpris_properties(status)
+
+        self.assertEqual(properties["PlaybackStatus"], "Stopped")
+        self.assertEqual(properties["Metadata"]["xesam:title"], "Song 2")
+        self.assertEqual(properties["Metadata"]["xesam:artist"], ["Artist"])
+        self.assertEqual(properties["Metadata"]["mpris:length"], 1_000_000)
+        self.assertEqual(self.application.build_status()["title"], "Song 2")
+
+    def test_mpris_shows_the_queue_track_when_idle(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.application.playback.stop()
+
+        metadata = self.app.mpris_metadata(self.application.mpris_status())
+
+        self.assertEqual(metadata["xesam:title"], "Song 2")
+
     def test_the_status_carries_the_playing_tracks_page_link(self):
         self.build()
         self.fill("home", 2)
@@ -5535,6 +5561,67 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual(self.application.build_status()["trackUrl"], "https://soundcloud.com/artist/song-2")
 
     # MPRIS wiring
+
+    def test_mpris_play_pause_on_a_restored_track_starts_it_without_a_socket(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n, durationMs=200_000) for n in (1, 2, 3)], 1, "likes")
+        self.build(saved=(queue, 61_000))
+        status = self.application.mpris_status()
+        slots_before = self.application.dispatch_slots._value
+
+        commands = self.app.mpris_method_commands("PlayPause", (), status)
+        for command in commands:
+            self.application.mpris_command(command)
+
+        self.assertEqual(self.started_id(), "2")
+        self.resolve()
+        self.assertEqual(self.application.playback.current.seeks, [61 * 10**9])
+        self.assertEqual(self.application.dispatch_slots._value, slots_before)
+
+    def test_mpris_commands_reuse_the_socket_command_code(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        slots_before = self.application.dispatch_slots._value
+
+        self.application.mpris_command("next")
+        self.assertEqual(self.started_id(), "2")
+        self.application.mpris_command("repeat:one")
+        self.application.mpris_command("shuffle:on")
+        self.application.mpris_command("volume:0.3000")
+        self.application.mpris_command("nonsense")
+
+        self.assertEqual((self.application.queue.repeat, self.application.queue.shuffle),
+                         ("one", True))
+        self.assertEqual(self.application.playback.volume_status()["volume"], 0.3)
+        self.assertEqual(self.application.dispatch_slots._value, slots_before)
+
+    def test_mpris_status_keeps_the_remote_artwork_url_and_the_queue_flags(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n, artUrl="https://i1.sndcdn.com/art-%d.jpg" % n) for n in (1, 2)], 0, "likes")
+        self.build(saved=(queue, 0))
+
+        status = self.application.mpris_status()
+        properties = self.app.mpris_properties(status)
+
+        self.assertEqual(status["artUrl"], "https://i1.sndcdn.com/art-1.jpg")
+        self.assertEqual(properties["Metadata"]["mpris:artUrl"], "https://i1.sndcdn.com/art-1.jpg")
+        self.assertEqual(properties["PlaybackStatus"], "Paused")
+        self.assertTrue(properties["CanGoNext"])
+        self.assertNotIn("artUrl", self.application.build_status())
+
+    def test_the_status_tick_updates_mpris_even_without_a_subscriber(self):
+        self.build()
+        updates = []
+        self.application.mpris = type("M", (), {
+            "owned": True, "update": lambda _self, status: updates.append(status),
+            "stop": lambda _self: None})()
+
+        self.assertFalse(self.application.status_subscribers)
+        self.application._publish_status()
+
+        self.assertEqual(len(updates), 1)
 
     # earbud multi-press
 
