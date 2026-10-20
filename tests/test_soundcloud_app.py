@@ -1946,6 +1946,294 @@ class LikedTracksTest(unittest.TestCase):
         self.assertEqual(cache, {"likes": [row], "history": [row]})
 
 
+def make_resolver(responses, user_id=1):
+    """A fake SoundCloud API request function that answers /me and the given paths."""
+    calls = []
+
+    def request(method, path, token, maximum=0):
+        calls.append((method, path))
+        if path == "/me":
+            return {"id": user_id}
+        result = responses[path]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    return request, calls
+
+
+def track_payload(track_id=7, **overrides):
+    return {**like_item(track_id)["track"], "kind": "track", **overrides}
+
+
+class ParseTrackLinkTest(unittest.TestCase):
+    def test_track_links_are_normalised_to_the_bare_track_page(self):
+        app = load_module()
+        track = ("track", "https://soundcloud.com/artist/song")
+
+        for text in (
+            "https://soundcloud.com/artist/song",
+            "  https://soundcloud.com/artist/song\n",
+            "soundcloud.com/artist/song",
+            "http://soundcloud.com/artist/song",
+            "https://www.soundcloud.com/artist/song",
+            "https://m.soundcloud.com/artist/song/",
+            "https://soundcloud.com/artist/song?si=abc123&utm_source=clipboard",
+            "https://soundcloud.com/artist/song?in=artist/sets/mix#t=1:30",
+        ):
+            self.assertEqual(app.parse_track_link(text), track, text)
+
+    def test_private_track_secret_tokens_are_kept_and_nothing_else(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.parse_track_link("https://soundcloud.com/artist/song/s-AbC123"),
+            ("track", "https://soundcloud.com/artist/song/s-AbC123"),
+        )
+        self.assertEqual(
+            app.parse_track_link("https://soundcloud.com/artist/song?secret_token=s-AbC123&si=x"),
+            ("track", "https://soundcloud.com/artist/song?secret_token=s-AbC123"),
+        )
+        self.assertEqual(
+            app.parse_track_link("https://soundcloud.com/artist/song?secret_token=../../me"),
+            ("track", "https://soundcloud.com/artist/song"),
+        )
+
+    def test_short_links_are_recognised_but_not_followed_here(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.parse_track_link("https://on.soundcloud.com/AbC123"),
+            ("short", "https://on.soundcloud.com/AbC123"),
+        )
+        self.assertEqual(
+            app.parse_track_link("on.soundcloud.com/AbC123/"),
+            ("short", "https://on.soundcloud.com/AbC123"),
+        )
+        with self.assertRaisesRegex(app.LinkError, "valid SoundCloud short link"):
+            app.parse_track_link("https://on.soundcloud.com/a/b")
+
+    def test_other_soundcloud_pages_say_what_they_are(self):
+        app = load_module()
+        cases = {
+            "https://soundcloud.com": "page, not a track",
+            "https://soundcloud.com/discover": "page, not a track",
+            "https://soundcloud.com/you/likes": "page, not a track",
+            "https://soundcloud.com/artist": "artist page",
+            "https://soundcloud.com/artist/likes": "artist page",
+            "https://soundcloud.com/artist/tracks": "artist page",
+            "https://soundcloud.com/artist/sets/mix": "Playlists",
+            "https://soundcloud.com/artist/sets": "Playlists",
+            "https://soundcloud.com/artist/song/extra": "isn't a track link",
+            "https://soundcloud.com/artist/song/recommended/more": "isn't a track link",
+            "https://soundcloud.com/artist/..": "isn't a track link",
+        }
+
+        for text, message in cases.items():
+            with self.assertRaisesRegex(app.LinkError, message, msg=text):
+                app.parse_track_link(text)
+
+    def test_anything_else_is_rejected_before_any_network_call(self):
+        app = load_module()
+        cases = (
+            None,
+            "",
+            "   ",
+            "just some words",
+            "line one\nhttps://soundcloud.com/artist/song",
+            "https://example.com/artist/song",
+            "https://soundcloud.com.evil.example/artist/song",
+            "https://evilsoundcloud.com/artist/song",
+            "https://soundcloud.com@evil.example/artist/song",
+            "https://user:pass@soundcloud.com/artist/song",
+            "https://soundcloud.com:8443/artist/song",
+            "ftp://soundcloud.com/artist/song",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://soundcloud.com/artist/song" + "a" * 3000,
+        )
+
+        for text in cases:
+            with self.assertRaises(app.LinkError, msg=repr(text)[:60]):
+                app.parse_track_link(text)
+
+
+class FollowShortLinkTest(unittest.TestCase):
+    class Opener:
+        def __init__(self, error=None):
+            self.error = error
+            self.requests = []
+
+        def open(self, request, timeout=0):
+            self.requests.append(request)
+            if self.error is not None:
+                raise self.error
+            return contextlib.nullcontext()
+
+    def redirect(self, location, code=302):
+        from urllib.error import HTTPError
+        error = HTTPError("https://on.soundcloud.com/AbC123", code, "Found", {"Location": location}, None)
+        self.addCleanup(error.close)
+        return error
+
+    def test_a_redirect_is_followed_without_sending_any_credentials(self):
+        app = load_module()
+        opener = self.Opener(self.redirect("https://soundcloud.com/artist/song?si=x"))
+
+        result = app.follow_short_link("https://on.soundcloud.com/AbC123", opener)
+
+        self.assertEqual(result, "https://soundcloud.com/artist/song?si=x")
+        headers = {name.lower() for name in opener.requests[0].headers}
+        self.assertNotIn("authorization", headers)
+
+    def test_relative_redirects_are_resolved_against_the_short_link(self):
+        app = load_module()
+        opener = self.Opener(self.redirect("/artist/song", code=301))
+
+        self.assertEqual(
+            app.follow_short_link("https://on.soundcloud.com/AbC123", opener),
+            "https://on.soundcloud.com/artist/song",
+        )
+
+    def test_a_short_link_that_does_not_redirect_is_an_error(self):
+        app = load_module()
+
+        with self.assertRaisesRegex(app.LinkError, "short link"):
+            app.follow_short_link("https://on.soundcloud.com/AbC123", self.Opener())
+        from urllib.error import HTTPError
+        gone = HTTPError("https://on.soundcloud.com/AbC123", 404, "Not Found", {}, None)
+        self.addCleanup(gone.close)
+        with self.assertRaisesRegex(app.LinkError, "short link"):
+            app.follow_short_link("https://on.soundcloud.com/AbC123", self.Opener(gone))
+
+    def test_network_failures_are_not_hidden_as_link_errors(self):
+        app = load_module()
+
+        with self.assertRaises(OSError):
+            app.follow_short_link("https://on.soundcloud.com/AbC123", self.Opener(OSError("offline")))
+
+
+class ResolveLinkTest(unittest.TestCase):
+    RESOLVE_SONG = "/resolve?url=https%3A%2F%2Fsoundcloud.com%2Fartist%2Fsong"
+
+    def likes(self, responses):
+        request, calls = make_resolver(responses)
+        return load_module(), request, calls
+
+    def test_a_track_link_resolves_to_a_playable_row(self):
+        app = load_module()
+        request, calls = make_resolver({self.RESOLVE_SONG: track_payload(7)})
+
+        row = app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+            "https://soundcloud.com/artist/song?si=tracking"
+        )
+
+        self.assertEqual(row["playbackId"], "soundcloud:tracks:7")
+        self.assertEqual(row["title"], "Song 7")
+        self.assertIn(("GET", self.RESOLVE_SONG), calls)
+
+    def test_short_links_are_followed_before_resolving(self):
+        app = load_module()
+        request, calls = make_resolver({self.RESOLVE_SONG: track_payload(7)})
+        opener = FollowShortLinkTest.Opener(
+            FollowShortLinkTest().redirect("https://soundcloud.com/artist/song?utm=x")
+        )
+
+        row = app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+            "https://on.soundcloud.com/AbC123", opener
+        )
+
+        self.assertEqual(row["playbackId"], "soundcloud:tracks:7")
+        self.assertIn(("GET", self.RESOLVE_SONG), calls)
+
+    def test_a_short_link_to_something_else_is_still_rejected(self):
+        app = load_module()
+        request, calls = make_resolver({})
+        opener = FollowShortLinkTest.Opener(FollowShortLinkTest().redirect("https://evil.example/artist/song"))
+
+        with self.assertRaisesRegex(app.LinkError, "doesn't lead to SoundCloud"):
+            app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                "https://on.soundcloud.com/AbC123", opener
+            )
+        self.assertEqual(calls, [])
+
+    def test_a_short_link_to_a_soundcloud_page_that_is_not_a_track_says_so(self):
+        app = load_module()
+        request, calls = make_resolver({})
+        opener = FollowShortLinkTest.Opener(FollowShortLinkTest().redirect("https://soundcloud.com/some-artist"))
+
+        with self.assertRaisesRegex(app.LinkError, "artist page"):
+            app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                "https://on.soundcloud.com/AbC123", opener
+            )
+        self.assertEqual(calls, [])
+
+    def test_playlists_artists_and_unknown_kinds_are_explained(self):
+        app = load_module()
+        cases = {
+            "playlist": "Playlists",
+            "system-playlist": "Playlists",
+            "user": "artist page",
+            "something-new": "isn't a track link",
+        }
+
+        for kind, message in cases.items():
+            request, _calls = make_resolver({self.RESOLVE_SONG: {"kind": kind, "id": 1}})
+            with self.assertRaisesRegex(app.LinkError, message, msg=kind):
+                app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                    "https://soundcloud.com/artist/song"
+                )
+
+    def test_blocked_and_unplayable_tracks_are_explained(self):
+        app = load_module()
+        cases = {
+            "doesn't allow playing that track": track_payload(7, policy="BLOCK"),
+            "can't play that track": track_payload(7, duration=None),
+        }
+
+        for message, payload in cases.items():
+            request, _calls = make_resolver({self.RESOLVE_SONG: payload})
+            with self.assertRaisesRegex(app.LinkError, message):
+                app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                    "https://soundcloud.com/artist/song"
+                )
+
+    def test_http_errors_become_readable_messages(self):
+        from urllib.error import HTTPError
+        app = load_module()
+        cases = {404: "not found", 401: "refused", 403: "refused", 429: "busy", 500: "couldn't open"}
+
+        for code, message in cases.items():
+            error = HTTPError("https://api-v2.soundcloud.com/resolve", code, "x", {}, None)
+            self.addCleanup(error.close)
+            request, _calls = make_resolver({self.RESOLVE_SONG: error})
+            with self.assertRaisesRegex(app.LinkError, message, msg=str(code)):
+                app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                    "https://soundcloud.com/artist/song"
+                )
+
+    def test_network_failures_are_not_reported_as_bad_links(self):
+        app = load_module()
+        request, _calls = make_resolver({self.RESOLVE_SONG: OSError("offline")})
+
+        with self.assertRaises(OSError) as raised:
+            app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                "https://soundcloud.com/artist/song"
+            )
+        self.assertNotIsInstance(raised.exception, app.LinkError)
+
+    def test_bad_links_and_signed_out_users_never_reach_the_api(self):
+        app = load_module()
+        request, calls = make_resolver({})
+
+        with self.assertRaises(app.LinkError):
+            app.TrackLikes(lambda: "token", None, request=request).resolve_link("https://example.com/a/b")
+        with self.assertRaises(PermissionError):
+            app.TrackLikes(lambda: None, None, request=request).resolve_link("https://soundcloud.com/artist/song")
+
+        self.assertEqual(calls, [])
+
+
 class LocalPlayHistoryTest(unittest.TestCase):
     def row(self, number):
         return {"url": f"https://soundcloud.com/artist/song-{number}", "title": f"Song {number}"}

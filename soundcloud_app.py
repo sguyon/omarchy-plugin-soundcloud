@@ -34,7 +34,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, cast
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 APP_ID = "com.github.brunosilveira.OmarchySoundCloud"
@@ -2329,6 +2330,101 @@ def track_from_entry(item: object) -> dict[str, object] | None:
     }
 
 
+class LinkError(ValueError):
+    """A pasted link that cannot be played. The message is fit to show the user."""
+
+
+class NotSoundCloudLink(LinkError):
+    """Pasted text that is not a link to soundcloud.com at all."""
+
+
+NOT_SOUNDCLOUD_MESSAGE = "That isn't a SoundCloud link"
+ARTIST_PAGE_MESSAGE = "That's an artist page, not a track"
+PLAYLIST_MESSAGE = "Playlists aren't supported yet. Copy a track link"
+NOT_A_TRACK_MESSAGE = "That isn't a track link"
+CANT_PLAY_MESSAGE = "SoundCloud can't play that track"
+
+
+SOUNDCLOUD_LINK_HOSTS = {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"}
+# First path segments that are SoundCloud pages rather than artists.
+SOUNDCLOUD_PAGE_SEGMENTS = {
+    "discover", "feed", "you", "stations", "search", "charts", "upload", "settings", "stream",
+    "messages", "notifications", "people", "pages", "terms-of-use", "jobs", "mobile", "popular",
+    "tags", "go", "music",
+}
+# Second path segments that make an artist's own page rather than a track.
+SOUNDCLOUD_ARTIST_SECTIONS = {
+    "tracks", "albums", "likes", "reposts", "popular-tracks", "following", "followers",
+    "comments", "spotlight",
+}
+LINK_SEGMENT = re.compile(r"[A-Za-z0-9_.~%-]{1,255}")
+LINK_SECRET_TOKEN = re.compile(r"s-[A-Za-z0-9]{1,32}")
+RESOLVE_ERRORS = {
+    404: "Track not found. It may be private or deleted",
+    401: "SoundCloud refused the request. Try signing in again",
+    403: "SoundCloud refused the request. Try signing in again",
+    429: "SoundCloud is busy. Try again in a moment",
+}
+
+
+def parse_track_link(text: object) -> tuple[str, str]:
+    """Classify pasted text as a SoundCloud track link.
+
+    Returns ("track", url) for a track page or ("short", url) for an on.soundcloud.com
+    short link. Tracking parameters, fragments and the m./www. host are dropped, and
+    only a private track's secret token is kept. Anything else raises LinkError.
+    """
+    value = text.strip() if isinstance(text, str) else ""
+    if not value or len(value.splitlines()) != 1:
+        raise LinkError("Copy a single SoundCloud track link first")
+    if len(value.encode("utf-8")) > MAX_URL_BYTES - 16:
+        raise LinkError("That link is too long")
+    try:
+        parsed = urlparse(value if "://" in value else "https://" + value)
+        port = parsed.port
+    except ValueError:
+        raise NotSoundCloudLink(NOT_SOUNDCLOUD_MESSAGE) from None
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme not in {"http", "https"} or parsed.username is not None
+            or parsed.password is not None or port not in (None, 80, 443)):
+        raise NotSoundCloudLink(NOT_SOUNDCLOUD_MESSAGE)
+    if host == "on.soundcloud.com":
+        if re.fullmatch(r"/[A-Za-z0-9]{1,32}/?", parsed.path):
+            return "short", "https://on.soundcloud.com" + parsed.path.rstrip("/")
+        raise LinkError("That isn't a valid SoundCloud short link")
+    if host not in SOUNDCLOUD_LINK_HOSTS:
+        raise NotSoundCloudLink(NOT_SOUNDCLOUD_MESSAGE)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments or segments[0] in SOUNDCLOUD_PAGE_SEGMENTS:
+        raise LinkError("That's a SoundCloud page, not a track")
+    if len(segments) == 1 or segments[1] in SOUNDCLOUD_ARTIST_SECTIONS:
+        raise LinkError(ARTIST_PAGE_MESSAGE)
+    if segments[1] == "sets":
+        raise LinkError(PLAYLIST_MESSAGE)
+    private = len(segments) == 3 and LINK_SECRET_TOKEN.fullmatch(segments[2]) is not None
+    if (len(segments) > 3 or (len(segments) == 3 and not private)
+            or not all(LINK_SEGMENT.fullmatch(segment) and segment.strip(".") for segment in segments)):
+        raise LinkError(NOT_A_TRACK_MESSAGE)
+    link = "https://soundcloud.com/" + "/".join(segments)
+    secret = parse_qs(parsed.query).get("secret_token", [""])[0]
+    if len(segments) == 2 and LINK_SECRET_TOKEN.fullmatch(secret):
+        link += "?secret_token=" + secret
+    return "track", link
+
+
+def follow_short_link(url: str, opener=_api_opener) -> str:
+    """The address an on.soundcloud.com short link redirects to. Sends no credentials."""
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with opener.open(request, timeout=10.0):
+            pass
+    except HTTPError as error:
+        location = error.headers.get("Location") if error.code in {301, 302, 303, 307, 308} else None
+        if location:
+            return urljoin(url, location)
+    raise LinkError("Couldn't open that short link. Copy the full track link instead")
+
+
 class TrackLikes:
     """The signed-in account's liked tracks, read over the private API.
 
@@ -2412,6 +2508,34 @@ class TrackLikes:
                 or parsed.netloc != "api-v2.soundcloud.com" or parsed.path != list_path):
             return tracks, None
         return tracks, parsed.path + "?" + parsed.query
+
+    def resolve_link(self, text: str, opener=_api_opener) -> dict[str, object]:
+        """Turn pasted text into a playable track row, or raise LinkError."""
+        kind, link = parse_track_link(text)
+        if kind == "short":
+            try:
+                kind, link = parse_track_link(follow_short_link(link, opener))
+            except NotSoundCloudLink:
+                raise LinkError("That short link doesn't lead to SoundCloud") from None
+        with self.lock:
+            token = self._identify()
+        try:
+            payload = self.request("GET", "/resolve?url=" + quote(link, safe=""), token, 2 * 1024 * 1024)
+        except HTTPError as error:
+            raise LinkError(RESOLVE_ERRORS.get(error.code, "SoundCloud couldn't open that link")) from error
+        resolved = payload.get("kind") if isinstance(payload, dict) else None
+        if resolved in {"playlist", "system-playlist"}:
+            raise LinkError(PLAYLIST_MESSAGE)
+        if resolved == "user":
+            raise LinkError(ARTIST_PAGE_MESSAGE)
+        if resolved != "track":
+            raise LinkError(NOT_A_TRACK_MESSAGE)
+        if payload.get("policy") == "BLOCK":
+            raise LinkError("SoundCloud doesn't allow playing that track here")
+        track = track_from_entry({"track": payload})
+        if track is None:
+            raise LinkError(CANT_PLAY_MESSAGE)
+        return track
 
     def is_liked(self, track_id: int) -> bool | None:
         liked_ids = self.liked_ids
