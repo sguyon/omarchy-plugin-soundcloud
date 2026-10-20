@@ -3109,6 +3109,12 @@ LIKE_TRACK_FUNCTION = r"""
 
 
 class GstPlayback:
+    # `on_end` runs on the main loop when a track ends by itself; `on_error` when a track
+    # fails. Neither runs for a user stop, and `on_end` not if another track began meanwhile.
+    on_end = None
+    on_error = None
+    pending_seek = 0.0
+    pending_seek_tries = 0
     # A flush seek makes playbin3 report PAUSED for a moment; that isn't a pause
     seek_in_flight = False
     last_seek = None  # (target seconds, monotonic time, playing) of the latest seek
@@ -3121,7 +3127,7 @@ class GstPlayback:
     hls_uri = ""
 
     def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args),
-                 volume: float = 1.0, muted: bool = False):
+                 on_end=None, on_error=None, volume: float = 1.0, muted: bool = False):
         self.Gst = Gst
         Gst.init(None)
         self.current = None
@@ -3131,6 +3137,8 @@ class GstPlayback:
         self.restore_volume = self.volume if self.volume > 0 else 0.5
         self.volume_target = None
         self.on_change = on_change
+        self.on_end = on_end
+        self.on_error = on_error
         self.schedule = schedule
         self.active = False
         self.playing = False
@@ -3161,6 +3169,8 @@ class GstPlayback:
             self.playing = False
             self.state = "paused"
             self.on_change()
+            if self.on_end is not None:
+                self.schedule(self._ended, generation)
         elif message.type == self.Gst.MessageType.STATE_CHANGED and message.src == self.current:
             _old, current, _pending = message.parse_state_changed()
             if self.seek_in_flight and current == self.Gst.State.PAUSED:
@@ -3170,9 +3180,20 @@ class GstPlayback:
                 self.has_started = True
                 self.seek_in_flight = False
                 self.state = "playing"
+                self._apply_pending_seek()
             elif current == self.Gst.State.PAUSED:
                 self.state = "paused" if self.has_started else "buffering"
             self.on_change()
+
+    def _ended(self, generation: int) -> bool:
+        if generation == self.generation and self.on_end is not None:
+            self.on_end()
+        return False
+
+    def _failed(self, generation: int) -> bool:
+        if generation == self.generation and self.on_error is not None:
+            self.on_error()
+        return False
 
     def set_volume(self, level: float) -> None:
         """Set the volume (0..1). Volume 0 mutes, as on the website; any other level unmutes."""
@@ -3233,7 +3254,10 @@ class GstPlayback:
         )
         self.error = error[:128]
         self.state = "error" if self.error else "idle"
+        self.pending_seek = 0.0
         self.on_change()
+        if self.error and self.on_error is not None:
+            self.schedule(self._failed, self.generation)
 
     def begin(self, metadata: dict[str, object]) -> int:
         self._stop_current()
@@ -3241,6 +3265,7 @@ class GstPlayback:
         self.playing = False
         self.has_started = False
         self.metadata = dict(metadata)
+        self.pending_seek = 0.0
         self.error = ""
         self.state = "resolving"
         self.on_change()
@@ -3471,12 +3496,26 @@ class GstPlayback:
         self.playing = False
         # The feeder this replaces may still be inside a network read and holding its slot.
         if not self._play_hls(self.hls_uri, start, paused, wait=HLS_SEEK_WAIT_SECONDS):
-            self.on_change()  # show the error
+            self.on_change()  # show the error; on_error lets the app react like any failed track
+            if self.on_error is not None:
+                self.schedule(self._failed, self.generation)
             return False
         self.has_started = paused
         self.state = "paused" if paused else "buffering"
         self.on_change()
         return True
+
+    def seek_when_playing(self, seconds: float) -> None:
+        """Seek to `seconds` once the pipeline plays, retrying on later status ticks."""
+        self.pending_seek = max(0.0, seconds)
+        self.pending_seek_tries = 0
+
+    def _apply_pending_seek(self) -> None:
+        if self.pending_seek <= 0 or not self.playing:
+            return
+        self.pending_seek_tries += 1
+        if self.seek_seconds(self.pending_seek) or self.pending_seek_tries >= 20:
+            self.pending_seek = 0.0
 
     def _query_time(self, method: str) -> float:
         try:
@@ -3500,6 +3539,7 @@ class GstPlayback:
                 "waveform": [],
                 **({"error": self.error} if self.error else {}),
             }
+        self._apply_pending_seek()
         duration = self._query_time("query_duration")
         if duration <= 0:
             duration = float(self.metadata.get("durationMs", 0) or 0) / 1000

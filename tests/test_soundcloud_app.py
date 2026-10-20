@@ -3437,6 +3437,112 @@ class GstPlaybackEndTest(unittest.TestCase):
         player.begin({"title": "A", "playbackId": "soundcloud:tracks:1"})
         self.assertTrue(player.play("https://x.sndcdn.com/a", {"title": "A"}, protocol, mime_type))
 
+    def test_end_and_error_hooks_run_once_on_the_scheduler(self):
+        with self.subTest('a natural end runs the hook once on the scheduler'):
+            ended = []
+            _app, player = self.player(on_end=lambda: ended.append(1))
+            self.start(player)
+
+            deliver(player, "eos")
+            self.assertEqual(ended, [])  # scheduled, not called from the bus callback
+            player.run_scheduled()
+
+            self.assertEqual(ended, [1])
+            self.assertEqual(player.state, "paused")
+        with self.subTest('the end of a hls stream runs the hook too'):
+            ended = []
+            app, player = self.player(on_end=lambda: ended.append(1))
+            self.start(player, "hls", "audio/mpeg")
+            source = player.current.source
+            source.on_emit = lambda name: deliver(player, "eos") if name == "end-of-stream" else None
+
+            with mock.patch.object(app, "hls_segment_list", return_value=[("https://x.sndcdn.com/s", 10.0)]), \
+                    mock.patch.object(app, "fetch_private_media", return_value=b"data"):
+                player._feed_hls(player.generation, source, "https://x.sndcdn.com/a", time.monotonic() + 5)
+            player.run_scheduled()
+
+            self.assertEqual(source.emitted, ["push-buffer", "end-of-stream"])
+            self.assertEqual(ended, [1])
+        with self.subTest('a failure runs the error hook but not the end hook'):
+            ended, failed = [], []
+            _app, player = self.player(on_end=lambda: ended.append(1), on_error=lambda: failed.append(1))
+            self.start(player)
+
+            deliver(player, "error")
+            player.run_scheduled()
+
+            self.assertEqual((ended, failed), ([], [1]))
+            self.assertEqual(player.state, "error")
+
+    def test_stale_ends_and_failures_are_dropped(self):
+        with self.subTest('a user stop does not run the hook'):
+            ended, failed = [], []
+            _app, player = self.player(on_end=lambda: ended.append(1), on_error=lambda: failed.append(1))
+            self.start(player)
+            pipeline = player.current
+
+            player.stop()
+            player.run_scheduled()
+
+            self.assertEqual((ended, failed), ([], []))
+            # a late end from the stopped pipeline is ignored as well
+            player._message(None, type("M", (), {"type": "eos", "src": pipeline})(), pipeline, 0)
+            player.run_scheduled()
+            self.assertEqual(ended, [])
+        with self.subTest('an end reported before a new track began is dropped'):
+            ended = []
+            _app, player = self.player(on_end=lambda: ended.append(1))
+            self.start(player)
+            deliver(player, "eos")
+
+            player.begin({"title": "B"})  # the user picked another track first
+            player.run_scheduled()
+
+            self.assertEqual(ended, [])
+        with self.subTest('a failure overtaken by a new track is dropped'):
+            failed = []
+            _app, player = self.player(on_error=lambda: failed.append(1))
+            self.start(player)
+            deliver(player, "error")
+
+            player.begin({"title": "B"})
+            player.run_scheduled()
+
+            self.assertEqual(failed, [])
+
+    def test_resume_seek_rules(self):
+        with self.subTest('a resume position is sought once the pipeline plays'):
+            _app, player = self.player()
+            self.start(player)
+            player.seek_when_playing(61.0)
+
+            deliver(player, "state", "paused")
+            self.assertEqual(player.current.seeks, [])
+            deliver(player, "state", "playing")
+
+            self.assertEqual(player.current.seeks, [61 * 10**9])
+            self.assertEqual(player.pending_seek, 0.0)
+        with self.subTest('a refused resume seek is retried a bounded number of times'):
+            _app, player = self.player()
+            self.start(player)
+            player.current.seek_result = False
+            player.seek_when_playing(61.0)
+            deliver(player, "state", "playing")
+
+            for _ in range(40):
+                player.status()
+
+            self.assertEqual(len(player.current.seeks), 20)
+            self.assertEqual(player.pending_seek, 0.0)
+        with self.subTest('a new selection cancels a pending resume seek'):
+            _app, player = self.player()
+            self.start(player)
+            player.seek_when_playing(61.0)
+
+            player.begin({"title": "B"})
+
+            self.assertEqual(player.pending_seek, 0.0)
+
     def test_a_seek_is_accurate_not_snapped_to_a_key_unit(self):
         _app, player = self.player()
         self.start(player)
@@ -3581,6 +3687,8 @@ class GstPlaybackEndTest(unittest.TestCase):
 
     def test_rapid_hls_seeks_wait_for_a_stuck_feeder_and_report_a_failure(self):
         app, player = self.player()
+        errors = []
+        player.on_error = lambda: errors.append(player.error)
         stuck = threading.Event()
         release = threading.Event()
 
@@ -3600,6 +3708,8 @@ class GstPlaybackEndTest(unittest.TestCase):
             with mock.patch.object(app, "HLS_SEEK_WAIT_SECONDS", 0.05):
                 self.assertFalse(player.seek_seconds(44.0))  # no slot frees up in time
             self.assertEqual((player.state, player.error), ("error", "SoundCloud playback is busy"))
+            player.run_scheduled()
+            self.assertEqual(errors, ["SoundCloud playback is busy"])  # reported, not silent
             release.set()
 
     def test_a_hls_seek_waits_briefly_for_the_old_feeder_to_stop(self):
