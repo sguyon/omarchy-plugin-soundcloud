@@ -14,6 +14,9 @@ without official SoundCloud API credentials.
 - Play/pause, previous, and next controls
 - Volume icon in the popup: click to mute, scroll over it or hover for a slider to
   change the level. The player's own volume (not the system volume) is saved between sessions
+- Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and
+  Shift+Tab switch tabs, Space plays or pauses, Left/Right seek, Shift+Up/Down volume,
+  l like, m mute, Esc close
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
