@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, cast
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, quote, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 APP_ID = "com.github.brunosilveira.OmarchySoundCloud"
@@ -76,6 +76,7 @@ NOTIFICATION_TIMEOUT_SECONDS = 3.0
 # Previous restarts the track from this position on. The website's real value is unverified.
 PREVIOUS_RESTART_SECONDS = 3.0
 REPEAT_MODES = ("none", "one", "all")
+QUEUE_SOURCES = ("home", "feed", "likes", "history")
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
@@ -660,6 +661,41 @@ def load_more_source_from_command(command: str) -> str | None:
     }.get(command)
 
 
+def playback_id_from_command(command: str) -> str | None:
+    if not command.startswith("play:"):
+        return None
+    value = command.removeprefix("play:")
+    return value if is_playback_id(value) else None
+
+
+def play_from_command(command: str) -> tuple[str, str] | None:
+    """`play-from:<tab>:<playback id>` as (tab, playback id)."""
+    if not command.startswith("play-from:"):
+        return None
+    tab, _, value = command.removeprefix("play-from:").partition(":")
+    return (tab, value) if tab in QUEUE_SOURCES and is_playback_id(value) else None
+
+
+def queue_next_from_command(command: str) -> str | None:
+    value = command.removeprefix("queue-next:") if command.startswith("queue-next:") else None
+    return value if is_playback_id(value) else None
+
+
+def repeat_from_command(command: str, current: str) -> str | None:
+    """The mode a `repeat` command asks for: bare `repeat` cycles none, one, all."""
+    if command == "repeat":
+        return REPEAT_MODES[(REPEAT_MODES.index(current) + 1) % len(REPEAT_MODES)]
+    mode = command.removeprefix("repeat:") if command.startswith("repeat:") else None
+    return mode if mode in REPEAT_MODES else None
+
+
+def shuffle_from_command(command: str, current: bool) -> bool | None:
+    """The state a `shuffle` command asks for: bare `shuffle` toggles."""
+    if command == "shuffle":
+        return not current
+    return {"shuffle:on": True, "shuffle:off": False}.get(command)
+
+
 def volume_from_command(command: str) -> float | None:
     """The level a `volume:<0..1>` command sets, clamped to 0..1."""
     return _command_number(command, "volume:", 0.0, 1.0)
@@ -678,13 +714,6 @@ def _command_number(command: str, prefix: str, minimum: float, maximum: float) -
     except ValueError:
         return None
     return max(minimum, min(maximum, number)) if math.isfinite(number) else None
-
-
-def playback_id_from_command(command: str) -> str | None:
-    if not command.startswith("play:"):
-        return None
-    value = command.removeprefix("play:")
-    return value if is_playback_id(value) else None
 
 
 def track_like_from_command(command: str) -> tuple[str, bool] | None:

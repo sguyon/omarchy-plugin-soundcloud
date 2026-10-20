@@ -3039,6 +3039,40 @@ class QueueStoreTest(unittest.TestCase):
         self.assertEqual(app.sanitize_queue({"v": True, "items": [self.row(1)]})["items"], [])
 
 
+class QueueCommandParsingTest(unittest.TestCase):
+    def test_play_from_names_a_tab_and_a_playback_id(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.play_from_command("play-from:likes:soundcloud:tracks:42"),
+            ("likes", "soundcloud:tracks:42"),
+        )
+        for bad in (
+            "play-from:library:soundcloud:tracks:42", "play-from:home:42", "play-from:home:",
+            "play-from:soundcloud:tracks:42", "play-from:home:soundcloud:tracks:0", "play:x",
+        ):
+            self.assertIsNone(app.play_from_command(bad), bad)
+
+    def test_queue_next_needs_a_playback_id(self):
+        app = load_module()
+
+        self.assertEqual(app.queue_next_from_command("queue-next:soundcloud:tracks:7"), "soundcloud:tracks:7")
+        self.assertIsNone(app.queue_next_from_command("queue-next:7"))
+        self.assertIsNone(app.queue_next_from_command("queue-next:"))
+
+    def test_repeat_cycles_or_takes_a_mode_and_shuffle_toggles_or_takes_a_state(self):
+        app = load_module()
+
+        self.assertEqual([app.repeat_from_command("repeat", m) for m in ("none", "one", "all")],
+                         ["one", "all", "none"])
+        self.assertEqual(app.repeat_from_command("repeat:all", "none"), "all")
+        self.assertIsNone(app.repeat_from_command("repeat:twice", "none"))
+        self.assertIs(app.shuffle_from_command("shuffle", False), True)
+        self.assertIs(app.shuffle_from_command("shuffle", True), False)
+        self.assertIs(app.shuffle_from_command("shuffle:on", True), True)
+        self.assertIs(app.shuffle_from_command("shuffle:off", True), False)
+        self.assertIsNone(app.shuffle_from_command("shuffle:maybe", True))
+
 class QueueStatusTest(unittest.TestCase):
     BASE = {
         "playerPresent": True, "playbackState": "playing", "playing": True,
