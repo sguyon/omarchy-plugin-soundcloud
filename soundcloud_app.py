@@ -13,6 +13,7 @@ import base64
 import concurrent.futures
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -2085,8 +2086,11 @@ def soundcloud_api_request(method: str, path: str, token: str, maximum: int = 25
             "User-Agent": "Mozilla/5.0",
         },
     )
-    with _api_opener.open(request, timeout=10.0) as response:
-        data = response.read(maximum + 1)
+    try:
+        with _api_opener.open(request, timeout=10.0) as response:
+            data = response.read(maximum + 1)
+    except http.client.HTTPException as error:  # IncompleteRead and friends: a cut or garbled reply
+        raise OSError(f"API connection failed: {type(error).__name__}") from error
     if len(data) > maximum:
         raise ValueError("API response too large")
     return json.loads(data) if data.strip() else None
@@ -2840,6 +2844,7 @@ def build_application(show_on_start: bool = False):
             self.cookie_save_source = 0
             self.cookie_manager = None
             self.dispatch_slots = threading.BoundedSemaphore(MAX_PENDING_DISPATCHES)
+            self.run_in_thread = lambda target: threading.Thread(target=target, daemon=True).start()
             self.control_server = ControlServer(
                 socket_path,
                 self._dispatch_from_thread,
@@ -3550,6 +3555,7 @@ def build_application(show_on_start: bool = False):
                 playback_id, liked = like
 
                 def update_like():
+                    payload = {"ok": False, "error": "SoundCloud could not update this like"}
                     try:
                         self.track_likes.set_liked(int(playback_id.rpartition(":")[2]), liked)
                         self.api_lists["likes"]["loaded_at"] = -math.inf  # refresh the Likes tab on next view
@@ -3557,13 +3563,14 @@ def build_application(show_on_start: bool = False):
                     except BotCheckRequired:
                         GLib.idle_add(self.show_login)
                         payload = {"ok": False, "error": BOT_CHECK_MESSAGE}
-                    except (OSError, ValueError):
-                        payload = {"ok": False, "error": "SoundCloud could not update this like"}
-                    GLib.idle_add(
-                        lambda: self._respond(connection, request_id, payload, publish_status=True)
-                    )
+                    except Exception:
+                        pass
+                    finally:
+                        GLib.idle_add(
+                            lambda: self._respond(connection, request_id, payload, publish_status=True)
+                        )
 
-                threading.Thread(target=update_like, daemon=True).start()
+                self.run_in_thread(update_like)
             elif source_uri(command):
                 self._publish_cached_tracks(command)
                 self.webview.load_uri(source_uri(command))

@@ -2005,6 +2005,124 @@ global.fetch = async (url, init) => {{
         self.assertIn(app._NoMediaRedirect, handler_types)
 
 
+class FakeGLib:
+    def __init__(self): self.idle = []; self.timers = []; self.delays = []
+    def set_application_name(self, _name): pass
+    def set_prgname(self, _name): pass
+    def idle_add(self, callback, *args): self.idle.append((callback, args)); return 1
+    def timeout_add(self, interval, callback, *args):
+        self.timers.append((callback, args)); self.delays.append(interval); return 1
+    timeout_add_seconds = timeout_add
+    def run_idle(self):
+        while self.idle:
+            callback, args = self.idle.pop(0)
+            callback(*args)
+
+
+class FakeConnection:
+    def __init__(self): self.sent = []
+    def send(self, payload): self.sent.append(payload); return True
+    @property
+    def reply(self): return self.sent[-1]
+
+
+class ApiReplyHardeningTest(unittest.TestCase):
+    """A cut or garbled API reply is a network error, and a like always gets its answer.
+
+    The application class runs with fake GTK and GStreamer and a temporary profile.
+    """
+
+    def build(self):
+        self.app = load_module()
+        self.glib = FakeGLib()
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        data = directory / "data" / "omarchy-soundcloud"
+        data.mkdir(parents=True, mode=0o700)
+        Gtk = type("Gtk", (), {"Application": type("Application", (), {
+            "__init__": lambda self, **_kw: None, "hold": lambda self: None,
+            "quit": lambda self: None, "do_shutdown": lambda self: None,
+        })})
+        Gio = type("Gio", (), {"ApplicationFlags": type("F", (), {"NON_UNIQUE": 0})})
+        Gst = type("Gst", (), {"init": staticmethod(lambda _value: None)})
+        patches = (
+            mock.patch.object(self.app, "_load_gi", lambda: (Gio, self.glib, Gst, Gtk, None, None)),
+            mock.patch.object(self.app, "profile_paths", lambda env=None: self.app.ProfilePaths(
+                data, directory / "cache", data / "cookies.sqlite")),
+            mock.patch.object(self.app, "runtime_socket_path",
+                              lambda env=None: directory / "run" / "omarchy-soundcloud" / "control.sock"),
+            mock.patch.object(self.app, "prepare_runtime_socket_path", lambda path: None),
+        )
+        for patch in patches:
+            self.enterContext(patch)
+        self.application = self.app.build_application()
+        self.application.run_in_thread = lambda target: target()
+        self.addCleanup(self.application.playback.close)
+        self.addCleanup(self.application.artwork_cache.close)
+        self.addCleanup(self.application.list_artwork_cache.close)
+        return self.application
+
+    def command(self, text):
+        connection = FakeConnection()
+        self.application.dispatch_slots.acquire()
+        self.application._handle_command(text, connection, 7)
+        return connection
+
+    def truncated_api(self):
+        """Make every API call except /me fail the way a cut connection does."""
+        import http.client
+
+        class Response:
+            def __init__(self, body, fail): self.body, self.fail = body, fail
+            def __enter__(self): return self
+            def __exit__(self, *_exc): return False
+            def read(self, _size=-1):
+                if self.fail:
+                    raise http.client.IncompleteRead(b"{", 100)
+                return self.body
+
+        class Opener:
+            def open(self, request, timeout=None):
+                is_me = request.full_url.endswith("/me")
+                return Response(b'{"id": 42}', fail=not is_me)
+
+        self.enterContext(mock.patch.object(self.app, "_api_opener", Opener()))
+        self.application.track_likes.load_token = lambda: "token"
+        self.application.track_likes.request = self.app.soundcloud_api_request
+
+    def test_a_cut_api_reply_is_an_oserror(self):
+        app = load_module()
+        import http.client
+
+        class Cut:
+            def open(self, _request, timeout=None): raise http.client.CannotSendRequest()
+
+        with mock.patch.object(app, "_api_opener", Cut()), self.assertRaises(OSError):
+            app.soundcloud_api_request("GET", "/me", "token")
+
+    def test_a_cut_reply_still_answers_a_like_and_frees_the_slot(self):
+        self.build()
+        self.truncated_api()
+        free = self.application.dispatch_slots._value
+
+        reply = self.command("like:soundcloud:tracks:5")
+        self.glib.run_idle()
+
+        self.assertEqual((reply.reply["ok"], reply.reply["error"]),
+                         (False, "SoundCloud could not update this like"))
+        self.assertEqual(self.application.dispatch_slots._value, free)
+
+    def test_an_unexpected_error_in_a_like_thread_still_replies_and_frees_the_slot(self):
+        self.build()
+        free = self.application.dispatch_slots._value
+        self.application.track_likes.set_liked = mock.Mock(side_effect=RuntimeError("boom"))
+
+        like = self.command("like:soundcloud:tracks:5")
+        self.glib.run_idle()
+
+        self.assertFalse(like.reply["ok"])
+        self.assertEqual(self.application.dispatch_slots._value, free)
+
+
 class CheckResultTest(unittest.TestCase):
     def test_dependency_check_is_machine_readable(self):
         app = load_module()
