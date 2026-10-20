@@ -79,6 +79,7 @@ REPEAT_MODES = ("none", "one", "all")
 QUEUE_SOURCES = ("home", "feed", "likes", "history")
 # A track that fails this soon after an automatic start is skipped instead of stopping the queue.
 AUTO_SKIP_WINDOW_SECONDS = 2.0
+QUEUE_POSITION_SAVE_SECONDS = 5
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
@@ -2552,14 +2553,6 @@ def command_script(action: str) -> str | None:
           if (audio.paused) { audio.play(); } else { audio.pause(); }
           return true;
         })()""",
-        "next": r"""(() => {
-          const button = document.querySelector('.skipControl__next, button[title="Next"], button[aria-label="Next"]');
-          if (!button) return false; button.click(); return true;
-        })()""",
-        "previous": r"""(() => {
-          const button = document.querySelector('.skipControl__previous, button[title="Previous"], button[aria-label="Previous"]');
-          if (!button) return false; button.click(); return true;
-        })()""",
     }
     return scripts.get(action)
 
@@ -3872,6 +3865,11 @@ def build_application(show_on_start: bool = False):
         cookie_records = cookie_store.migrate_legacy_sqlite()
     track_cache_store = PrivateJsonStore(profile_fd, "tracks.json", MAX_TRACK_CACHE_BYTES)
     track_cache = sanitize_track_cache(track_cache_store.load())
+    queue_store = QueueStore(profile_fd)
+    try:
+        saved_queue, saved_position_ms = queue_store.load()
+    except OSError:
+        saved_queue, saved_position_ms = PlayQueue(), 0
     settings_store = SettingsStore(profile_fd)
     try:
         saved_settings = settings_store.load()
@@ -3897,6 +3895,7 @@ def build_application(show_on_start: bool = False):
                 Gst,
                 lambda: GLib.idle_add(self._publish_status_once),
                 GLib.idle_add,
+                on_end=self._track_ended,
                 volume=cast(float, saved_settings["volume"]),
                 muted=saved_settings["muted"] is True,
             )
@@ -3927,14 +3926,19 @@ def build_application(show_on_start: bool = False):
                 for source in API_TRACK_LISTS
             }
             self.selection_generation = 0
-            self.track_cache_save_pending = False
+            self.pending_start = 0
+            self.queue = saved_queue
+            self.auto_skip = AutoSkip()
+            self.queue_finished = False  # the last queued track ended and nothing followed
+            self.queue_save_pending = False
             self.settings_save_pending = False
+            self.run_in_thread = lambda target: threading.Thread(target=target, daemon=True).start()
+            self.track_cache_save_pending = False
             self.had_subscriber = False
             self.disconnect_generation = 0
             self.cookie_save_source = 0
             self.cookie_manager = None
             self.dispatch_slots = threading.BoundedSemaphore(MAX_PENDING_DISPATCHES)
-            self.run_in_thread = lambda target: threading.Thread(target=target, daemon=True).start()
             self.control_server = ControlServer(
                 socket_path,
                 self._dispatch_from_thread,
@@ -3948,6 +3952,7 @@ def build_application(show_on_start: bool = False):
             GLib.timeout_add(STATUS_INTERVAL_MS, self._publish_status)
             GLib.timeout_add_seconds(PAGE_STATUS_INTERVAL_SECONDS, self._poll_page_status)
             GLib.timeout_add_seconds(5, self._check_installation)
+            GLib.timeout_add_seconds(QUEUE_POSITION_SAVE_SECONDS, self._save_position_tick)
             if show_on_start:
                 self.show_login()
             else:
@@ -3955,6 +3960,7 @@ def build_application(show_on_start: bool = False):
                 GLib.idle_add(self.window.hide)
 
         def do_shutdown(self):
+            self._save_queue()
             self._save_settings()
             self.control_server.close()
             self.playback.close()
@@ -4153,6 +4159,19 @@ def build_application(show_on_start: bool = False):
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 return
 
+        def _save_settings(self):
+            self.settings_save_pending = False
+            try:
+                settings_store.save({"v": 1, **self.playback.volume_status()})
+            except OSError:
+                pass
+            return False
+
+        def _settings_changed(self):
+            if not self.settings_save_pending:
+                self.settings_save_pending = True
+                GLib.idle_add(self._save_settings)
+
         def _save_track_cache(self):
             self.track_cache_save_pending = False
             try:
@@ -4201,23 +4220,122 @@ def build_application(show_on_start: bool = False):
             if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
                 self.webview.load_uri(source_uri("home"))
 
-        def _play_when_page_ready(self, playback_id, connection, request_id):
-            """Start playback once the page is on Home or Feed, so its request context exists."""
+        def _play_when_page_ready(self, row, connection, request_id, automatic=False):
+            """Start `row` once the page is on Home or Feed, so its request context exists."""
             self._keep_page_on_track_source()
+            self.pending_start += 1
+            token = self.pending_start
             deadline = time.monotonic() + 20.0
 
             def check():
+                if token != self.pending_start:
+                    self._respond(
+                        connection, request_id, {"ok": False, "error": "selection superseded"}
+                    )
+                    return False
                 ready = (
                     self.webview
                     and is_track_source_page(self.webview.get_uri() or "")
                     and not self.webview.is_loading()
                 )
                 if ready or time.monotonic() > deadline:
-                    self._handle_command("play:" + playback_id, connection, request_id)
+                    self._start_track(row, connection, request_id, automatic)
                     return False
                 return True
 
-            GLib.timeout_add(250, check)
+            if check():
+                GLib.timeout_add(250, check)
+
+        def _start_track(self, row, connection, request_id, automatic=False):
+            """The one way a track starts: resolve it in the page, then play it with GStreamer."""
+            playback_id = row.get("playbackId")
+            if not self._remember_playback_track(row):
+                self._respond(
+                    connection,
+                    request_id,
+                    {"ok": False, "error": "SoundCloud track details are not ready"},
+                )
+                return
+            self.queue_finished = False
+            self.selection_generation = (self.selection_generation + 1) % (2**31)
+            generation = self.selection_generation
+            self.auto_skip.started(generation, automatic, time.monotonic())
+            self.playback.begin(self.playback_tracks[playback_id])
+            self._publish_status_once()
+            script = play_track_script(playback_id, generation)
+
+            def track_selected(payload):
+                if generation != self.selection_generation:
+                    self._respond(
+                        connection,
+                        request_id,
+                        {"ok": False, "error": "selection superseded"},
+                    )
+                    return
+                if not payload:
+                    self.playback.stop("SoundCloud track details are not ready")
+                self._respond(
+                    connection,
+                    request_id,
+                    {
+                        "ok": bool(payload),
+                        "running": True,
+                        **({} if payload else {"error": "SoundCloud track details are not ready"}),
+                    },
+                    publish_status=True,
+                )
+
+            self._evaluate(script, track_selected)
+            GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
+
+        def _position_ms(self):
+            if self.playback.pending_seek > 0:
+                return int(self.playback.pending_seek * 1000)
+            if self.playback.active:
+                return int(self.playback.status()["position"] * 1000)
+            return 0
+
+        def _save_queue(self):
+            self.queue_save_pending = False
+            try:
+                queue_store.save(self.queue, self._position_ms())
+            except OSError:
+                pass
+            return False
+
+        def _queue_changed(self):
+            """Save after a structural change, once per main loop turn like the track cache."""
+            if not self.queue_save_pending:
+                self.queue_save_pending = True
+                GLib.idle_add(self._save_queue)
+
+        def _save_position_tick(self):
+            if self.playback.playing:
+                self._save_queue()
+            return True
+
+        def _next_playable(self, user_initiated):
+            """Step the queue, dropping rows that can't be played by id."""
+            row = self.queue.advance(user_initiated)
+            while row is not None and not is_playback_id(row.get("playbackId")):
+                row = self.queue.mark_dead(row.get("url"))
+            return row
+
+        def _step_user(self, direction, position_seconds=0.0):
+            """One queue step for the user's Next (1) or Previous (-1): a row, "restart" or None."""
+            if direction > 0:
+                return self._next_playable(True)
+            return self.queue.previous(position_seconds)
+
+        def _track_ended(self):
+            if self.auto_skip.generation != self.selection_generation:
+                return  # a newer selection began after the end was reported
+            self.auto_skip.begin_chain(self.queue.length)
+            row = self._next_playable(False)
+            self.queue_finished = row is None
+            self._queue_changed()
+            if row is not None:
+                self._play_when_page_ready(row, None, None, automatic=True)
 
         def _play_link(self, link_text, connection, request_id):
             """Play a pasted track link. The link is checked here the way the CLI checks it; the
@@ -4235,7 +4353,10 @@ def build_application(show_on_start: bool = False):
             def link_resolved(track, error):
                 if track is None or not self._remember_playback_track(track):
                     return fail(error or CANT_PLAY_MESSAGE)
-                self._play_when_page_ready(track["playbackId"], connection, request_id)
+                track = self.playback_tracks[track["playbackId"]]
+                self.queue.replace([track], 0, "")
+                self._queue_changed()
+                self._play_when_page_ready(track, connection, request_id)
                 return False
 
             def resolve_link():
@@ -4253,6 +4374,15 @@ def build_application(show_on_start: bool = False):
 
             self.run_in_thread(resolve_link)
             return False
+
+        def _restart_current(self, connection, request_id):
+            if self.playback.active and self.playback.seek_seconds(0.0):
+                if not self.playback.playing:
+                    self.playback.toggle()
+                self._respond(connection, request_id, {"ok": True, "running": True},
+                              publish_status=True)
+            else:
+                self._play_when_page_ready(self.queue.current, connection, request_id)
 
         def _load_api_list(self, source, reset):
             """Fetch one page of an account list on a worker thread; False if one is already loading."""
@@ -4426,19 +4556,6 @@ def build_application(show_on_start: bool = False):
         def _artwork_ready_from_thread(self):
             GLib.idle_add(self._publish_status_once)
 
-        def _save_settings(self):
-            self.settings_save_pending = False
-            try:
-                settings_store.save({"v": 1, **self.playback.volume_status()})
-            except OSError:
-                pass
-            return False
-
-        def _settings_changed(self):
-            if not self.settings_save_pending:
-                self.settings_save_pending = True
-                GLib.idle_add(self._save_settings)
-
         def _secure_status(self, payload):
             state = validate_status_payload(payload)
             if state is None:
@@ -4491,6 +4608,7 @@ def build_application(show_on_start: bool = False):
         def build_status(self):
             return self._secure_status({
                 **merge_status(self.page_status.values, self.playback.status()),
+                **queue_status(self.queue),
                 **self.playback.volume_status(),
             })
 
@@ -4518,6 +4636,10 @@ def build_application(show_on_start: bool = False):
             return False
 
         def _respond(self, connection, request_id, payload, publish_status=False):
+            if connection is None:  # an automatic advance has no caller
+                if publish_status:
+                    GLib.timeout_add(80, self._publish_status_once)
+                return
             try:
                 send_response(connection, payload, request_id=request_id)
                 if publish_status:
@@ -4674,8 +4796,10 @@ def build_application(show_on_start: bool = False):
                             data_url,
                         ),
                     )
-            elif command in {"play-pause", "next", "previous"}:
-                if command == "play-pause" and self.playback.active:
+            elif command == "play-pause":
+                if self.playback.active:
+                    if self.playback.playing:
+                        self._save_queue()  # keep the position the pause happened at
                     self._respond(
                         connection,
                         request_id,
@@ -4683,7 +4807,7 @@ def build_application(show_on_start: bool = False):
                         publish_status=True,
                     )
                 else:
-                    if self.playback.active or self.playback.error:
+                    if self.playback.error:
                         self.playback.stop()
                     self._evaluate(
                         command_script(command),
@@ -4694,6 +4818,70 @@ def build_application(show_on_start: bool = False):
                             publish_status=True,
                         ),
                     )
+            elif command in {"next", "previous"}:
+                direction = 1 if command == "next" else -1
+                target = self._step_user(direction, self._position_ms() / 1000)
+                self._queue_changed()
+                if target is None:
+                    self._respond(
+                        connection,
+                        request_id,
+                        {"ok": False, "running": True, "error": "Nothing else in the queue"},
+                    )
+                elif target == "restart":
+                    self._restart_current(connection, request_id)
+                else:
+                    self._play_when_page_ready(target, connection, request_id)
+            elif (queued := play_from_command(command)) is not None:
+                tab, playback_id = queued
+                rows = self.track_cache.get(tab, [])
+                index = next(
+                    (n for n, row in enumerate(rows) if row.get("playbackId") == playback_id), None
+                )
+                if index is None:
+                    self._respond(
+                        connection,
+                        request_id,
+                        {"ok": False, "error": "SoundCloud track details are not ready"},
+                    )
+                    return False
+                self.queue.replace(rows, index, tab)
+                self._queue_changed()
+                self._play_when_page_ready(self.queue.current, connection, request_id)
+            elif (mode := repeat_from_command(command, self.queue.repeat)) is not None \
+                    or command.startswith("repeat"):
+                if mode is not None:
+                    self.queue.repeat = mode
+                    self._queue_changed()
+                self._respond(
+                    connection,
+                    request_id,
+                    {"ok": mode is not None, "running": True, "repeat": self.queue.repeat},
+                    publish_status=True,
+                )
+            elif (shuffle := shuffle_from_command(command, self.queue.shuffle)) is not None \
+                    or command.startswith("shuffle"):
+                if shuffle is not None:
+                    self.queue.shuffle = shuffle
+                    self._queue_changed()
+                self._respond(
+                    connection,
+                    request_id,
+                    {"ok": shuffle is not None, "running": True, "shuffle": self.queue.shuffle},
+                    publish_status=True,
+                )
+            elif (queue_next_id := queue_next_from_command(command)) is not None:
+                row = self.playback_tracks.get(queue_next_id)
+                if row is not None:
+                    self.queue.play_next(row)
+                    self._queue_changed()
+                self._respond(
+                    connection,
+                    request_id,
+                    {"ok": row is not None, "running": True,
+                     **({} if row is not None else {"error": "SoundCloud track details are not ready"})},
+                    publish_status=True,
+                )
             elif command.startswith(("volume:", "volume-step:")) or command == "mute":
                 level = volume_from_command(command)
                 step = volume_step_from_command(command)
@@ -4752,43 +4940,17 @@ def build_application(show_on_start: bool = False):
             elif command.startswith("play-url:"):
                 self._play_link(command.removeprefix("play-url:"), connection, request_id)
             elif (playback_id := playback_id_from_command(command)) is not None:
-                metadata = self.playback_tracks.get(playback_id)
-                if metadata is None:
+                row = self.playback_tracks.get(playback_id)
+                if row is None:
                     self._respond(
                         connection,
                         request_id,
                         {"ok": False, "error": "SoundCloud track details are not ready"},
                     )
                     return False
-                self.selection_generation = (self.selection_generation + 1) % (2**31)
-                generation = self.selection_generation
-                self.playback.begin(metadata)
-                self._publish_status_once()
-                script = play_track_script(playback_id, generation)
-
-                def track_selected(payload):
-                    if generation != self.selection_generation:
-                        self._respond(
-                            connection,
-                            request_id,
-                            {"ok": False, "error": "selection superseded"},
-                        )
-                        return
-                    if not payload:
-                        self.playback.stop("SoundCloud track details are not ready")
-                    self._respond(
-                        connection,
-                        request_id,
-                        {
-                            "ok": bool(payload),
-                            "running": True,
-                            **({} if payload else {"error": "SoundCloud track details are not ready"}),
-                        },
-                        publish_status=True,
-                    )
-
-                self._evaluate(script, track_selected)
-                GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
+                self.queue.replace([row], 0, "")  # a track picked on its own is a queue of one
+                self._queue_changed()
+                self._play_when_page_ready(row, connection, request_id)
             elif (like := track_like_from_command(command)) is not None:
                 playback_id, liked = like
 

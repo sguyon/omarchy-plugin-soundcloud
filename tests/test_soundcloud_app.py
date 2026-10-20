@@ -419,8 +419,9 @@ class BackendCommandTest(unittest.TestCase):
         app = load_module()
 
         self.assertIn("playControls__play", app.command_script("play-pause"))
-        self.assertIn("skipControl__next", app.command_script("next"))
-        self.assertIn("skipControl__previous", app.command_script("previous"))
+        # next and previous follow the queue; they no longer click the page's skip buttons
+        self.assertIsNone(app.command_script("next"))
+        self.assertIsNone(app.command_script("previous"))
         self.assertIsNone(app.command_script("arbitrary-javascript"))
 
     def test_socket_launch_command_is_backward_compatible_with_show(self):
@@ -3884,6 +3885,381 @@ class FakeConnection:
     @property
     def reply(self): return self.sent[-1]
 
+
+class FakeWebview:
+    def __init__(self, uri="https://soundcloud.com/you/likes"):
+        self.uri = uri; self.loading = False; self.loaded = []
+    def get_uri(self): return self.uri
+    def is_loading(self): return self.loading
+    def load_uri(self, uri): self.loaded.append(uri); self.uri = uri
+
+
+class PageMessage:
+    def __init__(self, payload): self.payload = payload
+    def get_js_value(self): return self
+    def to_json(self, _indent): return json.dumps(json.dumps(self.payload))
+
+
+class QueuePlaybackTest(unittest.TestCase):
+    """Queue commands, auto-advance and resume, through the real application class.
+
+    GTK, WebKit and GStreamer are fakes and the profile is a temporary directory.
+    """
+
+    def row(self, number, **overrides):
+        return {**PlayQueueTest.row(None, number), **overrides}
+
+    def build(self, saved=None, saved_file=None, settings=None):
+        self.app = load_module()
+        self.glib, self.gst = FakeGLib(), fake_gst()
+        self.evaluated = []
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        data = directory / "data" / "omarchy-soundcloud"
+        data.mkdir(parents=True, mode=0o700)
+        self.queue_file = data / "queue.json"
+        if saved is not None:
+            queue, position_ms = saved
+            fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY)
+            self.app.QueueStore(fd).save(queue, position_ms)
+            os.close(fd)
+        if saved_file is not None:
+            self.queue_file.write_bytes(saved_file)
+            os.chmod(self.queue_file, 0o600)
+        Gtk = type("Gtk", (), {"Application": type("Application", (), {
+            "__init__": lambda self, **_kw: None, "hold": lambda self: None,
+            "quit": lambda self: None, "do_shutdown": lambda self: None,
+        })})
+        Gio = type("Gio", (), {"ApplicationFlags": type("F", (), {"NON_UNIQUE": 0})})
+        patches = (
+            mock.patch.object(self.app, "_load_gi",
+                              lambda: (Gio, self.glib, self.gst, Gtk, None, None)),
+            mock.patch.object(self.app, "profile_paths", lambda env=None: self.app.ProfilePaths(
+                data, directory / "cache", data / "cookies.sqlite")),
+            mock.patch.object(self.app, "runtime_socket_path",
+                              lambda env=None: directory / "run" / "omarchy-soundcloud" / "control.sock"),
+            mock.patch.object(self.app, "prepare_runtime_socket_path", lambda path: None),
+        )
+        for patch in patches:
+            self.enterContext(patch)
+        if settings is not None:
+            fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY)
+            self.app.SettingsStore(fd).save(settings)
+            os.close(fd)
+        self.application = self.app.build_application()
+        self.application.run_in_thread = lambda target: target()
+        self.addCleanup(self.application.playback.close)
+        self.addCleanup(self.application.artwork_cache.close)
+        self.addCleanup(self.application.list_artwork_cache.close)
+        self.application.webview = FakeWebview()
+        self.application._evaluate = lambda script, callback: self.evaluated.append((script, callback))
+        self.application.page_status.seeded = True
+        return self.application
+
+    def command(self, text):
+        connection = FakeConnection()
+        self.application.dispatch_slots.acquire()
+        self.application._handle_command(text, connection, 7)
+        return connection
+
+    def fill(self, tab="home", count=4):
+        rows = [self.row(n) for n in range(1, count + 1)]
+        self.application.track_cache[tab] = rows
+        for row in rows:
+            self.application.playback_tracks[row["playbackId"]] = row
+        return rows
+
+    def started_id(self):
+        script = self.evaluated[-1][0]
+        return script.split("soundcloud:tracks:")[1].split('"')[0]
+
+    def resolve(self, ok=True):
+        """Finish the page's work for the track that began last."""
+        application = self.application
+        _script, callback = self.evaluated[-1]
+        callback(True)
+        payload = {"requestId": application.selection_generation, "ok": ok,
+                   "streamUrl": "https://cf-media.sndcdn.com/a.mp3", "protocol": "progressive",
+                   "mimeType": "audio/mpeg", "waveform": [],
+                   "track": {key: value for key, value in application.playback.metadata.items()
+                             if key != "waveform"}, **({} if ok else {"error": "gone"})}
+        application._playback_message_received(None, PageMessage(payload))
+        if ok:
+            deliver(application.playback, "state", self.gst.State.PLAYING)
+
+    def end_track(self):
+        deliver(self.application.playback, "eos")
+        self.glib.run_idle()
+
+    def queue_ids(self):
+        return [row["playbackId"].rpartition(":")[2] for row in self.application.queue.items]
+
+    # commands
+
+    def test_play_from_replaces_the_queue_with_a_snapshot_of_the_tab(self):
+        self.build()
+        self.fill("home", 4)
+        self.fill("likes", 3)
+
+        reply = self.command("play-from:home:soundcloud:tracks:3")
+        self.resolve()
+
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        self.assertEqual((self.application.queue.cursor, self.application.queue.source), (2, "home"))
+        self.assertEqual(self.started_id(), "3")
+        self.assertTrue(reply.reply["ok"])
+        self.assertEqual(self.application.playback.state, "playing")
+
+    def test_play_from_an_unknown_track_changes_nothing(self):
+        self.build()
+        self.fill("home", 2)
+
+        reply = self.command("play-from:likes:soundcloud:tracks:1")
+
+        self.assertFalse(reply.reply["ok"])
+        self.assertEqual((self.application.queue.length, self.evaluated), (0, []))
+
+    def test_a_bare_play_is_a_queue_of_one(self):
+        self.build()
+        self.fill("home", 4)
+
+        self.command("play:soundcloud:tracks:2")
+
+        self.assertEqual(self.queue_ids(), ["2"])
+        self.assertEqual(self.started_id(), "2")
+
+    def test_next_and_previous_move_through_the_queue_without_touching_the_page_player(self):
+        self.build()
+        self.fill("home", 4)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        stopped = []
+        self.application.playback.stop = lambda *a: stopped.append(a)
+
+        self.command("next")
+        self.assertEqual(self.started_id(), "3")
+        self.resolve()
+        self.command("previous")  # right after the start, so it goes back a track
+        self.assertEqual(self.started_id(), "2")
+
+        self.assertEqual(stopped, [])
+        self.assertFalse(any("skipControl" in script for script, _callback in self.evaluated))
+
+    def test_previous_restarts_the_track_after_the_threshold(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        pipeline = self.application.playback.current
+        started = len(self.evaluated)
+
+        pipeline.position = 10 * 10**9
+        reply = self.command("previous")
+
+        self.assertTrue(reply.reply["ok"])
+        self.assertEqual(pipeline.seeks, [0])
+        self.assertEqual(len(self.evaluated), started)
+        self.assertEqual(self.application.queue.cursor, 1)
+
+    def test_next_and_previous_with_nothing_to_go_to_return_not_ok(self):
+        self.build()
+        self.assertFalse(self.command("next").reply["ok"])
+        self.assertFalse(self.command("previous").reply["ok"])
+
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        before = (len(self.evaluated), self.application.playback.state)
+        self.assertFalse(self.command("next").reply["ok"])  # the last track
+        self.assertEqual((len(self.evaluated), self.application.playback.state), before)
+        self.assertEqual(self.application.queue.cursor, 1)
+
+    def test_repeat_shuffle_and_queue_next_change_the_queue_and_show_in_the_status(self):
+        self.build()
+        self.fill("home", 4)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+
+        self.assertEqual(self.command("repeat").reply["repeat"], "one")
+        self.assertEqual(self.command("repeat:all").reply["repeat"], "all")
+        self.assertFalse(self.command("repeat:sometimes").reply["ok"])
+        self.assertTrue(self.command("shuffle").reply["shuffle"])
+        self.assertFalse(self.command("shuffle:off").reply["shuffle"])
+        self.assertTrue(self.command("queue-next:soundcloud:tracks:4").reply["ok"])
+        self.assertFalse(self.command("queue-next:soundcloud:tracks:99").reply["ok"])
+
+        status = self.application.build_status()
+        self.assertEqual((status["repeat"], status["shuffle"], status["length"]), ("all", False, 4))
+        self.command("next")
+        self.assertEqual(self.started_id(), "4")  # "play next" jumps the list order
+
+    def test_a_queue_start_keeps_the_hidden_page_on_home_or_feed(self):
+        self.build()
+        self.fill("likes", 3)
+        self.application.webview.loading = True
+
+        self.command("play-from:likes:soundcloud:tracks:1")
+        self.assertEqual(self.application.webview.loaded, ["https://soundcloud.com/discover"])
+        self.assertEqual(self.evaluated, [])  # waits for the page
+
+        self.application.webview.loading = False
+        self.glib.timers[-1][0]()
+        self.assertEqual(self.started_id(), "1")
+
+    # auto-advance
+
+    def test_a_track_that_ends_starts_the_next_one_and_records_it_in_history(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+
+        self.end_track()
+        self.assertEqual(self.started_id(), "2")
+        self.assertEqual(self.application.queue.cursor, 1)
+        self.resolve()
+
+        self.assertEqual([row["playbackId"] for row in self.application.track_cache["plays"]],
+                         ["soundcloud:tracks:2", "soundcloud:tracks:1"])
+
+    def test_auto_advance_brings_the_page_back_to_home_or_feed(self):
+        self.build()
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.application.webview.uri = "https://soundcloud.com/you/likes"
+
+        self.end_track()
+
+        self.assertEqual(self.application.webview.loaded[-1], "https://soundcloud.com/discover")
+        self.assertEqual(self.started_id(), "2")
+
+    def test_the_end_of_the_queue_starts_nothing(self):
+        self.build()
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        started = len(self.evaluated)
+
+        self.end_track()
+
+        self.assertEqual(len(self.evaluated), started)
+
+    def test_repeat_one_replays_the_track_that_ended_and_repeat_all_wraps(self):
+        self.build()
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        self.command("repeat:one")
+        self.end_track()
+        self.assertEqual(self.started_id(), "2")
+        self.resolve()
+
+        self.command("repeat:all")
+        self.end_track()
+
+        self.assertEqual(self.started_id(), "1")
+
+    def test_next_pressed_right_after_an_end_does_not_advance_twice(self):
+        self.build()
+        self.fill("home", 5)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+
+        deliver(self.application.playback, "eos")  # reported, not yet handled
+        self.command("next")                       # the user beat it to the main loop
+        self.glib.run_idle()
+
+        self.assertEqual(self.application.queue.cursor, 1)
+        self.assertEqual(self.started_id(), "2")
+
+    def test_an_advance_that_is_overtaken_by_a_newer_selection_never_starts(self):
+        self.build()
+        self.fill("home", 5)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.application.webview.loading = True  # the advance has to wait for the page
+        self.end_track()
+        started = len(self.evaluated)
+        waiting = self.glib.timers[-1][0]
+
+        self.application.webview.loading = False
+        self.command("play-from:home:soundcloud:tracks:4")
+        waiting()                                  # the old advance wakes up late
+
+        self.assertEqual((len(self.evaluated), self.started_id()), (started + 1, "4"))
+        self.application.selection_generation += 1  # as a resolve timeout does
+        queued = self.application.queue.cursor
+        self.application._track_ended()
+        self.assertEqual((len(self.evaluated), self.application.queue.cursor), (started + 1, queued))
+
+    def test_next_during_a_resolve_moves_one_step_from_where_the_queue_is(self):
+        self.build()
+        self.fill("home", 5)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.end_track()  # track 2 is resolving
+
+        self.command("next")
+        self.glib.run_idle()
+
+        self.assertEqual(self.application.queue.cursor, 2)
+        self.assertEqual(self.started_id(), "3")
+
+    # dead tracks
+
+    def test_structural_changes_are_saved_once_the_loop_is_idle(self):
+        self.build()
+        self.fill("home", 3)
+
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.command("repeat:one")
+        self.assertFalse(self.queue_file.exists())  # debounced to the main loop
+        self.glib.run_idle()
+
+        saved, position_ms = self.app.QueueStore(os.open(self.queue_file.parent, os.O_RDONLY)).load()
+        self.assertEqual((saved.cursor, saved.repeat, saved.length), (1, "one", 3))
+        self.assertEqual(stat.S_IMODE(self.queue_file.stat().st_mode), 0o600)
+
+    def test_the_position_is_saved_while_playing_and_when_pausing_and_on_shutdown(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        pipeline = self.application.playback.current
+        directory = os.open(self.queue_file.parent, os.O_RDONLY)
+        self.addCleanup(os.close, directory)
+
+        def saved_position():
+            return self.app.QueueStore(directory).load()[1]
+
+        pipeline.position = 42 * 10**9
+        self.application._save_position_tick()
+        self.assertEqual(saved_position(), 42_000)
+
+        pipeline.position = 50 * 10**9
+        self.command("play-pause")
+        self.assertEqual(saved_position(), 50_000)
+
+        pipeline.position = 55 * 10**9
+        self.application._save_queue()  # what do_shutdown does first
+        self.assertEqual(saved_position(), 55_000)
+
+    def test_a_corrupt_or_missing_queue_file_gives_an_empty_idle_queue(self):
+        for content in (None, b"{broken", b'{"v":1,"items":"x"}'):
+            with self.subTest(content=content):
+                self.build(saved_file=content)
+                status = self.application.build_status()
+                self.assertEqual((status["length"], status["playbackState"], status["canNext"]),
+                                 (0, "idle", False))
+                self.assertEqual(status["title"], "")
+
+
+    # volume, settings
+
+    def play_last_of_two(self):
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
 
 class SeekCommandTest(unittest.TestCase):
     """The seek and seek-by socket commands, through the real application class."""
