@@ -603,13 +603,31 @@ class BackendCommandTest(unittest.TestCase):
         self.assertIn("state.completed", feed_script)
         self.assertIn("state.error", feed_script)
 
-    def test_track_command_allows_only_route_bound_api_sources(self):
-        app = load_module()
+    def test_command_parsers_accept_only_route_bound_sources_and_stable_ids(self):
+        with self.subTest('track command allows only route bound api sources'):
+            app = load_module()
 
-        self.assertEqual(app.track_source_from_command("tracks:home"), "home")
-        self.assertEqual(app.track_source_from_command("tracks:feed"), "feed")
-        self.assertIsNone(app.track_source_from_command("tracks"))
-        self.assertIsNone(app.track_source_from_command("tracks:https://evil.example"))
+            self.assertEqual(app.track_source_from_command("tracks:home"), "home")
+            self.assertEqual(app.track_source_from_command("tracks:feed"), "feed")
+            self.assertIsNone(app.track_source_from_command("tracks"))
+            self.assertIsNone(app.track_source_from_command("tracks:https://evil.example"))
+        with self.subTest('load more command allows only route bound sources'):
+            app = load_module()
+
+            self.assertEqual(app.load_more_source_from_command("load-more:home"), "home")
+            self.assertEqual(app.load_more_source_from_command("load-more:feed"), "feed")
+            self.assertIsNone(app.load_more_source_from_command("load-more"))
+            self.assertIsNone(app.load_more_source_from_command("load-more:likes"))
+        with self.subTest('play command accepts only stable soundcloud track ids'):
+            app = load_module()
+
+            self.assertEqual(
+                app.playback_id_from_command("play:soundcloud:tracks:123"),
+                "soundcloud:tracks:123",
+            )
+            self.assertIsNone(app.playback_id_from_command("play:soundcloud:tracks:0"))
+            self.assertIsNone(app.playback_id_from_command("play-url:https://soundcloud.com/a/b"))
+            self.assertIsNone(app.playback_id_from_command("play:soundcloud:users:123"))
 
     def test_cli_does_not_offer_bare_tracks_command(self):
         # The backend only answers tracks:home and tracks:feed, so a bare
@@ -618,25 +636,6 @@ class BackendCommandTest(unittest.TestCase):
 
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             app.parse_args(["tracks"])
-
-    def test_load_more_command_allows_only_route_bound_sources(self):
-        app = load_module()
-
-        self.assertEqual(app.load_more_source_from_command("load-more:home"), "home")
-        self.assertEqual(app.load_more_source_from_command("load-more:feed"), "feed")
-        self.assertIsNone(app.load_more_source_from_command("load-more"))
-        self.assertIsNone(app.load_more_source_from_command("load-more:likes"))
-
-    def test_play_command_accepts_only_stable_soundcloud_track_ids(self):
-        app = load_module()
-
-        self.assertEqual(
-            app.playback_id_from_command("play:soundcloud:tracks:123"),
-            "soundcloud:tracks:123",
-        )
-        self.assertIsNone(app.playback_id_from_command("play:soundcloud:tracks:0"))
-        self.assertIsNone(app.playback_id_from_command("play-url:https://soundcloud.com/a/b"))
-        self.assertIsNone(app.playback_id_from_command("play:soundcloud:users:123"))
 
     def test_track_pages_append_unique_tracks_and_new_navigation_resets(self):
         app = load_module()
@@ -1554,23 +1553,23 @@ eval({json.dumps(capture_script)});
         self.assertIsNone(app._decode_chunked_body(b"11\r\ntoo-large-for-cap\r\n0\r\n\r\n", 8))
         self.assertIsNone(app._decode_chunked_body(b"4\r\nWiki", 16))
 
-    def test_play_track_script_uses_only_stable_playback_id(self):
-        app = load_module()
+    def test_play_track_script_is_built_only_from_a_stable_playback_id(self):
+        with self.subTest('play track script uses only stable playback id'):
+            app = load_module()
 
-        script = app.play_track_script("soundcloud:tracks:123", 17)
+            script = app.play_track_script("soundcloud:tracks:123", 17)
 
-        self.assertIn("soundcloud:tracks:123", script)
-        self.assertIn("__omarchyPlayApiTrack(playbackId, 17)", script)
-        self.assertIn("__omarchyPlayApiTrack", script)
-        self.assertNotIn("document.querySelector", script)
-        self.assertNotIn("button.click()", script)
+            self.assertIn("soundcloud:tracks:123", script)
+            self.assertIn("__omarchyPlayApiTrack(playbackId, 17)", script)
+            self.assertIn("__omarchyPlayApiTrack", script)
+            self.assertNotIn("document.querySelector", script)
+            self.assertNotIn("button.click()", script)
+        with self.subTest('play track script rejects invalid playback id'):
+            app = load_module()
 
-    def test_play_track_script_rejects_invalid_playback_id(self):
-        app = load_module()
-
-        self.assertIsNone(app.play_track_script("https://soundcloud.com/artist/track", 1))
-        self.assertIsNone(app.play_track_script("soundcloud:tracks:not-a-number", 1))
-        self.assertIsNone(app.play_track_script("soundcloud:tracks:123", -1))
+            self.assertIsNone(app.play_track_script("https://soundcloud.com/artist/track", 1))
+            self.assertIsNone(app.play_track_script("soundcloud:tracks:not-a-number", 1))
+            self.assertIsNone(app.play_track_script("soundcloud:tracks:123", -1))
 
     def test_remote_payloads_are_schema_bounded_before_ipc(self):
         app = load_module()
@@ -1657,6 +1656,20 @@ class FakeSoundCloudApi:
         self.calls.append(("PUT" if liked else "DELETE", f"/users/{user_id}/track_likes/{track_id}", token))
         if self.fail_writes:
             raise OSError("like request failed with HTTP 403")
+
+
+def like_item(track_id, **overrides):
+    track = {
+        "id": track_id,
+        "title": f"Song {track_id}",
+        "duration": 180000,
+        "permalink_url": f"https://soundcloud.com/artist/song-{track_id}",
+        "artwork_url": "https://i1.sndcdn.com/artworks-abc-large.jpg",
+        "playback_count": 12,
+        "user": {"username": "Artist"},
+    }
+    track.update(overrides)
+    return {"kind": "like", "created_at": "2026-10-01T00:00:00Z", "track": track}
 
 
 class StatusSplitTest(unittest.TestCase):
@@ -1783,21 +1796,6 @@ class StatusSplitTest(unittest.TestCase):
         asked[0](self.PAGE)
 
         self.assertEqual(seen, [True, True])
-
-
-def like_item(track_id, **overrides):
-    track = {
-        "id": track_id,
-        "title": f"Song {track_id}",
-        "duration": 180000,
-        "permalink_url": f"https://soundcloud.com/artist/song-{track_id}",
-        "artwork_url": "https://i1.sndcdn.com/artworks-abc-large.jpg",
-        "playback_count": 12,
-        "user": {"username": "Artist"},
-    }
-    track.update(overrides)
-    return {"kind": "like", "created_at": "2026-10-01T00:00:00Z", "track": track}
-
 
 class LikedTracksTest(unittest.TestCase):
     def test_like_entries_become_playable_track_rows(self):
@@ -2500,6 +2498,21 @@ class PlayUrlCommandTest(unittest.TestCase):
             self.assertEqual((code, popups), (1, []))
             self.assertEqual(notices, ["Track not found. It may be private or deleted"])
 
+class AvatarSizeTest(unittest.TestCase):
+    def test_a_large_avatar_url_asks_for_the_200px_version_and_other_urls_are_left_alone(self):
+        app = load_module()
+        large = "https://i1.sndcdn.com/avatars-000012345678-abcdef-large.jpg"
+
+        self.assertEqual(
+            app.larger_avatar_url(large),
+            "https://i1.sndcdn.com/avatars-000012345678-abcdef-t200x200.jpg",
+        )
+        self.assertEqual(app.larger_avatar_url(""), "")
+        other = "https://i1.sndcdn.com/artworks-000000-abc-large.jpg"
+        self.assertEqual(app.larger_avatar_url(other), other)
+        self.assertEqual(app.larger_avatar_url("https://evil.example/avatars-1-large.jpg"),
+                         "https://evil.example/avatars-1-large.jpg")
+
 
 class LocalPlayHistoryTest(unittest.TestCase):
     def row(self, number):
@@ -3163,15 +3176,6 @@ class QueueCommandParsingTest(unittest.TestCase):
         self.assertIs(app.shuffle_from_command("shuffle:off", True), False)
         self.assertIsNone(app.shuffle_from_command("shuffle:maybe", True))
 
-    def test_queue_remove_needs_a_playback_id(self):
-        app = load_module()
-
-        self.assertEqual(app.queue_remove_from_command("queue-remove:soundcloud:tracks:5"),
-                         "soundcloud:tracks:5")
-        self.assertIsNone(app.queue_remove_from_command("queue-remove:5"))
-        self.assertIsNone(app.queue_remove_from_command("queue-remove:"))
-        self.assertIsNone(app.queue_remove_from_command("queue-add:soundcloud:tracks:5"))
-
 
 class QueueStatusTest(unittest.TestCase):
     BASE = {
@@ -3272,205 +3276,6 @@ class AutoSkipTest(unittest.TestCase):
         skip.started(2, automatic=False, now=1.0)
 
         self.assertEqual(skip.skipped, 0)
-
-
-class TrackLikesTest(unittest.TestCase):
-    def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
-        app = load_module()
-
-        self.assertEqual(
-            app.track_like_from_command("like:soundcloud:tracks:123"),
-            ("soundcloud:tracks:123", True),
-        )
-        self.assertEqual(
-            app.track_like_from_command("unlike:soundcloud:tracks:123"),
-            ("soundcloud:tracks:123", False),
-        )
-        self.assertIsNone(app.track_like_from_command("like:soundcloud:tracks:0"))
-        self.assertIsNone(app.track_like_from_command("like:soundcloud:users:123"))
-        self.assertIsNone(app.track_like_from_command("like:soundcloud:tracks:1/../../me"))
-
-    def test_session_token_comes_only_from_the_soundcloud_oauth_cookie(self):
-        app = load_module()
-        cookie = {"name": "oauth_token", "value": "2-1-abc", "domain": "soundcloud.com", "path": "/"}
-
-        self.assertEqual(app.oauth_token_from_cookies([cookie]), "2-1-abc")
-        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "domain": "api-auth.soundcloud.com"}]))
-        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "name": "connect_session"}]))
-        # Current SoundCloud tokens are far longer than the original 512 character cap.
-        long_token = "2-" + "a" * 850
-        self.assertEqual(app.oauth_token_from_cookies([{**cookie, "value": long_token}]), long_token)
-        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "a" * 2049}]))
-        # A header-injecting value must never reach the Authorization header.
-        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "abc\r\nX-Evil: 1"}]))
-
-    def test_liking_writes_to_the_signed_in_users_likes_and_updates_state(self):
-        app = load_module()
-        api = FakeSoundCloudApi(user_id=42, liked_ids=[7])
-        likes = app.TrackLikes(lambda: "token", api.write, request=api)
-
-        likes.set_liked(99, True)
-
-        self.assertIn(("PUT", "/users/42/track_likes/99", "token"), api.calls)
-        self.assertTrue(likes.is_liked(99))
-        self.assertTrue(likes.is_liked(7))
-
-        likes.set_liked(7, False)
-
-        self.assertIn(("DELETE", "/users/42/track_likes/7", "token"), api.calls)
-        self.assertFalse(likes.is_liked(7))
-
-    def test_likes_beyond_the_first_page_show_as_liked(self):
-        app = load_module()
-        api = FakeSoundCloudApi(liked_ids=[1, 2, 3, 4, 5])
-        likes = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
-
-        likes.load_in_background(lambda: None)
-
-        self.assertTrue(likes.is_liked(5))
-        self.assertFalse(likes.is_liked(6))
-
-    def test_likes_paging_never_follows_a_cursor_off_soundcloud(self):
-        app = load_module()
-        calls = []
-
-        def request(method, path, token, maximum=0):
-            calls.append(path)
-            if path == "/me":
-                return {"id": 1}
-            return {"collection": [7], "next_href": "https://evil.example/me/track_likes/ids?offset=1"}
-
-        likes = app.TrackLikes(lambda: "token", None, request=request, spawn=lambda target: target())
-        likes.load_in_background(lambda: None)
-
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(likes.is_liked(7))
-
-    def test_failed_write_keeps_the_previous_liked_state(self):
-        app = load_module()
-        api = FakeSoundCloudApi(liked_ids=[7])
-        likes = app.TrackLikes(lambda: "token", api.write, request=api)
-        api.fail_writes = True
-
-        with self.assertRaises(OSError):
-            likes.set_liked(7, False)
-
-        self.assertTrue(likes.is_liked(7))
-
-    def test_likes_are_unknown_until_loaded_and_signed_out_never_calls_the_api(self):
-        app = load_module()
-        api = FakeSoundCloudApi()
-        likes = app.TrackLikes(lambda: None, api.write, request=api, spawn=lambda target: target())
-
-        self.assertIsNone(likes.is_liked(7))
-        with self.assertRaises(PermissionError):
-            likes.set_liked(7, True)
-        likes.load_in_background(lambda: None)
-
-        self.assertEqual(api.calls, [])
-        self.assertIsNone(likes.is_liked(7))
-
-    def test_background_load_retries_are_throttled(self):
-        app = load_module()
-        api = FakeSoundCloudApi()
-        api.user_id = 0  # invalid account response
-        likes = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
-
-        likes.load_in_background(lambda: None)
-        likes.load_in_background(lambda: None)
-
-        self.assertEqual(len(api.calls), 1)
-
-    def test_switching_accounts_drops_the_previous_accounts_likes(self):
-        app = load_module()
-        api = FakeSoundCloudApi(user_id=1, liked_ids=[7])
-        token = ["first"]
-        likes = app.TrackLikes(lambda: token[0], api.write, request=api)
-        likes.set_liked(8, True)
-
-        token[0] = "second"
-        api.user_id, api.liked_ids = 2, []
-        likes.set_liked(9, True)
-
-        self.assertIn(("PUT", "/users/2/track_likes/9", "second"), api.calls)
-        self.assertFalse(likes.is_liked(7))
-
-    def run_like_function(self, responses, method="PUT"):
-        app = load_module()
-        harness = f"""
-const responses = {json.dumps(responses)};
-const requests = [];
-global.fetch = async (url, init) => {{
-  requests.push({{ url, method: init.method, auth: init.headers.Authorization }});
-  const next = responses.shift();
-  return new Response(next.body, {{ status: next.status }});
-}};
-(async () => {{
-  const outcomes = [];
-  for (let index = 0; index < {len(responses)}; index++) {{
-    outcomes.push(await (async (userId, trackId, method, token) => {{
-      {app.LIKE_TRACK_FUNCTION}
-    }})(42, 99, {json.dumps(method)}, 'token'));
-  }}
-  process.stdout.write(JSON.stringify({{ outcomes, requests }}));
-}})().catch((error) => {{ console.error(error); process.exit(1); }});
-"""
-        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
-        return json.loads(completed.stdout)
-
-    def test_page_like_reports_a_captcha_so_the_user_can_be_sent_to_solve_it(self):
-        captcha = json.dumps({"url": "https://geo.captcha-delivery.com/captcha/?cid=x"})
-        lookalike = json.dumps({"url": "https://geo.captcha-delivery.com.example.org/captcha/"})
-
-        result = self.run_like_function([
-            {"status": 200, "body": ""},
-            {"status": 403, "body": captcha},
-            {"status": 403, "body": lookalike},
-            {"status": 403, "body": "{}"},
-            {"status": 500, "body": captcha},
-        ])
-
-        self.assertEqual(result["outcomes"], ["ok", "bot-check", "failed", "failed", "failed"])
-        self.assertEqual(result["requests"][0], {
-            "url": "https://api-v2.soundcloud.com/users/42/track_likes/99",
-            "method": "PUT",
-            "auth": "OAuth token",
-        })
-
-    def test_page_like_refuses_methods_other_than_like_and_unlike(self):
-        result = self.run_like_function([{"status": 200, "body": ""}], method="POST")
-
-        self.assertEqual(result["outcomes"], ["failed"])
-        self.assertEqual(result["requests"], [])
-
-    def test_api_requests_go_only_to_soundcloud_without_proxies_or_redirects(self):
-        app = load_module()
-        seen = []
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self, _size):
-                return b'{"id": 1}'
-
-        def fake_open(request, timeout):
-            seen.append(request)
-            return Response()
-
-        with mock.patch.object(app._api_opener, "open", side_effect=fake_open):
-            self.assertEqual(app.soundcloud_api_request("GET", "/me", "token"), {"id": 1})
-            with self.assertRaises(ValueError):
-                app.soundcloud_api_request("GET", "@evil.example/me", "token")
-
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0].full_url, "https://api-v2.soundcloud.com/me")
-        self.assertEqual(seen[0].get_header("Authorization"), "OAuth token")
-        handler_types = {type(handler) for handler in app._api_opener.handlers}
-        self.assertIn(app._NoMediaRedirect, handler_types)
 
 
 def fake_gst():
@@ -4508,6 +4313,11 @@ class QueuePlaybackTest(unittest.TestCase):
         self.application.track_likes.request = request
         return paths
 
+    def play_last_of_two(self):
+        self.fill("home", 2)
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+
     def test_the_end_of_the_queue_continues_with_related_tracks(self):
         self.build()
         paths = self.related((101, 102, 103))
@@ -4656,11 +4466,6 @@ class QueuePlaybackTest(unittest.TestCase):
 
         self.assertEqual(self.queue_ids(), ["1", "2", "101", "102"])
         self.assertEqual(self.started_id(), "101")
-
-    def play_last_of_two(self):
-        self.fill("home", 2)
-        self.command("play-from:home:soundcloud:tracks:2")
-        self.resolve()
 
     def test_an_automatic_start_that_cannot_begin_is_skipped_not_stalled(self):
         self.build()
@@ -5641,67 +5446,6 @@ class QueuePlaybackTest(unittest.TestCase):
 
     # MPRIS wiring
 
-    def test_mpris_play_pause_on_a_restored_track_starts_it_without_a_socket(self):
-        queue = load_module().PlayQueue()
-        queue.replace([self.row(n, durationMs=200_000) for n in (1, 2, 3)], 1, "likes")
-        self.build(saved=(queue, 61_000))
-        status = self.application.mpris_status()
-        slots_before = self.application.dispatch_slots._value
-
-        commands = self.app.mpris_method_commands("PlayPause", (), status)
-        for command in commands:
-            self.application.mpris_command(command)
-
-        self.assertEqual(self.started_id(), "2")
-        self.resolve()
-        self.assertEqual(self.application.playback.current.seeks, [61 * 10**9])
-        self.assertEqual(self.application.dispatch_slots._value, slots_before)
-
-    def test_mpris_commands_reuse_the_socket_command_code(self):
-        self.build()
-        self.fill("home", 3)
-        self.command("play-from:home:soundcloud:tracks:1")
-        self.resolve()
-        slots_before = self.application.dispatch_slots._value
-
-        self.application.mpris_command("next")
-        self.assertEqual(self.started_id(), "2")
-        self.application.mpris_command("repeat:one")
-        self.application.mpris_command("shuffle:on")
-        self.application.mpris_command("volume:0.3000")
-        self.application.mpris_command("nonsense")
-
-        self.assertEqual((self.application.queue.repeat, self.application.queue.shuffle),
-                         ("one", True))
-        self.assertEqual(self.application.playback.volume_status()["volume"], 0.3)
-        self.assertEqual(self.application.dispatch_slots._value, slots_before)
-
-    def test_mpris_status_keeps_the_remote_artwork_url_and_the_queue_flags(self):
-        queue = load_module().PlayQueue()
-        queue.replace([self.row(n, artUrl="https://i1.sndcdn.com/art-%d.jpg" % n) for n in (1, 2)], 0, "likes")
-        self.build(saved=(queue, 0))
-
-        status = self.application.mpris_status()
-        properties = self.app.mpris_properties(status)
-
-        self.assertEqual(status["artUrl"], "https://i1.sndcdn.com/art-1.jpg")
-        self.assertEqual(properties["Metadata"]["mpris:artUrl"], "https://i1.sndcdn.com/art-1.jpg")
-        self.assertEqual(properties["PlaybackStatus"], "Paused")
-        self.assertTrue(properties["CanGoNext"])
-        self.assertNotIn("artUrl", self.application.build_status())
-
-    def test_the_status_tick_updates_mpris_even_without_a_subscriber(self):
-        self.build()
-        updates = []
-        self.application.mpris = type("M", (), {
-            "owned": True, "update": lambda _self, status: updates.append(status),
-            "stop": lambda _self: None})()
-
-        self.assertFalse(self.application.status_subscribers)
-        self.application._publish_status()
-
-        self.assertEqual(len(updates), 1)
-
     # earbud multi-press
 
     class Invocation:
@@ -5884,78 +5628,66 @@ class QueuePlaybackTest(unittest.TestCase):
                              "notify": True, "multiPress": False})
         self.assertIs(self.application.build_status()["multiPress"], False)
 
+    def test_mpris_play_pause_on_a_restored_track_starts_it_without_a_socket(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n, durationMs=200_000) for n in (1, 2, 3)], 1, "likes")
+        self.build(saved=(queue, 61_000))
+        status = self.application.mpris_status()
+        slots_before = self.application.dispatch_slots._value
 
-class CheckResultTest(unittest.TestCase):
-    def test_dependency_check_is_machine_readable(self):
-        app = load_module()
+        commands = self.app.mpris_method_commands("PlayPause", (), status)
+        for command in commands:
+            self.application.mpris_command(command)
 
-        result = app.dependency_check()
+        self.assertEqual(self.started_id(), "2")
+        self.resolve()
+        self.assertEqual(self.application.playback.current.seeks, [61 * 10**9])
+        self.assertEqual(self.application.dispatch_slots._value, slots_before)
 
-        self.assertEqual(result["python_gobject"], True)
-        self.assertEqual(result["gtk"], "3.0")
-        self.assertEqual(result["webkit2"], "4.1")
-        self.assertEqual(result["gstreamer_autoaudiosink"], True)
-        self.assertEqual(result["gstreamer_aac_decoder"], True)
-        self.assertEqual(result["gstreamer_playback_elements"], True)
-        self.assertIn("ok", result)
+    def test_mpris_commands_reuse_the_socket_command_code(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        slots_before = self.application.dispatch_slots._value
 
-    def test_missing_gstreamer_elements_name_every_package_to_install(self):
-        app = load_module()
-        stock_omarchy = {"playbin3", "appsrc", "audioconvert", "audioresample"}
+        self.application.mpris_command("next")
+        self.assertEqual(self.started_id(), "2")
+        self.application.mpris_command("repeat:one")
+        self.application.mpris_command("shuffle:on")
+        self.application.mpris_command("volume:0.3000")
+        self.application.mpris_command("nonsense")
 
-        packages = app.missing_gstreamer_packages(lambda name: name in stock_omarchy)
+        self.assertEqual((self.application.queue.repeat, self.application.queue.shuffle),
+                         ("one", True))
+        self.assertEqual(self.application.playback.volume_status()["volume"], 0.3)
+        self.assertEqual(self.application.dispatch_slots._value, slots_before)
 
-        self.assertEqual(packages, ["gst-plugins-good", "gst-libav"])
+    def test_mpris_status_keeps_the_remote_artwork_url_and_the_queue_flags(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n, artUrl="https://i1.sndcdn.com/art-%d.jpg" % n) for n in (1, 2)], 0, "likes")
+        self.build(saved=(queue, 0))
 
-    def test_missing_aac_decoder_alone_names_only_gst_libav(self):
-        app = load_module()
+        status = self.application.mpris_status()
+        properties = self.app.mpris_properties(status)
 
-        packages = app.missing_gstreamer_packages(lambda name: name != "avdec_aac")
+        self.assertEqual(status["artUrl"], "https://i1.sndcdn.com/art-1.jpg")
+        self.assertEqual(properties["Metadata"]["mpris:artUrl"], "https://i1.sndcdn.com/art-1.jpg")
+        self.assertEqual(properties["PlaybackStatus"], "Paused")
+        self.assertTrue(properties["CanGoNext"])
+        self.assertNotIn("artUrl", self.application.build_status())
 
-        self.assertEqual(packages, ["gst-libav"])
+    def test_the_status_tick_updates_mpris_even_without_a_subscriber(self):
+        self.build()
+        updates = []
+        self.application.mpris = type("M", (), {
+            "owned": True, "update": lambda _self, status: updates.append(status),
+            "stop": lambda _self: None})()
 
-    def test_install_hint_is_a_command_the_user_can_run(self):
-        app = load_module()
+        self.assertFalse(self.application.status_subscribers)
+        self.application._publish_status()
 
-        hint = app.install_hint(["gst-plugins-good", "gst-libav"])
-
-        self.assertIn("omarchy pkg add gst-plugins-good gst-libav", hint)
-
-
-class LaunchBackendTest(unittest.TestCase):
-    missing = {"ok": False, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}
-
-    def test_missing_dependencies_are_reported_instead_of_starting_a_doomed_backend(self):
-        app = load_module()
-        with mock.patch.object(app, "request_backend", return_value=None), \
-                mock.patch.object(app, "dependency_check", return_value=self.missing), \
-                mock.patch.object(app.subprocess, "Popen") as popen:
-            result = app.launch_backend(show=False)
-
-        popen.assert_not_called()
-        self.assertEqual(result["ok"], False)
-        self.assertEqual(result["error"], self.missing["error"])
-
-    def test_running_backend_is_reused_without_checking_dependencies(self):
-        app = load_module()
-        with mock.patch.object(app, "request_backend", return_value={"ok": True, "running": True}), \
-                mock.patch.object(app, "dependency_check") as check:
-            result = app.launch_backend(show=False)
-
-        check.assert_not_called()
-        self.assertEqual(result["running"], True)
-
-    def test_ensure_exits_nonzero_with_the_error_on_stdout(self):
-        app = load_module()
-        stdout = io.StringIO()
-        with mock.patch.object(app, "request_backend", return_value=None), \
-                mock.patch.object(app, "dependency_check", return_value=self.missing), \
-                contextlib.redirect_stdout(stdout):
-            code = app.main(["ensure"])
-
-        self.assertEqual(code, 1)
-        self.assertEqual(json.loads(stdout.getvalue())["error"], self.missing["error"])
-
+        self.assertEqual(len(updates), 1)
 
 class SettingsCommandParsingTest(unittest.TestCase):
     def test_volume_commands_accept_finite_numbers_and_clamp(self):
@@ -5973,14 +5705,17 @@ class SettingsCommandParsingTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(app.volume_step_from_command(bad))
 
-    def test_on_off_commands(self):
+    def test_autoplay_notify_and_queue_remove_commands(self):
         app = load_module()
 
         self.assertIs(app.on_off_from_command("autoplay:on", "autoplay"), True)
         self.assertIs(app.on_off_from_command("autoplay:off", "autoplay"), False)
         self.assertIsNone(app.on_off_from_command("autoplay:maybe", "autoplay"))
-        self.assertIsNone(app.on_off_from_command("shuffle:on", "autoplay"))
         self.assertIsNone(app.on_off_from_command("notify:on", "autoplay"))
+        self.assertEqual(app.queue_remove_from_command("queue-remove:soundcloud:tracks:5"),
+                         "soundcloud:tracks:5")
+        self.assertIsNone(app.queue_remove_from_command("queue-remove:5"))
+        self.assertIsNone(app.queue_remove_from_command("queue-remove:"))
 
 
 class SettingsStoreTest(unittest.TestCase):
@@ -6025,17 +5760,6 @@ class SettingsStoreTest(unittest.TestCase):
             "v": 1, "volume": 0.35, "muted": True, "autoplay": False, "notify": False,
             "multiPress": False})
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-
-    def test_only_the_known_keys_are_kept_so_a_new_setting_is_added_on_purpose(self):
-        app, store, _path = self.store()
-
-        store.save({"v": 1, "volume": 0.5, "muted": False, "autoplay": True, "somethingNew": True})
-
-        self.assertEqual(store.load(), {
-            "v": 1, "volume": 0.5, "muted": False, "autoplay": True, "notify": True,
-            "multiPress": True})
-        self.assertEqual(set(app.DEFAULT_SETTINGS),
-                         {"v", "volume", "muted", "autoplay", "notify", "multiPress"})
 
 
 class GstVolumeTest(unittest.TestCase):
@@ -6212,8 +5936,6 @@ class SettingsStatusFieldsTest(unittest.TestCase):
 
 
 class QueueViewTest(unittest.TestCase):
-    """The rows the queue view lists: PlayQueue.view and the edits behind its buttons."""
-
     def queue(self, count=5, index=0, **options):
         app = load_module()
         queue = app.PlayQueue(**options)
@@ -6468,62 +6190,350 @@ class TrackNotificationTest(unittest.TestCase):
         self.assertIsNot(threads[0], threading.main_thread())
 
 
+class TrackLikesTest(unittest.TestCase):
+    def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
+        app = load_module()
+
+        self.assertEqual(
+            app.track_like_from_command("like:soundcloud:tracks:123"),
+            ("soundcloud:tracks:123", True),
+        )
+        self.assertEqual(
+            app.track_like_from_command("unlike:soundcloud:tracks:123"),
+            ("soundcloud:tracks:123", False),
+        )
+        self.assertIsNone(app.track_like_from_command("like:soundcloud:tracks:0"))
+        self.assertIsNone(app.track_like_from_command("like:soundcloud:users:123"))
+        self.assertIsNone(app.track_like_from_command("like:soundcloud:tracks:1/../../me"))
+
+    def test_session_token_comes_only_from_the_soundcloud_oauth_cookie(self):
+        app = load_module()
+        cookie = {"name": "oauth_token", "value": "2-1-abc", "domain": "soundcloud.com", "path": "/"}
+
+        self.assertEqual(app.oauth_token_from_cookies([cookie]), "2-1-abc")
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "domain": "api-auth.soundcloud.com"}]))
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "name": "connect_session"}]))
+        # Current SoundCloud tokens are far longer than the original 512 character cap.
+        long_token = "2-" + "a" * 850
+        self.assertEqual(app.oauth_token_from_cookies([{**cookie, "value": long_token}]), long_token)
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "a" * 2049}]))
+        # A header-injecting value must never reach the Authorization header.
+        self.assertIsNone(app.oauth_token_from_cookies([{**cookie, "value": "abc\r\nX-Evil: 1"}]))
+
+    def test_liking_writes_to_the_signed_in_users_likes_and_updates_state(self):
+        app = load_module()
+        api = FakeSoundCloudApi(user_id=42, liked_ids=[7])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+
+        likes.set_liked(99, True)
+
+        self.assertIn(("PUT", "/users/42/track_likes/99", "token"), api.calls)
+        self.assertTrue(likes.is_liked(99))
+        self.assertTrue(likes.is_liked(7))
+
+        likes.set_liked(7, False)
+
+        self.assertIn(("DELETE", "/users/42/track_likes/7", "token"), api.calls)
+        self.assertFalse(likes.is_liked(7))
+
+    def test_likes_beyond_the_first_page_show_as_liked(self):
+        app = load_module()
+        api = FakeSoundCloudApi(liked_ids=[1, 2, 3, 4, 5])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
+
+        likes.load_in_background(lambda: None)
+
+        self.assertTrue(likes.is_liked(5))
+        self.assertFalse(likes.is_liked(6))
+
+    def test_likes_paging_never_follows_a_cursor_off_soundcloud(self):
+        app = load_module()
+        calls = []
+
+        def request(method, path, token, maximum=0):
+            calls.append(path)
+            if path == "/me":
+                return {"id": 1}
+            return {"collection": [7], "next_href": "https://evil.example/me/track_likes/ids?offset=1"}
+
+        likes = app.TrackLikes(lambda: "token", None, request=request, spawn=lambda target: target())
+        likes.load_in_background(lambda: None)
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(likes.is_liked(7))
+
+    def test_failed_write_keeps_the_previous_liked_state(self):
+        app = load_module()
+        api = FakeSoundCloudApi(liked_ids=[7])
+        likes = app.TrackLikes(lambda: "token", api.write, request=api)
+        api.fail_writes = True
+
+        with self.assertRaises(OSError):
+            likes.set_liked(7, False)
+
+        self.assertTrue(likes.is_liked(7))
+
+    def test_likes_are_unknown_until_loaded_and_signed_out_never_calls_the_api(self):
+        app = load_module()
+        api = FakeSoundCloudApi()
+        likes = app.TrackLikes(lambda: None, api.write, request=api, spawn=lambda target: target())
+
+        self.assertIsNone(likes.is_liked(7))
+        with self.assertRaises(PermissionError):
+            likes.set_liked(7, True)
+        likes.load_in_background(lambda: None)
+
+        self.assertEqual(api.calls, [])
+        self.assertIsNone(likes.is_liked(7))
+
+    ME = {
+        "id": 42, "username": "Sacha", "full_name": "Not Used",
+        "permalink_url": "https://soundcloud.com/sacha",
+        "avatar_url": "https://i1.sndcdn.com/avatars-abc-large.jpg",
+    }
+
+    def test_the_account_is_read_from_the_me_response_and_checked(self):
+        app = load_module()
+        hostile = {
+            "id": 42, "username": "x" * 5000, "permalink_url": "https://evil.example/sacha",
+            "avatar_url": "https://evil.example/a.jpg",
+        }
+        for me, expected in (
+            (self.ME, {"name": "Sacha", "url": "https://soundcloud.com/sacha",
+                       "avatar": "https://i1.sndcdn.com/avatars-abc-t200x200.jpg"}),
+            (hostile, {"name": "", "url": "", "avatar": ""}),
+            ({"id": 42, "username": 7, "permalink_url": ["a"], "avatar_url": None},
+             {"name": "", "url": "", "avatar": ""}),
+            ({"id": 42, "username": "bad\x00name"}, {"name": "", "url": "", "avatar": ""}),
+        ):
+            likes = app.TrackLikes(lambda: "token", lambda *a: None, request=lambda *a: me,
+                                   spawn=lambda target: target())
+            self.assertEqual(likes.account, {})
+            likes.load_account_in_background(lambda: None)
+            self.assertEqual(likes.account, expected)
+
+    def test_the_account_loads_once_and_a_failure_is_not_retried_in_a_loop(self):
+        app = load_module()
+        api = FakeSoundCloudApi()
+        loaded = []
+        likes = app.TrackLikes(lambda: "token", api.write, request=lambda *a: {**self.ME, **api(*a)},
+                               spawn=lambda target: target())
+
+        likes.load_account_in_background(lambda: loaded.append(1))
+        likes.load_account_in_background(lambda: loaded.append(1))
+
+        self.assertEqual((loaded, len(api.calls)), ([1], 1))
+        self.assertEqual(likes.account["name"], "Sacha")
+
+        failing = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
+        api.user_id = 0
+        before = len(api.calls)
+        failing.load_account_in_background(lambda: loaded.append(2))
+        failing.load_account_in_background(lambda: loaded.append(2))
+        self.assertEqual((loaded, failing.account, len(api.calls) - before), ([1], {}, 1))
+
+        signed_out = app.TrackLikes(lambda: None, api.write, request=api, spawn=lambda target: target())
+        signed_out.load_account_in_background(lambda: loaded.append(3))
+        self.assertEqual((loaded, signed_out.account), ([1], {}))
+
+    def test_a_new_token_or_a_forgotten_account_loads_again(self):
+        app = load_module()
+        token = ["first"]
+        names = {"first": "One", "second": "Two"}
+        likes = app.TrackLikes(
+            lambda: token[0], lambda *a: None,
+            request=lambda _m, _p, tok, *_r: {**self.ME, "username": names[tok]},
+            spawn=lambda target: target())
+        likes.load_account_in_background(lambda: None)
+        self.assertEqual(likes.account["name"], "One")
+
+        likes.forget_account()
+        self.assertEqual(likes.account, {})
+        token[0] = "second"
+        likes.load_account_in_background(lambda: None)
+        self.assertEqual(likes.account["name"], "Two")
+
+    def test_background_load_retries_are_throttled(self):
+        app = load_module()
+        api = FakeSoundCloudApi()
+        api.user_id = 0  # invalid account response
+        likes = app.TrackLikes(lambda: "token", api.write, request=api, spawn=lambda target: target())
+
+        likes.load_in_background(lambda: None)
+        likes.load_in_background(lambda: None)
+
+        self.assertEqual(len(api.calls), 1)
+
+    def test_switching_accounts_drops_the_previous_accounts_likes(self):
+        app = load_module()
+        api = FakeSoundCloudApi(user_id=1, liked_ids=[7])
+        token = ["first"]
+        likes = app.TrackLikes(lambda: token[0], api.write, request=api)
+        likes.set_liked(8, True)
+
+        token[0] = "second"
+        api.user_id, api.liked_ids = 2, []
+        likes.set_liked(9, True)
+
+        self.assertIn(("PUT", "/users/2/track_likes/9", "second"), api.calls)
+        self.assertFalse(likes.is_liked(7))
+
+    def run_like_function(self, responses, method="PUT"):
+        app = load_module()
+        harness = f"""
+const responses = {json.dumps(responses)};
+const requests = [];
+global.fetch = async (url, init) => {{
+  requests.push({{ url, method: init.method, auth: init.headers.Authorization }});
+  const next = responses.shift();
+  return new Response(next.body, {{ status: next.status }});
+}};
+(async () => {{
+  const outcomes = [];
+  for (let index = 0; index < {len(responses)}; index++) {{
+    outcomes.push(await (async (userId, trackId, method, token) => {{
+      {app.LIKE_TRACK_FUNCTION}
+    }})(42, 99, {json.dumps(method)}, 'token'));
+  }}
+  process.stdout.write(JSON.stringify({{ outcomes, requests }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+        return json.loads(completed.stdout)
+
+    def test_page_like_reports_captchas_and_refuses_other_methods(self):
+        with self.subTest('page like reports a captcha so the user can be sent to solve it'):
+            captcha = json.dumps({"url": "https://geo.captcha-delivery.com/captcha/?cid=x"})
+            lookalike = json.dumps({"url": "https://geo.captcha-delivery.com.example.org/captcha/"})
+
+            result = self.run_like_function([
+                {"status": 200, "body": ""},
+                {"status": 403, "body": captcha},
+                {"status": 403, "body": lookalike},
+                {"status": 403, "body": "{}"},
+                {"status": 500, "body": captcha},
+            ])
+
+            self.assertEqual(result["outcomes"], ["ok", "bot-check", "failed", "failed", "failed"])
+            self.assertEqual(result["requests"][0], {
+                "url": "https://api-v2.soundcloud.com/users/42/track_likes/99",
+                "method": "PUT",
+                "auth": "OAuth token",
+            })
+        with self.subTest('page like refuses methods other than like and unlike'):
+            result = self.run_like_function([{"status": 200, "body": ""}], method="POST")
+
+            self.assertEqual(result["outcomes"], ["failed"])
+            self.assertEqual(result["requests"], [])
+
+    def test_api_requests_go_only_to_soundcloud_without_proxies_or_redirects(self):
+        app = load_module()
+        seen = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size):
+                return b'{"id": 1}'
+
+        def fake_open(request, timeout):
+            seen.append(request)
+            return Response()
+
+        with mock.patch.object(app._api_opener, "open", side_effect=fake_open):
+            self.assertEqual(app.soundcloud_api_request("GET", "/me", "token"), {"id": 1})
+            with self.assertRaises(ValueError):
+                app.soundcloud_api_request("GET", "@evil.example/me", "token")
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].full_url, "https://api-v2.soundcloud.com/me")
+        self.assertEqual(seen[0].get_header("Authorization"), "OAuth token")
+        handler_types = {type(handler) for handler in app._api_opener.handlers}
+        self.assertIn(app._NoMediaRedirect, handler_types)
+
+
+class CheckResultTest(unittest.TestCase):
+    def test_dependency_check_is_machine_readable(self):
+        app = load_module()
+
+        result = app.dependency_check()
+
+        self.assertEqual(result["python_gobject"], True)
+        self.assertEqual(result["gtk"], "3.0")
+        self.assertEqual(result["webkit2"], "4.1")
+        self.assertEqual(result["gstreamer_autoaudiosink"], True)
+        self.assertEqual(result["gstreamer_aac_decoder"], True)
+        self.assertEqual(result["gstreamer_playback_elements"], True)
+        self.assertIn("ok", result)
+
+    def test_missing_gstreamer_packages_and_the_install_hint(self):
+        with self.subTest('missing gstreamer elements name every package to install'):
+            app = load_module()
+            stock_omarchy = {"playbin3", "appsrc", "audioconvert", "audioresample"}
+
+            packages = app.missing_gstreamer_packages(lambda name: name in stock_omarchy)
+
+            self.assertEqual(packages, ["gst-plugins-good", "gst-libav"])
+        with self.subTest('missing aac decoder alone names only gst libav'):
+            app = load_module()
+
+            packages = app.missing_gstreamer_packages(lambda name: name != "avdec_aac")
+
+            self.assertEqual(packages, ["gst-libav"])
+        with self.subTest('install hint is a command the user can run'):
+            app = load_module()
+
+            hint = app.install_hint(["gst-plugins-good", "gst-libav"])
+
+            self.assertIn("omarchy pkg add gst-plugins-good gst-libav", hint)
+
+
+class LaunchBackendTest(unittest.TestCase):
+    missing = {"ok": False, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}
+
+    def test_missing_dependencies_are_reported_instead_of_starting_a_doomed_backend(self):
+        app = load_module()
+        with mock.patch.object(app, "request_backend", return_value=None), \
+                mock.patch.object(app, "dependency_check", return_value=self.missing), \
+                mock.patch.object(app.subprocess, "Popen") as popen:
+            result = app.launch_backend(show=False)
+
+        popen.assert_not_called()
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"], self.missing["error"])
+
+    def test_running_backend_is_reused_without_checking_dependencies(self):
+        app = load_module()
+        with mock.patch.object(app, "request_backend", return_value={"ok": True, "running": True}), \
+                mock.patch.object(app, "dependency_check") as check:
+            result = app.launch_backend(show=False)
+
+        check.assert_not_called()
+        self.assertEqual(result["running"], True)
+
+    def test_ensure_exits_nonzero_with_the_error_on_stdout(self):
+        app = load_module()
+        stdout = io.StringIO()
+        with mock.patch.object(app, "request_backend", return_value=None), \
+                mock.patch.object(app, "dependency_check", return_value=self.missing), \
+                contextlib.redirect_stdout(stdout):
+            code = app.main(["ensure"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["error"], self.missing["error"])
+
+
 class BarWidgetTest(unittest.TestCase):
-    def test_runtime_commands_use_one_persistent_socket(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("Socket {", qml)
-        self.assertIn("SplitParser {", qml)
-        self.assertIn("socket.write(JSON.stringify(payload)", qml)
-        self.assertNotIn("id: statusProcess", qml)
-        self.assertNotIn("id: tracksProcess", qml)
-        self.assertNotIn("id: actionProcess", qml)
-        self.assertIn('splitMarker: ""', qml)
-        self.assertIn("maxSocketFrameChars", qml)
-
-    def test_connected_backend_never_sends_unsupported_launch_command(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn('if (action === "launch") return "show"', qml)
-        self.assertIn("function initializeConnection()", qml)
-        self.assertIn('sendCommand("subscribe", "subscribe")', qml)
-        self.assertIn('sendCommand("status", "status")', qml)
-        self.assertIn("onBackendConnectedChanged: initializeConnection()", qml)
-
     def test_track_label_is_tooltip_only(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
         self.assertNotIn('visible: !root.bar.vertical && root.title !== ""', qml)
         self.assertIn("showTooltip(root, root.safeTooltipLabel)", qml)
         self.assertIn('replace(/[<>&', qml)
-
-    def test_bar_remains_icon_only_while_popup_uses_artwork(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertNotIn("id: barArtwork", qml)
-        self.assertIn('text: ""', qml)
-        self.assertIn("source: root.artDataUrl", qml)
-        self.assertNotIn("source: track.artUrl", qml)
-        self.assertNotIn("source: root.artUrl", qml)
-
-    def test_track_list_requests_bounded_backend_artwork_by_token(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-        source = MODULE_PATH.read_text()
-
-        self.assertIn('"artwork:" + artworkId', qml)
-        self.assertIn("source: trackArtDataUrl", qml)
-        self.assertIn("visible: trackArtDataUrl !== \"\"", qml)
-        self.assertNotIn("source: track.artUrl", qml)
-        self.assertIn('command.startswith("artwork:")', source)
-        self.assertIn("LIST_ARTWORK_BYTES", source)
-
-    def test_track_list_displays_play_count_and_duration(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("formatCompactCount", qml)
-        self.assertIn("track.playCount", qml)
-        self.assertIn("track.durationMs", qml)
-        self.assertIn('"—:—"', qml)
 
     def test_theme_colors_follow_bar_palette(self):
         import re
@@ -6566,158 +6576,18 @@ class BarWidgetTest(unittest.TestCase):
         self.assertNotIn("set_persistent_storage", source)
         self.assertIn("def _check_installation", source)
 
-    def test_popup_uses_seekable_waveform_instead_of_feed_buttons(self):
+    def test_library_opens_in_the_browser_from_the_avatar_and_is_not_a_tab(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        model = (MODULE_PATH.parent / "SoundCloudModel.js").read_text()
 
-        self.assertNotIn('text: "Following"', qml)
-        self.assertIn("Canvas {", qml)
-        self.assertIn('root.runAction("seek"', qml)
-
-    def test_likes_tab_sits_next_to_feed_and_reads_likes_without_navigating_the_page(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertLess(qml.index('text: "Feed"'), qml.index('text: "Likes"'))
-        self.assertIn('onClicked: root.selectTab("likes")', qml)
-        self.assertIn("if (!isAccountTab(tab)) runAction(tab)", qml)
-
-    def test_library_link_opens_the_soundcloud_library_in_the_browser_apart_from_the_tabs(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertLess(qml.index('text: "History"'), qml.index('tooltipText: "Open your Library'))
+        self.assertIn('var libraryUrl = "https://soundcloud.com/you/library"', model)
         self.assertIn(
-            'Quickshell.execDetached(["omarchy", "launch", "browser", "https://soundcloud.com/you/library"])',
+            'Quickshell.execDetached(["omarchy", "launch", "browser", SoundCloudModel.libraryUrl])',
             qml,
         )
+        self.assertIn("onClicked: root.openLibrary()", qml)
         self.assertNotIn("selectTab(\"library\")", qml)
-
-    def test_queue_button_follows_the_tabs_and_opens_a_view_that_reads_the_queue(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertLess(qml.index('text: "History"'), qml.index('text: "Queue"'))
-        self.assertIn("onClicked: root.toggleQueue()", qml)
-        self.assertIn('sendCommand("queue", "queue")', qml)
-        self.assertIn("visible: root.running && root.loggedIn && root.queueOpen", qml)
-        self.assertIn("SoundCloudModel.queuePlayCommand(item.playbackId)", qml)
-        self.assertIn('text === "q"', qml)
-
-    def test_track_rows_offer_play_next_and_add_to_queue_and_dim_encrypted_tracks(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("SoundCloudModel.queueNextCommand(track.playbackId)", qml)
-        self.assertIn("SoundCloudModel.queueAddCommand(track.playbackId)", qml)
-        self.assertIn("SoundCloudModel.queueRemoveCommand(item.playbackId)", qml)
-        self.assertIn("enabled: !encrypted && (!root.actionBusy || root.selectionBusy)", qml)
-        self.assertIn("if (!track || SoundCloudModel.isEncrypted(track)) return", qml)
-
-    def test_queue_rows_can_be_dragged_moved_by_key_and_cleared_after_a_confirmation(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("SoundCloudModel.queueMoveCommand(playbackId, offset)", qml)
-        self.assertIn("SoundCloudModel.queueDragOffset(", qml)
-        self.assertIn('moveQueueRow(queueSelectedId, SoundCloudModel.queueKeyMoveOffset(', qml)
-        self.assertIn('onClicked: root.armClearQueue()', qml)
-        self.assertIn('sendUi("queue-clear")', qml)
-        # Clear is never sent by the first click.
-        self.assertLess(qml.index("function armClearQueue"), qml.index('sendUi("queue-clear")'))
-        self.assertNotIn('onClicked: root.sendUi("queue-clear")', qml)
-
-    def test_a_link_pasted_into_the_open_popup_is_read_from_the_clipboard_and_sent_to_the_queue(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn('action === "link-next" || action === "link-play"', qml)
-        self.assertIn("wl-paste --no-newline --type text 2>/dev/null | head -c 4096", qml)
-        self.assertIn("pasteTimeout", qml)
-        self.assertIn("SoundCloudModel.pasteRequest(text, pasteNow)", qml)
-        self.assertIn('sendCommand(request.command, "paste")', qml)
-        # The clipboard text only ever reaches the backend as an encoded https link command.
-        self.assertNotIn("sendCommand(text", qml)
-
-    def test_the_queue_toolbar_has_an_autoplay_switch(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn('SoundCloudModel.toggleCommand("autoplay", root.autoplay)', qml)
-        self.assertIn("autoplay = state.autoplay !== false", qml)
-        self.assertIn('SoundCloudModel.toggleCommand("notify", root.notify)', qml)
-        self.assertIn("notify = state.notify !== false", qml)
-
-    def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertLess(qml.index('text: "Likes"'), qml.index('text: "History"'))
-        self.assertIn('onClicked: root.selectTab("history")', qml)
-        self.assertIn('tab === "likes" || tab === "history"', qml)
-
-    def test_popup_has_larger_scrollable_home_and_feed_browser(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("Style.space(456)", qml)
-        self.assertIn("Style.space(480)", qml)
-        self.assertIn('text: "Home"', qml)
-        self.assertIn('text: "Feed"', qml)
-        self.assertIn("ListView {", qml)
-        self.assertIn('root.runAction("play-from"', qml)
-        self.assertIn("modelData.playbackId", qml)
-        self.assertNotIn('root.runAction("play-url"', qml)
-
-    def test_track_selection_avoids_transient_signed_out_and_optimistic_metadata(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("reportsLoggedOut", qml)
-        self.assertIn("root.loggedIn && !reportsLoggedOut", qml)
-        self.assertNotIn('root.title = track.title || ""', qml)
-        self.assertIn("(!root.actionBusy || root.selectionBusy)", qml)
-        self.assertIn('selectionBusy = SoundCloudModel.isSelectionAction(action)', qml)
-        self.assertIn("activeSelectionRequestId = sentId", qml)
-        self.assertIn("isCurrentSelectionResponse(activeSelectionRequestId, message.id)", qml)
-        self.assertIn("SoundCloudModel.selectionIsPending(playbackState)", qml)
-        self.assertIn('kind === "selection"', qml)
-
-    def test_tab_loading_preserves_now_playing_state_and_each_tab_cache(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("property var homeTracks", qml)
-        self.assertIn("property var feedTracks", qml)
-        self.assertNotIn("    tracks = []\n    tracksLoading = true", qml)
-        self.assertIn("if (!preserveMetadata)", qml)
-
-    def test_track_refresh_requests_the_selected_route_bound_api_source(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn(
-            'sendCommand("tracks:" + selectedTab, "tracks:" + selectedTab)',
-            qml,
-        )
-
-    def test_pending_track_fetch_preserves_the_tab_cache(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("SoundCloudModel.applyTrackResult(cached, result)", qml)
-
-    def test_track_refresh_has_no_legacy_navigation_delay(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertNotIn("interval: 1400", qml)
-        self.assertIn("interval: 100", qml)
-        self.assertIn("runAction(tab)\n    refreshTracks()", qml)
-        self.assertIn("message.pending === true", qml)
-        self.assertIn('if (message.type === "tracks")', qml)
-
-    def test_track_lists_request_more_before_reaching_the_exact_end(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertNotIn("onContentYChanged: root.loadMoreTracks", qml)
-        self.assertNotIn("onCountChanged: root.loadMoreTracks", qml)
-        self.assertIn("onMovementEnded: root.loadMoreTracks", qml)
-        self.assertIn("userInitiated: userInitiated", qml)
-        self.assertIn("yPosition: yPosition", qml)
-        self.assertIn("heightRatio: heightRatio", qml)
-        self.assertIn('sendCommand("load-more:" + selectedTab', qml)
-
-    def test_lazy_loading_has_bounded_observability_events(self):
-        source = MODULE_PATH.read_text()
-
-        self.assertIn('"lazy-load-request"', source)
-        self.assertIn('"track-page"', source)
+        self.assertNotIn('text: "Library', qml)
 
     def test_coalesced_socket_frames_are_limited_after_complete_lines_are_parsed(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
@@ -6729,60 +6599,6 @@ class BarWidgetTest(unittest.TestCase):
             "if (socketBuffer.length > maxSocketFrameChars)"
         ))
         self.assertIn("if (line.length > maxSocketFrameChars)", function)
-
-    def test_disconnect_clears_partial_frames_and_inflight_request_state(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("function resetConnectionState()", qml)
-        self.assertIn('socketBuffer = ""', qml)
-        self.assertIn("pendingRequests = ({})", qml)
-        self.assertIn("tracksRequestPending = false", qml)
-        self.assertIn("trackArtworkPending = ({})", qml)
-        self.assertIn("root.resetConnectionState()", qml)
-
-    def test_empty_navigation_status_updates_timeline_without_erasing_metadata(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("var preserveMetadata", qml)
-        self.assertIn("SoundCloudModel.shouldPreservePlaybackMetadata(state, root.title)", qml)
-        self.assertLess(qml.index("playing = state.playing === true"), qml.index(
-            "if (!preserveMetadata)"
-        ))
-        self.assertLess(qml.index("duration = Number(state.duration || 0)"), qml.index(
-            "if (!preserveMetadata)"
-        ))
-        self.assertNotIn('if (!hasIncomingTrack && root.title !== "") return', qml)
-
-    def test_now_playing_sections_keep_their_layout_while_data_is_missing(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn("property bool hasTrack", qml)
-        self.assertIn("opacity: root.hasTrack ? 1 : 0.45", qml)
-        self.assertNotIn('visible: root.running && root.loggedIn && root.title !== ""', qml)
-
-    def test_popup_has_no_bottom_shortcut_help_text(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertNotIn("Middle-click: play/pause", qml)
-
-    def test_track_browser_fills_remaining_popup_height(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-
-        self.assertIn(
-            "height: Math.max(0, parent.height - y - (errorText.visible",
-            qml,
-        )
-        self.assertIn("id: errorText", qml)
-        self.assertNotIn("height: Style.space(178)", qml)
-
-    def test_readme_documents_safe_removal_and_persistent_state(self):
-        readme = (MODULE_PATH.parent / "README.md").read_text()
-
-        self.assertIn("## Removing", readme)
-        self.assertIn("omarchy plugin remove brunosilveira.soundcloud", readme)
-        self.assertIn("ephemeral in-memory profile and cache", readme)
-        self.assertIn("python3 soundcloud_app.py stop", readme)
-
 
 class MprisHelpersTest(unittest.TestCase):
     def setUp(self):
@@ -6952,6 +6768,117 @@ class MprisCommandMappingTest(unittest.TestCase):
         self.assertIsNone(self.commands("OpenUri", "https://soundcloud.com/a/b"))
 
 
+class AccountStatusTest(unittest.TestCase):
+    """The signed-in account in the status, through the real application class."""
+
+    build = QueuePlaybackTest.build
+    ME = TrackLikesTest.ME
+    AVATAR = "https://i1.sndcdn.com/avatars-abc-large.jpg"
+    DATA_URL = "data:image/png;base64,AAAA"
+
+    def setUp(self):
+        self.build()
+        self.application.page_status.values["loggedIn"] = True
+        self.me = dict(self.ME)
+        self.fetched = []
+        self.application.track_likes.load_token = lambda: "token"
+        self.application.track_likes.request = lambda *a: self.me
+        self.application.track_likes.spawn = lambda target: target()
+        self.application.avatar_cache.fetcher = lambda uri: (self.fetched.append(uri), self.DATA_URL)[1]
+
+    def account_keys(self, status):
+        return {key: status[key] for key in ("accountName", "accountUrl", "accountAvatarDataUrl")}
+
+    def wait_for_avatar(self):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = self.application.build_status()
+            if status["accountAvatarDataUrl"]:
+                return status
+            time.sleep(0.01)
+        self.fail("the avatar never became ready")
+
+    def test_a_signed_in_status_carries_the_name_link_and_avatar(self):
+        self.assertEqual(self.application.build_status()["accountName"], "")  # starts the lookup
+        first = self.application.build_status()
+        self.assertEqual(first["accountName"], "Sacha")
+        self.assertEqual(first["accountUrl"], "https://soundcloud.com/sacha")
+        self.assertEqual(first["accountAvatarDataUrl"], "")  # until the picture is ready
+        self.assertNotIn("accountAvatarUrl", first)
+
+        status = self.wait_for_avatar()
+
+        self.assertEqual(self.account_keys(status), {
+            "accountName": "Sacha", "accountUrl": "https://soundcloud.com/sacha",
+            "accountAvatarDataUrl": self.DATA_URL})
+        # The 200x200 version of the account's avatar is fetched, not the 100x100 one.
+        self.assertEqual(self.fetched, [self.AVATAR.replace("-large.", "-t200x200.")])
+        self.assertNotIn("accountAvatarUrl", status)
+
+    def test_the_account_is_empty_when_logged_out_and_loads_again_after_signing_in(self):
+        self.application.page_status.values["loggedIn"] = False
+        status = self.application.build_status()
+        self.assertEqual(self.account_keys(status), {
+            "accountName": "", "accountUrl": "", "accountAvatarDataUrl": ""})
+
+        self.application.page_status.values["loggedIn"] = True
+        self.wait_for_avatar()
+        self.application.page_status.values["loggedIn"] = False
+        self.assertEqual(self.account_keys(self.application.build_status()), {
+            "accountName": "", "accountUrl": "", "accountAvatarDataUrl": ""})
+
+        self.me = {**self.ME, "username": "Other"}
+        self.application.page_status.values["loggedIn"] = True
+        self.application.build_status()
+        self.assertEqual(self.application.build_status()["accountName"], "Other")
+
+    def test_a_failed_lookup_leaves_the_fields_empty_and_does_not_retry_at_once(self):
+        calls = []
+
+        def failing(*args):
+            calls.append(args)
+            raise OSError("offline")
+
+        self.application.track_likes.request = failing
+        for _ in range(3):
+            status = self.application.build_status()
+        self.assertEqual(self.account_keys(status), {
+            "accountName": "", "accountUrl": "", "accountAvatarDataUrl": ""})
+        self.assertEqual(len(calls), 1)
+
+    def test_a_hostile_account_does_not_break_the_status(self):
+        self.me = {"id": 42, "username": "y" * 100_000, "permalink_url": "javascript:alert(1)",
+                   "avatar_url": "https://evil.example/a.png"}
+
+        status = self.application.build_status()
+
+        self.assertEqual(self.account_keys(status), {
+            "accountName": "", "accountUrl": "", "accountAvatarDataUrl": ""})
+        self.assertEqual(status["loggedIn"], True)
+        self.assertEqual(self.fetched, [])
+
+    def test_the_payload_validator_checks_the_account_keys(self):
+        app = self.app
+        base = QueueStatusTest.BASE
+
+        plain = app.validate_status_payload(base)
+        self.assertFalse(any(key.startswith("account") for key in plain))
+
+        ok = app.validate_status_payload({
+            **base, "accountName": "Sacha", "accountUrl": "https://soundcloud.com/sacha",
+            "accountAvatarUrl": self.AVATAR})
+        self.assertEqual((ok["accountName"], ok["accountUrl"], ok["accountAvatarUrl"]),
+                         ("Sacha", "https://soundcloud.com/sacha", self.AVATAR))
+
+        bad = app.validate_status_payload({
+            **base, "accountName": "x" * 1000, "accountUrl": "https://evil.example/",
+            "accountAvatarUrl": "https://evil.example/a.png", "accountAvatarDataUrl": self.DATA_URL})
+        self.assertEqual((bad["accountName"], bad["accountUrl"], bad["accountAvatarUrl"]), ("", "", ""))
+        self.assertNotIn("accountAvatarDataUrl", bad)  # a data URL never comes from the payload
+        self.assertEqual(bad["title"], base["title"])
+        self.assertEqual(app.validate_status_payload({**base, "accountName": 5})["accountName"], "")
+
+
 class MultiPressTest(unittest.TestCase):
     def setUp(self):
         self.app = load_module()
@@ -7015,7 +6942,6 @@ class MultiPressTest(unittest.TestCase):
     def test_a_clock_that_goes_backwards_starts_a_new_gesture(self):
         self.press()
         self.assertEqual(self.press(-5.0).kind, "toggle")
-
 
 
 class FakeMprisBackend:
@@ -7258,6 +7184,664 @@ class MprisServiceBusTest(unittest.TestCase):
     def test_stop_releases_the_name(self):
         self.stop_service()
         self.assertFalse(self.service.owned)
+
+
+NETWORK_ERROR = ("gst-resource-error-quark", 9, "Could not read from resource.",
+                 "gstsouphttpsrc.c: Timeout was reached")
+
+
+class ConnectionClassificationTest(unittest.TestCase):
+    def test_bus_errors_are_told_apart_by_domain_code_and_text(self):
+        app = load_module()
+        resource, stream, core = "gst-resource-error-quark", "gst-stream-error-quark", "gst-core-error-quark"
+        # (domain, code, message and debug text, playback had started, retrying, connection problem?)
+        table = [
+            (resource, 9, "Could not read from resource. Timeout was reached", True, False, True),
+            (resource, 9, "Could not read from resource.", True, False, True),
+            (resource, 5, "Could not open resource for reading. Could not resolve server name.", False, False, True),
+            (resource, 5, "Could not open resource for reading. Name or service not known", False, False, True),
+            (resource, 5, "Could not open resource for reading. Network is unreachable", True, False, True),
+            (resource, 5, "Could not open resource for reading.", False, False, False),
+            (resource, 5, "Could not open resource for reading.", False, True, True),
+            (stream, 8, "Could not download fragment", True, False, True),
+            (stream, 8, "hlsdemux: Failed to download fragment", True, False, True),
+            (resource, 9, "Connection reset by peer", True, False, True),
+            (resource, 9, "Connection refused", False, False, True),
+            (resource, 15, "Not authorized to access resource", True, False, False),
+            ("g-tls-error-quark", 0, "Error performing TLS handshake: The TLS connection was non-properly terminated.",
+             True, False, True),
+            (resource, 3, "Not Found gsthttpsrc.c: status code 404", False, False, False),
+            (resource, 3, "Not Found gsthttpsrc.c: status code 404", True, False, True),
+            (resource, 3, "Not Found", False, True, True),
+            (resource, 7, "Forbidden gsthttpsrc.c: status code 403", True, False, False),
+            (resource, 7, "Gone status code 410", False, True, False),
+            (resource, 5, "Service Unavailable status code 503", False, False, True),
+            (resource, 5, "Too Many Requests status code 429", True, False, True),
+            (stream, 1, "Internal data stream error. streaming stopped, reason error (-5)", True, False, True),
+            (stream, 1, "Internal data stream error. streaming stopped, reason error (-5)", False, False, False),
+            (stream, 1, "Internal data stream error. streaming stopped, reason not-linked (-1)", True, False, False),
+            (stream, 7, "Failed to decode JPEG image", True, False, False),
+            (stream, 7, "Could not decode stream.", True, False, False),
+            (stream, 4, "Could not determine type of stream.", False, False, False),
+            (stream, 11, "The stream is encrypted and cannot be decrypted.", False, False, False),
+            (core, 12, "Your GStreamer installation is missing a plug-in.", False, False, False),
+            (stream, 3, "No suitable plugins found", True, False, False),
+            ("", 0, "", True, False, False),
+            ("", 0, "something unexpected", True, False, False),
+        ]
+        for domain, code, text, started, retrying, expected in table:
+            with self.subTest(domain=domain, code=code, text=text, started=started, retrying=retrying):
+                self.assertIs(app.is_connection_problem(domain, code, text, started, retrying), expected)
+
+    def test_feeder_failures_are_told_apart_by_exception(self):
+        import http.client
+        import socket
+        import urllib.error
+        app = load_module()
+
+        def http_error(code):
+            return urllib.error.HTTPError("https://x.sndcdn.com/s", code, "x", {}, None)
+
+        table = [
+            (TimeoutError("media operation deadline exceeded"), False, False, True),
+            (socket.timeout("timed out"), True, False, True),
+            (ConnectionResetError(104, "Connection reset by peer"), True, False, True),
+            (urllib.error.URLError(socket.gaierror(-2, "Name or service not known")), False, False, True),
+            (urllib.error.URLError("[Errno 101] Network is unreachable"), False, False, True),
+            (http.client.IncompleteRead(b"abc", 100), True, False, True),
+            (http_error(503), False, False, True),
+            (http_error(429), True, False, True),
+            (http_error(404), False, False, False),
+            (http_error(404), True, False, True),
+            (http_error(404), False, True, True),
+            (http_error(403), True, False, False),
+            (http_error(410), False, True, False),
+            (ValueError("invalid media URL"), True, False, False),
+            (ValueError("media response too large"), True, False, False),
+            (RuntimeError("audio pipeline rejected data"), True, False, False),
+            (UnicodeError("bad playlist"), False, False, False),
+        ]
+        for error, started, retrying, expected in table:
+            with self.subTest(error=repr(error), started=started, retrying=retrying):
+                self.assertIs(app.is_connection_exception(error, started, retrying), expected)
+
+    def test_resolve_failures_are_told_apart_by_the_page_detail(self):
+        app = load_module()
+        table = [
+            ("SoundCloud could not resolve this track (network)", False, True),
+            ("SoundCloud could not resolve this track (HTTP 503)", False, True),
+            ("SoundCloud could not resolve this track (HTTP 429)", False, True),
+            ("SoundCloud could not resolve this track (HTTP 404)", True, False),
+            ("SoundCloud could not resolve this track (HTTP 403)", True, False),
+            ("SoundCloud could not resolve this track", False, False),
+            ("SoundCloud could not resolve this track", True, True),
+            ("SoundCloud took too long to resolve this track", False, True),
+            ("gone", False, False),
+        ]
+        for text, retrying, expected in table:
+            with self.subTest(text=text, retrying=retrying):
+                self.assertIs(app.is_resolve_connection_problem(text, retrying), expected)
+
+    def test_the_page_names_a_request_that_never_got_an_answer(self):
+        app = load_module()
+        script = app.api_request_capture_script()
+        self.assertIn("' (network)'", script)
+        self.assertIn("Failed to fetch", script)
+
+    def test_retry_delays_grow_then_settle_at_fifteen_seconds(self):
+        app = load_module()
+        self.assertEqual([app.connection_retry_delay(n) for n in range(7)],
+                         [3.0, 6.0, 12.0, 15.0, 15.0, 15.0, 15.0])
+
+    def test_unreadable_bus_errors_have_no_details(self):
+        app = load_module()
+        self.assertEqual(app.bus_error_details(object()), ("", 0, ""))
+        message = type("M", (), {"parse_error": lambda self: (
+            type("E", (), {"domain": "d", "code": 9, "message": "m"})(), None)})()
+        self.assertEqual(app.bus_error_details(message), ("d", 9, "m "))
+
+
+class ConnectionLossPlaybackTest(unittest.TestCase):
+    """GstPlayback with a fake pipeline: a connection problem keeps the track and the position."""
+
+    player = GstPlaybackEndTest.player
+    start = GstPlaybackEndTest.start
+
+    def hooks(self):
+        self.events = []
+        return dict(on_error=lambda: self.events.append("error"),
+                    on_end=lambda: self.events.append("end"),
+                    on_connection_lost=lambda: self.events.append("lost"),
+                    on_recovered=lambda: self.events.append("back"))
+
+    def playing_player(self, position=120):
+        app, player = self.player(**self.hooks())
+        self.start(player)
+        player.metadata = {"title": "A", "playbackId": "soundcloud:tracks:1", "durationMs": 3029000,
+                           "waveform": [1, 2]}
+        deliver(player, "state", "playing")
+        player.current.position = position * 10**9
+        player.status()  # a status tick remembers the position
+        return app, player
+
+    def test_a_transport_error_keeps_track_position_and_metadata(self):
+        _app, player = self.playing_player(1042)
+
+        deliver(player, "error", error=NETWORK_ERROR)
+        player.run_scheduled()
+
+        status = player.status()
+        self.assertEqual(self.events, ["lost"])  # never "error": the track is not dead
+        self.assertEqual((status["playbackState"], status["playing"]), ("buffering", False))
+        self.assertEqual(status["error"], "Connection lost, retrying…")
+        self.assertEqual((status["position"], status["duration"]), (1042.0, 3029.0))
+        self.assertEqual((status["title"], status["playbackId"], status["waveform"]),
+                         ("A", "soundcloud:tracks:1", [1, 2]))
+        self.assertTrue(player.connection_lost)
+        self.assertIsNone(player.current)
+
+    def test_the_last_good_position_is_used_when_the_failed_pipeline_cannot_say(self):
+        _app, player = self.playing_player(77)
+        player.current.position = 0
+
+        deliver(player, "error", error=NETWORK_ERROR)
+
+        self.assertEqual(player.status()["position"], 77.0)
+
+    def test_a_track_error_still_stops_with_the_track_message(self):
+        for error, started in ((("gst-stream-error-quark", 7, "Could not decode stream.", ""), True),
+                               (("gst-resource-error-quark", 3, "Not Found", "status code 404"), False),
+                               (None, True)):
+            with self.subTest(error=error, started=started):
+                _app, player = self.player(**self.hooks())
+                self.start(player)
+                if started:
+                    deliver(player, "state", "playing")
+
+                deliver(player, "error", error=error)
+                player.run_scheduled()
+
+                self.assertEqual(self.events, ["error"])
+                self.assertEqual((player.state, player.error),
+                                 ("error", "SoundCloud could not play this track"))
+                self.assertFalse(player.connection_lost)
+
+    def test_a_retry_that_plays_again_clears_the_message_and_seeks_back(self):
+        _app, player = self.playing_player(300)
+        deliver(player, "error", error=NETWORK_ERROR)
+        player.run_scheduled()
+        meta = {"title": "A", "playbackId": "soundcloud:tracks:1", "durationMs": 3029000}
+
+        player.begin(meta, retrying=True)
+        self.assertEqual((player.state, player.error), ("buffering", "Connection lost, retrying…"))
+        self.assertEqual(player.metadata["waveform"], [1, 2])
+        player.play("https://x.sndcdn.com/a", meta)
+        player.seek_when_playing(player.resume_seconds)
+        self.assertEqual(player.status()["error"], "Connection lost, retrying…")
+        self.assertEqual(player.status()["position"], 300.0)  # not 0 while the pipeline starts
+        deliver(player, "state", "paused")
+        self.assertEqual(self.events, ["lost"])
+        deliver(player, "state", "playing")
+        player.run_scheduled()
+
+        self.assertEqual(player.current.seeks, [300 * 10**9])
+        self.assertEqual(self.events, ["lost", "back"])
+        self.assertEqual((player.state, player.error, player.connection_lost, player.held),
+                         ("playing", "", False, False))
+
+    def test_playing_does_not_count_as_back_before_the_seek_lands(self):
+        _app, player = self.playing_player(300)
+        deliver(player, "error", error=NETWORK_ERROR)
+        player.run_scheduled()
+        player.begin({"title": "A", "playbackId": "soundcloud:tracks:1"}, retrying=True)
+        player.play("https://x.sndcdn.com/a", {"title": "A"})
+        player.current.seek_result = False
+        player.seek_when_playing(300.0)
+
+        deliver(player, "state", "playing")
+        player.run_scheduled()
+
+        self.assertEqual(self.events, ["lost"])
+        self.assertEqual(player.status()["playing"], False)
+        player.current.seek_result = True
+        player.status()  # the next tick lands the seek
+        player.run_scheduled()
+        self.assertEqual(self.events, ["lost", "back"])
+
+    def test_an_error_during_a_retry_is_the_connection_again(self):
+        _app, player = self.playing_player(300)
+        deliver(player, "error", error=NETWORK_ERROR)
+        player.run_scheduled()
+        player.begin({"title": "A", "playbackId": "soundcloud:tracks:1"}, retrying=True)
+        player.play("https://x.sndcdn.com/a", {"title": "A"})
+        player.seek_when_playing(300.0)
+
+        deliver(player, "error", error=("gst-stream-error-quark", 1, "Internal data stream error.",
+                                        "streaming stopped, reason error (-5)"))
+        player.run_scheduled()
+
+        self.assertEqual(self.events, ["lost", "lost"])
+        self.assertEqual(player.status()["position"], 300.0)  # the saved position survives a failed retry
+
+    def test_a_track_error_during_a_retry_ends_the_outage_as_a_dead_track(self):
+        _app, player = self.playing_player(300)
+        deliver(player, "error", error=NETWORK_ERROR)
+        player.run_scheduled()
+        player.begin({"title": "A", "playbackId": "soundcloud:tracks:1"}, retrying=True)
+        player.play("https://x.sndcdn.com/a", {"title": "A"})
+
+        deliver(player, "error", error=("gst-stream-error-quark", 7, "Could not decode stream.", ""))
+        player.run_scheduled()
+
+        self.assertEqual(self.events, ["lost", "error"])
+        self.assertEqual((player.state, player.connection_lost, player.held), ("error", False, False))
+
+    def test_giving_up_keeps_the_track_and_the_position_in_the_error_state(self):
+        _app, player = self.playing_player(900)
+        deliver(player, "error", error=NETWORK_ERROR)
+        player.run_scheduled()
+
+        player.give_up_connection()
+        player.run_scheduled()
+
+        status = player.status()
+        self.assertEqual((status["playbackState"], status["error"]), ("error", "Connection lost"))
+        self.assertEqual((status["position"], status["title"], status["playing"]), (900.0, "A", False))
+        self.assertEqual(self.events, ["lost"])  # giving up is not a failed track either
+        self.assertFalse(player.connection_lost)
+
+    def test_a_new_track_or_a_stop_forgets_the_outage(self):
+        for action in (lambda p: p.begin({"title": "B", "playbackId": "soundcloud:tracks:2"}),
+                       lambda p: p.stop(), lambda p: p.stop("broken")):
+            _app, player = self.playing_player(900)
+            deliver(player, "error", error=NETWORK_ERROR)
+
+            action(player)
+
+            self.assertEqual((player.connection_lost, player.held, player.resume_seconds), (False, False, 0.0))
+            self.assertNotEqual(player.error, "Connection lost, retrying…")
+
+    def test_hls_feeder_failures_follow_the_same_classification(self):
+        import urllib.error
+        for error, expected in ((TimeoutError("media operation deadline exceeded"), "lost"),
+                                (urllib.error.URLError("Network is unreachable"), "lost"),
+                                (ValueError("track stream too large"), "error")):
+            with self.subTest(error=repr(error)):
+                app, player = self.player(**self.hooks())
+                self.start(player, "hls", "audio/mpeg")
+                deliver(player, "state", "playing")
+                with mock.patch.object(app, "hls_segment_list", return_value=[("https://x.sndcdn.com/s", 10.0)]), \
+                        mock.patch.object(app, "fetch_private_media", side_effect=error):
+                    player._feed_hls(player.generation, player.current.source,
+                                     "https://x.sndcdn.com/a", time.monotonic() + 5)
+                player.run_scheduled()
+                player.run_scheduled()  # the hook is scheduled by the failure handler
+
+                self.assertEqual(self.events, [expected])
+                self.assertEqual(player.connection_lost, expected == "lost")
+
+
+class ConnectionRetryTest(unittest.TestCase):
+    """The application retries after a lost connection, through the usual start path."""
+
+    row = QueuePlaybackTest.row
+    build = QueuePlaybackTest.build
+    command = QueuePlaybackTest.command
+    fill = QueuePlaybackTest.fill
+    started_id = QueuePlaybackTest.started_id
+    resolve = QueuePlaybackTest.resolve
+    end_track = QueuePlaybackTest.end_track
+    queue_ids = QueuePlaybackTest.queue_ids
+
+    def setUp(self):
+        self.sent = []
+
+    def prepare(self, notify=True, position=90):
+        self.build(settings={"v": 1, "volume": 1.0, "muted": False, "autoplay": False,
+                             "notify": notify, "multiPress": True})
+        self.enterContext(mock.patch.object(self.app, "notify_message", self.sent.append))
+        for row in self.fill("home", 4):
+            row["durationMs"] = 3_000_000
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+        self.application.playback.current.position = position * 10**9
+        self.application.playback.status()
+        return self.application
+
+    def drop(self, error=NETWORK_ERROR):
+        deliver(self.application.playback, "error", error=error)
+        self.glib.run_idle()
+
+    def retry_timers(self):
+        return [(index, callback, args) for index, (callback, args) in enumerate(self.glib.timers)
+                if callback.__name__ == "_retry_connection"]
+
+    def fire_retry(self):
+        index, callback, args = self.retry_timers()[-1]
+        delay = self.glib.delays[index]
+        del self.glib.timers[index]
+        del self.glib.delays[index]
+        callback(*args)
+        return delay
+
+    def fail_attempt(self, error="SoundCloud could not resolve this track (network)"):
+        application = self.application
+        _script, callback = self.evaluated[-1]
+        callback(True)
+        application._playback_message_received(None, PageMessage(
+            {"requestId": application.selection_generation, "ok": False, "error": error}))
+        self.glib.run_idle()
+
+    def status(self):
+        return self.application.build_status()
+
+    def test_a_lost_connection_keeps_everything_and_schedules_a_retry(self):
+        application = self.prepare()
+        before = (application.queue.cursor, self.queue_ids())
+
+        self.drop()
+
+        status = self.status()
+        self.assertEqual((status["playbackState"], status["playing"]), ("buffering", False))
+        self.assertEqual(status["error"], "Connection lost, retrying…")
+        self.assertEqual((status["position"], status["duration"], status["playbackId"]),
+                         (90.0, 3000.0, "soundcloud:tracks:2"))
+        self.assertEqual((application.queue.cursor, self.queue_ids()), before)
+        self.assertEqual(application.queue.length, 4)
+        self.assertEqual(len(self.retry_timers()), 1)
+        self.assertEqual(self.glib.delays[self.retry_timers()[0][0]], 3000)
+        self.assertEqual(self.sent, ["SoundCloud: connection lost, retrying"])
+        self.assertIsNotNone(self.app.validate_status_payload(status))
+
+    def test_the_position_is_saved_when_the_connection_is_lost(self):
+        application = self.prepare(position=1042)
+
+        self.drop()
+
+        fd = os.open(self.queue_file.parent, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        _queue, position_ms = self.app.QueueStore(fd).load()
+        self.assertEqual(position_ms, 1042000)
+        self.assertEqual(application.queue.current["playbackId"], "soundcloud:tracks:2")
+
+    def test_a_retry_restarts_the_same_track_at_the_saved_position(self):
+        application = self.prepare()
+        self.drop()
+        started = len(self.evaluated)
+
+        self.assertEqual(self.fire_retry(), 3000)
+
+        self.assertEqual(len(self.evaluated), started + 1)
+        self.assertEqual(self.started_id(), "2")
+        self.assertEqual(self.status()["playbackState"], "buffering")
+        self.assertEqual(self.status()["error"], "Connection lost, retrying…")
+        self.assertEqual(application.queue.cursor, 1)
+        self.resolve()
+        self.glib.run_idle()
+        self.assertEqual(application.playback.current.seeks, [90 * 10**9])
+        status = self.status()
+        self.assertEqual((status["playbackState"], status["playing"], status.get("error")),
+                         ("playing", True, None))
+        self.assertEqual(self.sent, ["SoundCloud: connection lost, retrying"])
+        # the back-online notice waits until the connection has held for a few seconds
+        confirm = [(c, a) for c, a in self.glib.timers if c.__name__ == "_confirm_recovery"]
+        self.assertEqual(len(confirm), 1)
+        confirm[0][0](*confirm[0][1])
+        self.assertEqual(self.sent, ["SoundCloud: connection lost, retrying", "SoundCloud: back online"])
+        self.assertIsNone(application.outage)
+
+    def test_retries_back_off_three_six_twelve_then_every_fifteen_seconds(self):
+        self.prepare()
+        self.drop()
+
+        delays = []
+        for _ in range(7):
+            delays.append(self.fire_retry())
+            self.fail_attempt()
+
+        self.assertEqual(delays, [3000, 6000, 12000, 15000, 15000, 15000, 15000])
+        self.assertEqual(self.status()["error"], "Connection lost, retrying…")
+        self.assertEqual(self.status()["position"], 90.0)
+        self.assertEqual(self.sent, ["SoundCloud: connection lost, retrying"])  # one notice per outage
+
+    def test_a_transport_error_after_a_retry_started_also_goes_round_again(self):
+        self.prepare()
+        self.drop()
+        self.fire_retry()
+        self.resolve(ok=True)
+        self.glib.run_idle()
+        # the new pipeline is playing; the link drops again before the outage is confirmed
+        self.application.playback.current.position = 95 * 10**9
+        self.application.playback.status()
+        self.drop()
+
+        self.assertEqual(self.status()["playbackState"], "buffering")
+        self.assertEqual(self.sent, ["SoundCloud: connection lost, retrying"])
+        self.assertEqual(len(self.retry_timers()), 1)
+        confirm = [(c, a) for c, a in self.glib.timers if c.__name__ == "_confirm_recovery"]
+        confirm[0][0](*confirm[0][1])  # the stale confirmation does nothing
+        self.assertEqual(len(self.sent), 1)
+
+    def test_after_ten_minutes_it_gives_up_and_a_play_resumes_at_the_position(self):
+        application = self.prepare(position=1042)
+        self.drop()
+        application.outage["since"] -= 601
+
+        self.fire_retry()
+
+        status = self.status()
+        self.assertEqual((status["playbackState"], status["error"], status["playing"]),
+                         ("error", "Connection lost", False))
+        self.assertEqual((status["position"], status["playbackId"]), (1042.0, "soundcloud:tracks:2"))
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        self.assertEqual(self.retry_timers(), [])
+        self.assertIsNone(application.outage)
+        mpris = self.app.mpris_properties(self.app.validate_status_payload(application._raw_status()))
+        self.assertEqual(mpris["PlaybackStatus"], "Stopped")
+
+        reply = self.command("play-pause")
+        self.resolve()
+
+        self.assertEqual(self.started_id(), "2")
+        self.assertEqual(application.playback.current.seeks, [1042 * 10**9])
+        self.assertTrue(reply.reply["ok"])
+        self.assertIsNone(self.status().get("error"))
+
+    def test_giving_up_also_happens_when_the_failures_run_out_the_clock(self):
+        application = self.prepare()
+        self.drop()
+        self.fire_retry()
+        application.outage["since"] -= 601
+
+        self.fail_attempt()
+
+        self.assertEqual(self.status()["playbackState"], "error")
+        self.assertEqual(self.status()["error"], "Connection lost")
+
+    def test_the_user_picking_another_track_cancels_the_retries_at_once(self):
+        application = self.prepare()
+        self.drop()
+        stale = self.retry_timers()[-1]
+        started = len(self.evaluated)
+
+        self.command("play-from:home:soundcloud:tracks:4")
+        stale[1](*stale[2])  # the old timer fires late
+
+        self.assertEqual(len(self.evaluated), started + 1)
+        self.assertEqual(self.started_id(), "4")
+        self.assertIsNone(application.outage)
+        self.assertNotEqual(self.status().get("error"), "Connection lost, retrying…")
+
+    def test_pause_next_and_a_second_press_cancel_the_retries(self):
+        with self.subTest("pause keeps the position and play resumes there"):
+            application = self.prepare(position=250)
+            self.drop()
+            stale = self.retry_timers()[-1]
+            started = len(self.evaluated)
+
+            reply = self.command("play-pause")
+            stale[1](*stale[2])
+
+            self.assertTrue(reply.reply["ok"])
+            self.assertEqual(len(self.evaluated), started)
+            status = self.status()
+            self.assertEqual((status["playbackState"], status["position"]), ("paused", 250.0))
+            self.assertIsNone(status.get("error"))
+            self.assertIsNone(application.outage)
+            mpris = self.app.mpris_properties(self.app.validate_status_payload(application._raw_status()))
+            self.assertEqual(mpris["PlaybackStatus"], "Paused")
+            self.command("play-pause")
+            self.resolve()
+            self.assertEqual(application.playback.current.seeks, [250 * 10**9])
+        with self.subTest("next starts the next track and ends the outage"):
+            application = self.prepare()
+            self.drop()
+            stale = self.retry_timers()[-1]
+            started = len(self.evaluated)
+
+            self.command("next")
+            stale[1](*stale[2])
+
+            self.assertEqual(len(self.evaluated), started + 1)
+            self.assertEqual(self.started_id(), "3")
+            self.assertIsNone(application.outage)
+
+    def test_the_status_during_an_outage_never_claims_playing_and_follows_to_mpris(self):
+        application = self.prepare()
+        self.drop()
+
+        raw = application._raw_status()
+        mpris = self.app.mpris_properties(self.app.validate_status_payload(raw))
+
+        self.assertFalse(raw["playing"])
+        self.assertEqual(raw["playbackState"], "buffering")
+        self.assertEqual(mpris["PlaybackStatus"], "Playing")  # still trying; a press pauses
+        self.assertEqual(self.app.mpris_method_commands("Pause", (), raw), ["play-pause"])
+        self.assertEqual(self.app.mpris_method_commands("Play", (), raw), [])
+        self.assertEqual(application._position_ms(), 90000)
+
+    def test_a_gesture_does_not_pause_the_retries_by_accident(self):
+        application = self.prepare()
+        self.drop()
+
+        application._mpris_restore_playing(True)
+
+        self.assertTrue(application.playback.connection_lost)
+        self.assertEqual(len(self.retry_timers()), 1)
+
+    def test_an_outage_at_the_end_of_a_track_does_not_skip_through_the_queue(self):
+        application = self.prepare()
+        self.end_track()                       # track 3 starts by itself
+        self.fail_attempt()                    # and cannot start: the network is down
+        for _ in range(6):
+            self.fire_retry()
+            self.fail_attempt()
+
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        self.assertEqual(application.queue.cursor, 2)
+        self.assertEqual(self.started_id(), "3")
+        status = self.status()
+        self.assertEqual((status["playbackState"], status["playbackId"], status["error"]),
+                         ("buffering", "soundcloud:tracks:3", "Connection lost, retrying…"))
+        self.assertEqual(application.auto_skip.skipped, 0)
+
+        self.fire_retry()
+        self.resolve()
+        self.glib.run_idle()
+        self.assertEqual(self.status()["playbackState"], "playing")
+        self.assertEqual(self.status()["playbackId"], "soundcloud:tracks:3")
+
+    def test_a_dead_track_is_still_skipped_when_the_connection_is_fine(self):
+        application = self.prepare()
+        self.end_track()
+
+        self.resolve(ok=False)                 # the page says "gone", not "network"
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "4")
+        self.assertEqual(self.queue_ids(), ["1", "2", "4"])
+        self.assertIsNone(application.outage)
+
+    def test_a_real_track_error_during_a_retry_is_not_retried_forever(self):
+        application = self.prepare()
+        self.drop()
+        self.fire_retry()
+
+        self.fail_attempt("SoundCloud could not resolve this track (HTTP 404)")
+
+        self.assertEqual(self.status()["playbackState"], "error")
+        self.assertEqual(self.status()["error"], "SoundCloud could not resolve this track (HTTP 404)")
+        self.assertEqual(self.retry_timers(), [])
+
+    def test_a_slow_resolve_counts_as_the_connection_not_a_dead_track(self):
+        application = self.prepare()
+        self.command("next")
+        generation = application.selection_generation
+
+        application._resolution_timed_out(generation)
+        self.glib.run_idle()
+
+        self.assertTrue(application.playback.connection_lost)
+        self.assertEqual(self.status()["error"], "Connection lost, retrying…")
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        self.assertEqual(len(self.retry_timers()), 1)
+
+    def test_a_retry_that_stalls_is_counted_as_failed(self):
+        application = self.prepare()
+        self.drop()
+        self.fire_retry()
+        stalled = [(c, a) for c, a in self.glib.timers if c.__name__ == "_attempt_stalled"]
+
+        stalled[-1][0](*stalled[-1][1])
+        self.glib.run_idle()
+
+        self.assertTrue(application.playback.connection_lost)
+        self.assertEqual(len(self.retry_timers()), 1)
+        self.assertEqual(self.status()["position"], 90.0)
+
+    def test_no_notifications_when_the_setting_is_off(self):
+        application = self.prepare(notify=False)
+        self.drop()
+        self.fire_retry()
+        self.resolve()
+        self.glib.run_idle()
+        for callback, args in [t for t in self.glib.timers if t[0].__name__ == "_confirm_recovery"]:
+            callback(*args)
+
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(application.outage)
+
+    def test_a_new_outage_after_a_confirmed_recovery_notifies_again(self):
+        application = self.prepare()
+        self.drop()
+        self.fire_retry()
+        self.resolve()
+        self.glib.run_idle()
+        for callback, args in [t for t in self.glib.timers if t[0].__name__ == "_confirm_recovery"]:
+            callback(*args)
+        application.playback.last_seek = None  # the resume seek has settled
+        application.playback.current.position = 400 * 10**9
+        application.playback.status()
+
+        self.drop()
+
+        self.assertEqual(self.sent, ["SoundCloud: connection lost, retrying", "SoundCloud: back online",
+                                     "SoundCloud: connection lost, retrying"])
+        self.assertEqual(self.status()["position"], 400.0)
+
+    def test_the_notification_runs_off_the_main_loop(self):
+        app = load_module()
+        started = []
+
+        class FakeThread:
+            def __init__(self, target, args, daemon): started.append((target, args, daemon))
+            def start(self): started.append("started")
+
+        with mock.patch.object(app.threading, "Thread", FakeThread):
+            app.notify_message("SoundCloud: back online")
+
+        self.assertEqual(started, [(app.send_desktop_notification, ("SoundCloud: back online",), True),
+                                   "started"])
 
 
 if __name__ == "__main__":

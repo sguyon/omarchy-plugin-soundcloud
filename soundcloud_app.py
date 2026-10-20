@@ -84,6 +84,16 @@ QUEUE_SOURCES = ("home", "feed", "likes", "history")
 # A track that fails this soon after an automatic start is skipped instead of stopping the queue.
 AUTO_SKIP_WINDOW_SECONDS = 2.0
 SKIP_NOTICE_SECONDS = 8.0
+# A lost connection: retry after 3, 6 and 12 s, then every 15 s, for at most 10 minutes.
+CONNECTION_RETRY_DELAYS = (3.0, 6.0, 12.0)
+CONNECTION_RETRY_EVERY_SECONDS = 15.0
+CONNECTION_GIVE_UP_SECONDS = 600.0
+# Playing this long again confirms the connection is back (a flapping link stays one outage).
+CONNECTION_CONFIRM_SECONDS = 10.0
+# A retry that has neither played nor failed after this long counts as failed.
+CONNECTION_ATTEMPT_SECONDS = 45
+CONNECTION_RETRY_MESSAGE = "Connection lost, retrying\u2026"
+CONNECTION_LOST_MESSAGE = "Connection lost"
 QUEUE_POSITION_SAVE_SECONDS = 5
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
@@ -1175,7 +1185,6 @@ class PlayQueue:
                 return self.current
         return None
 
-
     def mark_dead(self, track_id: object) -> dict[str, object] | None:
         """Drop a track that can't play, by playback id or URL. Returns what to play now, if any."""
         if not isinstance(track_id, str) or not track_id:
@@ -1709,8 +1718,10 @@ def api_request_capture_script() -> str:
           });
         })).catch((error) => {
           if (generation !== playbackGeneration) return;
-          const detail = /^HTTP [0-9]{3}$/.test(String(error && error.message || ''))
-            ? ' (' + error.message + ')' : '';
+          const reason = String(error && error.message || '');
+          const detail = /^HTTP [0-9]{3}$/.test(reason) ? ' (' + reason + ')'
+            : /^(Load failed|Failed to fetch|NetworkError|The network connection was lost|The Internet connection appears to be offline|The request timed out)/i.test(reason)
+              ? ' (network)' : '';
           window.webkit.messageHandlers.omarchyPlayback.postMessage(JSON.stringify({
             ok: false,
             requestId,
@@ -1963,6 +1974,46 @@ def _bounded_integer(value: object, minimum: int, maximum: int) -> int:
     return value if minimum <= value <= maximum else minimum
 
 
+MAX_ACCOUNT_NAME_BYTES = 128
+
+
+def _account_name(value: object) -> str:
+    name = _bounded_string(value, MAX_ACCOUNT_NAME_BYTES)
+    if name is None or any(ord(character) < 32 or ord(character) == 127 for character in name):
+        return ""
+    return name
+
+
+def _account_url(value: object, allowed) -> str:
+    url = _bounded_string(value, MAX_URL_BYTES)
+    return url if url and allowed(url) else ""
+
+
+def larger_avatar_url(url: str) -> str:
+    """The 200x200 version of a SoundCloud avatar; `-large.` is only 100x100 and looks soft.
+
+    Any other URL is returned unchanged.
+    """
+    larger = url.replace("-large.", "-t200x200.", 1) if "/avatars-" in url else url
+    return larger if is_allowed_artwork_uri(larger) else url
+
+
+def _account_status_fields(payload: dict[str, object]) -> dict[str, object]:
+    """The optional signed-in account keys; a missing or invalid value becomes an empty string.
+
+    `accountAvatarUrl` is the remote picture the application turns into
+    `accountAvatarDataUrl`; a data URL is never taken from the payload.
+    """
+    fields: dict[str, object] = {}
+    if "accountName" in payload:
+        fields["accountName"] = _account_name(payload["accountName"])
+    if "accountUrl" in payload:
+        fields["accountUrl"] = _account_url(payload["accountUrl"], is_soundcloud_uri)
+    if "accountAvatarUrl" in payload:
+        fields["accountAvatarUrl"] = _account_url(payload["accountAvatarUrl"], is_allowed_artwork_uri)
+    return fields
+
+
 def validate_status_payload(payload: object) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
@@ -2003,6 +2054,7 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
         **({"error": error} if error else {}),
         **_queue_status_fields(payload),
         **_setting_status_fields(payload),
+        **_account_status_fields(payload),
     }
 
 
@@ -2126,6 +2178,110 @@ class PageStatusCache:
                 notify(changed)
 
         self.evaluate(self.script, finished)
+
+
+def connection_retry_delay(attempt: int) -> float:
+    """Seconds to wait before retry number `attempt` (0 is the first)."""
+    if 0 <= attempt < len(CONNECTION_RETRY_DELAYS):
+        return CONNECTION_RETRY_DELAYS[attempt]
+    return CONNECTION_RETRY_EVERY_SECONDS
+
+
+# Parts of a GStreamer error (message plus debug text, lower case) that name a transport failure.
+_NETWORK_ERROR_PATTERNS = (
+    "could not read from resource", "error reading", "timeout was reached", "timed out",
+    "timeout", "could not download fragment", "could not fetch", "failed to download",
+    "connection reset", "connection refused", "connection closed", "connection timed out",
+    "connection terminated", "broken pipe", "network is unreachable", "network unreachable",
+    "no route to host", "host is unreachable", "name or service not known",
+    "name resolution", "resolve server name", "could not resolve", "server name",
+    "non-properly terminated", "unexpected eof", "premature end", "incomplete",
+    "internal server error", "bad gateway", "service unavailable", "gateway time-out",
+    "too many requests", "status code 5", "status code 408", "status code 429",
+    "could not receive", "could not send", "socket",
+)
+# Failures that are the track's own, however the network is.
+_REFUSAL_PATTERNS = (
+    "forbidden", "unauthorized", "not authorized", "status code 401", "status code 403",
+    "status code 410", "status code 451", "gone",
+)
+_TRACK_ERROR_PATTERNS = (
+    "missing a plug-in", "no suitable plugin", "could not determine type", "not supported",
+    "unsupported", "decrypt", "codec", "decode", "decoder", "not-linked", "not-negotiated",
+    "wrong type", "invalid data", "corrupt",
+)
+_GENERIC_STREAM_ERROR_PATTERNS = ("internal data stream error", "streaming stopped, reason error")
+_NOT_FOUND_PATTERNS = ("not found", "status code 404")
+# GstResourceError codes
+_RESOURCE_NOT_FOUND, _RESOURCE_OPEN_READ, _RESOURCE_READ = 3, 5, 9
+_RESOURCE_BUSY, _RESOURCE_SYNC, _RESOURCE_NOT_AUTHORIZED = 4, 12, 15
+
+
+def is_connection_problem(domain: str, code: int, text: str,
+                          started: bool, retrying: bool = False) -> bool:
+    """Whether a GStreamer error looks like the connection failing rather than the track.
+
+    `domain` and `code` are the error's GLib domain (such as "gst-resource-error-quark") and
+    code, `text` its message plus debug text. `started` says playback had begun; `retrying`
+    says the error comes from a retry after an outage, where an error that is not clearly the
+    track's counts as the connection still being down. Unknown errors are the track's.
+    """
+    lowered = text.lower()
+    resource = "resource" in domain
+    if resource and code == _RESOURCE_NOT_AUTHORIZED:
+        return False
+    if any(pattern in lowered for pattern in _REFUSAL_PATTERNS):
+        return False
+    if any(pattern in lowered for pattern in _NETWORK_ERROR_PATTERNS):
+        return True
+    if any(pattern in lowered for pattern in _TRACK_ERROR_PATTERNS):
+        return False
+    if any(pattern in lowered for pattern in _NOT_FOUND_PATTERNS) or (
+            resource and code == _RESOURCE_NOT_FOUND):
+        return started or retrying  # a 404 on the first request is the track's
+    if resource and code in (_RESOURCE_READ, _RESOURCE_BUSY, _RESOURCE_SYNC) and (started or retrying):
+        return True
+    if resource and code == _RESOURCE_OPEN_READ and retrying:
+        return True
+    if any(pattern in lowered for pattern in _GENERIC_STREAM_ERROR_PATTERNS):
+        return started or retrying
+    return False
+
+
+def is_connection_exception(error: BaseException, started: bool, retrying: bool = False) -> bool:
+    """Whether a failure of the HLS feeder (a download or a push) is the connection failing."""
+    if isinstance(error, HTTPError):
+        code = error.code
+        if code in (408, 425, 429) or code >= 500:
+            return True
+        return code == 404 and (started or retrying)
+    if isinstance(error, (http.client.HTTPException, OSError)):
+        return True  # timeouts, resets, DNS and TLS failures, a body cut short
+    return False
+
+
+def is_resolve_connection_problem(text: str, retrying: bool = False) -> bool:
+    """Whether the page's failure to resolve a track is the connection failing.
+
+    The page reports "... (HTTP 503)" for an HTTP error and "... (network)" when its request
+    never got an answer. Without detail, the failure is the connection's only during an outage.
+    """
+    match = re.search(r"\(HTTP ([0-9]{3})\)", text)
+    if match:
+        code = int(match.group(1))
+        return code in (408, 425, 429) or code >= 500
+    if "(network)" in text or "took too long" in text:
+        return True
+    return retrying
+
+
+def bus_error_details(message) -> tuple[str, int, str]:
+    """(domain, code, text) of a GStreamer ERROR message; empty when it can't be read."""
+    try:
+        error, debug = message.parse_error()
+        return str(error.domain), int(error.code), f"{error.message} {debug or ''}"
+    except Exception:
+        return "", 0, ""
 
 
 class AutoSkip:
@@ -2290,7 +2446,7 @@ def sanitize_settings(payload: object) -> dict[str, object]:
 
 
 class SettingsStore:
-    """Volume, mute, autoplay, notification and earbud multi-press choices in `settings.json`."""
+    """Volume, mute, autoplay and notification choices in `settings.json`."""
 
     def __init__(self, directory_fd: int, maximum_bytes: int = MAX_SETTINGS_BYTES):
         self._store = PrivateJsonStore(directory_fd, "settings.json", maximum_bytes)
@@ -3085,19 +3241,38 @@ class TrackLikes:
         self.liked_ids: set[int] | None = None
         self.loading = False
         self.last_attempt = -math.inf
+        # The signed-in account's name, profile link and avatar link from /me; memory only.
+        self._account: dict[str, str] | None = None
+        self.account_loading = False
+        self.account_last_attempt = -math.inf
+
+    @property
+    def account(self) -> dict[str, str]:
+        """`name`, `url` and `avatar` of the signed-in account, or {} until known."""
+        return self._account or {}
+
+    def forget_account(self) -> None:
+        """Drop the account (the user signed out) so the next sign-in reads it again."""
+        self._account = None
+        self.account_last_attempt = -math.inf
 
     def _identify(self) -> str:
         token = self.load_token()
         if not token:
             raise PermissionError("not signed in")
         if token != self.token:
-            self.token, self.user_id, self.liked_ids = token, None, None
-        if self.user_id is None:
+            self.token, self.user_id, self.liked_ids, self._account = token, None, None, None
+        if self.user_id is None or self._account is None:
             me = self.request("GET", "/me", token)
             user_id = me.get("id") if isinstance(me, dict) else None
             if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
                 raise ValueError("invalid account response")
             self.user_id = user_id
+            self._account = {
+                "name": _account_name(me.get("username")),
+                "url": _account_url(me.get("permalink_url"), is_soundcloud_uri),
+                "avatar": larger_avatar_url(_account_url(me.get("avatar_url"), is_allowed_artwork_uri)),
+            }
         return token
 
     def _session(self) -> str:
@@ -3226,6 +3401,27 @@ class TrackLikes:
 
         self.spawn(worker)
 
+    def load_account_in_background(self, on_loaded) -> None:
+        """Read the account once; after a failure wait RETRY_SECONDS before the next try."""
+        now = time.monotonic()
+        if (self._account is not None or self.account_loading
+                or now - self.account_last_attempt < self.RETRY_SECONDS):
+            return
+        self.account_loading = True
+        self.account_last_attempt = now
+
+        def worker():
+            try:
+                with self.lock:
+                    self._identify()
+                on_loaded()
+            except (OSError, ValueError):
+                pass
+            finally:
+                self.account_loading = False
+
+        self.spawn(worker)
+
     def set_liked(self, track_id: int, liked: bool) -> None:
         with self.lock:
             token = self._session()
@@ -3289,9 +3485,20 @@ class GstPlayback:
     hls_skip = 0.0
     hls_cache = None
     hls_uri = ""
+    # After a connection problem the track, its duration and the position stay on show:
+    # `held` while retrying (`connection_lost`) and after giving up, at `resume_seconds`.
+    # `on_connection_lost` runs on the main loop after each loss, `on_recovered` once
+    # playback is back at the saved position.
+    on_connection_lost = None
+    on_recovered = None
+    connection_lost = False
+    held = False
+    resume_seconds = 0.0
+    last_position = 0.0
 
     def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args),
-                 on_end=None, on_error=None, volume: float = 1.0, muted: bool = False):
+                 on_end=None, on_error=None, volume: float = 1.0, muted: bool = False,
+                 on_connection_lost=None, on_recovered=None):
         self.Gst = Gst
         Gst.init(None)
         self.current = None
@@ -3303,6 +3510,8 @@ class GstPlayback:
         self.on_change = on_change
         self.on_end = on_end
         self.on_error = on_error
+        self.on_connection_lost = on_connection_lost
+        self.on_recovered = on_recovered
         self.schedule = schedule
         self.active = False
         self.playing = False
@@ -3328,7 +3537,11 @@ class GstPlayback:
         if pipeline is not self.current or generation != self.generation:
             return
         if message.type == self.Gst.MessageType.ERROR:
-            self.stop("SoundCloud could not play this track")
+            domain, code, text = bus_error_details(message)
+            if is_connection_problem(domain, code, text, self.has_started, self.connection_lost):
+                self.lose_connection()
+            else:
+                self.stop("SoundCloud could not play this track")
         elif message.type == self.Gst.MessageType.EOS:
             self.playing = False
             self.state = "paused"
@@ -3345,6 +3558,7 @@ class GstPlayback:
                 self.seek_in_flight = False
                 self.state = "playing"
                 self._apply_pending_seek()
+                self._check_recovered()
             elif current == self.Gst.State.PAUSED:
                 self.state = "paused" if self.has_started else "buffering"
             self.on_change()
@@ -3353,6 +3567,75 @@ class GstPlayback:
         if generation == self.generation and self.on_end is not None:
             self.on_end()
         return False
+
+    def _lost(self, generation: int) -> bool:
+        if generation == self.generation and self.on_connection_lost is not None:
+            self.on_connection_lost()
+        return False
+
+    def _restored(self, generation: int) -> bool:
+        if generation == self.generation and self.on_recovered is not None:
+            self.on_recovered()
+        return False
+
+    def held_position(self) -> float:
+        return self.pending_seek if self.pending_seek > 0 else self.resume_seconds
+
+    def lose_connection(self, position: float | None = None) -> None:
+        """The connection failed: drop the pipeline but keep the track and where playback was.
+
+        The state becomes buffering with a short message, `on_connection_lost` decides when to
+        try again, and nothing counts the track as unplayable. `position` is for a failure
+        before anything played; otherwise the position is read from the pipeline.
+        """
+        if position is not None:
+            saved = position
+        elif self.has_started and self.current is not None:
+            saved = self.pending_seek if self.pending_seek > 0 else self._shown_position()
+            if saved <= 0:
+                saved = self.last_position
+        else:
+            saved = self.held_position()
+        self._stop_current()
+        self.active = False
+        self.playing = False
+        self.has_started = False
+        self.connection_lost = True
+        self.held = True
+        self.resume_seconds = max(0.0, saved)
+        self.pending_seek = 0.0
+        self.last_seek = None
+        self.error = CONNECTION_RETRY_MESSAGE
+        self.state = "buffering"
+        self.on_change()
+        if self.on_connection_lost is not None:
+            self.schedule(self._lost, self.generation)
+
+    def give_up_connection(self) -> None:
+        """Stop retrying: show the error, keep the track and the position for a later play."""
+        position = self.held_position()
+        self._stop_current()
+        self.active = False
+        self.playing = False
+        self.has_started = False
+        self.connection_lost = False
+        self.held = True
+        self.resume_seconds = position
+        self.pending_seek = 0.0
+        self.last_seek = None
+        self.error = CONNECTION_LOST_MESSAGE
+        self.state = "error"
+        self.on_change()
+
+    def _check_recovered(self) -> None:
+        """After a retry: playing again at the saved position ends the outage."""
+        if self.connection_lost and self.playing and self.pending_seek <= 0:
+            self.connection_lost = False
+            self.held = False
+            self.error = ""
+            self.resume_seconds = 0.0
+            if self.on_recovered is not None:
+                self.schedule(self._restored, self.generation)
 
     def _failed(self, generation: int) -> bool:
         if generation == self.generation and self.on_error is not None:
@@ -3394,7 +3677,6 @@ class GstPlayback:
     def _stop_current(self) -> None:
         self.generation += 1
         self.seek_in_flight = False
-        self.last_seek = None
         previous = self.current
         self.current = None
         self.volume_target = None
@@ -3419,19 +3701,33 @@ class GstPlayback:
         self.error = error[:128]
         self.state = "error" if self.error else "idle"
         self.pending_seek = 0.0
+        self.last_seek = None
+        self.connection_lost = self.held = False
+        self.resume_seconds = self.last_position = 0.0
         self.on_change()
         if self.error and self.on_error is not None:
             self.schedule(self._failed, self.generation)
 
-    def begin(self, metadata: dict[str, object]) -> int:
+    def begin(self, metadata: dict[str, object], retrying: bool = False) -> int:
+        """Start over with a new track. `retrying` keeps an outage going: the same track,
+        state buffering and the connection message stay on show until playback is back."""
         self._stop_current()
         self.active = False
         self.playing = False
         self.has_started = False
+        waveform = self.metadata.get("waveform") if retrying else None
         self.metadata = dict(metadata)
         self.pending_seek = 0.0
-        self.error = ""
-        self.state = "resolving"
+        self.last_seek = None
+        if retrying and self.connection_lost:
+            if waveform:
+                self.metadata["waveform"] = waveform
+            self.state = "buffering"
+        else:
+            self.error = ""
+            self.state = "resolving"
+            self.connection_lost = self.held = False
+            self.resume_seconds = self.last_position = 0.0
         self.on_change()
         return self.generation
 
@@ -3443,7 +3739,8 @@ class GstPlayback:
         mime_type: str = "",
     ) -> bool:
         self.metadata = dict(metadata)
-        self.error = ""
+        if not self.connection_lost:
+            self.error = ""
         self.active = True
         self.playing = False
         self.has_started = False
@@ -3564,13 +3861,17 @@ class GstPlayback:
             if generation == self.generation:
                 source.emit("end-of-stream")
         except (OSError, RuntimeError, TimeoutError, UnicodeError, ValueError,
-                concurrent.futures.CancelledError):
+                http.client.HTTPException, concurrent.futures.CancelledError) as error:
             if generation == self.generation:
-                self.schedule(self._hls_failed, generation)
+                connection = is_connection_exception(error, self.has_started, self.connection_lost)
+                self.schedule(self._hls_failed, generation, connection)
 
-    def _hls_failed(self, generation: int) -> bool:
+    def _hls_failed(self, generation: int, connection: bool = False) -> bool:
         if generation == self.generation:
-            self.stop("SoundCloud could not stream this track")
+            if connection:
+                self.lose_connection()
+            else:
+                self.stop("SoundCloud could not stream this track")
         return False
 
     def toggle(self) -> bool:
@@ -3583,7 +3884,9 @@ class GstPlayback:
     def seek(self, ratio: float) -> bool:
         if not self.active:
             return False
-        duration = self._duration()
+        duration = self._query_time("query_duration")
+        if duration <= 0:
+            duration = float(self.metadata.get("durationMs", 0) or 0) / 1000
         if duration <= 0:
             return False
         return self.seek_seconds(duration * max(0.0, min(1.0, ratio)))
@@ -3688,7 +3991,32 @@ class GstPlayback:
         except (AttributeError, TypeError, ValueError):
             return 0.0
 
+    def _held_status(self) -> dict[str, object]:
+        """The status after a connection problem: the saved track at the saved position,
+        never `playing`, and buffering while a retry is under way."""
+        self._apply_pending_seek()
+        self._check_recovered()
+        if not self.held:
+            return self.status()
+        duration = float(self.metadata.get("durationMs", 0) or 0) / 1000
+        position = self.held_position()
+        return {
+            "playerPresent": True,
+            "playbackState": "buffering" if self.connection_lost else self.state,
+            "playing": False,
+            "playbackId": str(self.metadata.get("playbackId", "")),
+            "title": str(self.metadata.get("title", "")),
+            "artist": str(self.metadata.get("artist", "")),
+            "artUrl": str(self.metadata.get("artUrl", "")),
+            "duration": duration,
+            "position": min(position, duration) if duration else position,
+            "waveform": list(self.metadata.get("waveform", [])),
+            "error": self.error,
+        }
+
     def status(self) -> dict[str, object]:
+        if self.held:
+            return self._held_status()
         if not self.active:
             return {
                 "playerPresent": False,
@@ -3716,10 +4044,16 @@ class GstPlayback:
             "artist": str(self.metadata.get("artist", "")),
             "artUrl": str(self.metadata.get("artUrl", "")),
             "duration": duration,
-            "position": self._shown_position(),
+            "position": self._remember_position(self._shown_position()),
             "waveform": list(self.metadata.get("waveform", [])),
             **({"error": self.error} if self.error else {}),
         }
+
+    def _remember_position(self, position: float) -> float:
+        """Keep the last good position, in case the pipeline can't say it when it fails."""
+        if self.playing and position > 0:
+            self.last_position = position
+        return position
 
     def close(self) -> None:
         self._stop_current()
@@ -4424,12 +4758,16 @@ def build_application(show_on_start: bool = False):
             self.page_status = PageStatusCache(self._evaluate, status_script())
             self.status_hold_until = 0.0
             self.artwork_cache = ArtworkCache()
+            # the signed-in avatar lives in memory only, apart from the cover art it would evict
+            self.avatar_cache = ArtworkCache(maximum_entries=2, maximum_pending=2)
             self.playback = GstPlayback(
                 Gst,
                 lambda: GLib.idle_add(self._publish_status_once),
                 GLib.idle_add,
                 on_end=self._track_ended,
                 on_error=self._track_failed,
+                on_connection_lost=self._connection_lost,
+                on_recovered=self._connection_restored,
                 volume=cast(float, saved_settings["volume"]),
                 muted=saved_settings["muted"] is True,
             )
@@ -4466,6 +4804,9 @@ def build_application(show_on_start: bool = False):
             # A saved track is shown paused at its saved position until the user plays it.
             self.restored_position_ms = saved_position_ms if saved_queue.current else None
             self.auto_skip = AutoSkip()
+            # An outage while playing: {"since", "attempts", "notified", "row"}, None when online
+            self.outage = None
+            self.outage_token = 0
             self.notice = ""
             self.notice_until = 0.0
             self.queue_finished = False  # the last queued track ended and nothing followed
@@ -4512,6 +4853,7 @@ def build_application(show_on_start: bool = False):
             self.control_server.close()
             self.playback.close()
             self.artwork_cache.close()
+            self.avatar_cache.close()
             self.list_artwork_cache.close()
             os.close(profile_fd)
             Gtk.Application.do_shutdown(self)
@@ -4672,10 +5014,13 @@ def build_application(show_on_start: bool = False):
                         or request_id != self.selection_generation):
                     return
                 if payload.get("ok") is not True:
-                    self.playback.stop(
-                        _bounded_string(payload.get("error", ""), 128)
-                        or "SoundCloud could not resolve this track"
-                    )
+                    text = (_bounded_string(payload.get("error", ""), 128)
+                            or "SoundCloud could not resolve this track")
+                    if is_resolve_connection_problem(text, self.playback.connection_lost):
+                        # not a dead track: keep it, wait for the connection and try again
+                        self.playback.lose_connection(self.resume_ms / 1000)
+                    else:
+                        self.playback.stop(text)
                     return
                 stream_uri = validate_stream_uri(payload.get("streamUrl"))
                 validated = validate_tracks_payload({"tracks": [payload.get("track")]})
@@ -4719,7 +5064,6 @@ def build_application(show_on_start: bool = False):
             self.last_notified_id = playback_id
             if self.notify and not replay:
                 notify_track_started(str(track.get("title", "")), str(track.get("artist", "")))
-
 
         def _save_settings(self):
             self.settings_save_pending = False
@@ -4787,7 +5131,7 @@ def build_application(show_on_start: bool = False):
                 self.webview.load_uri(source_uri("home"))
 
         def _play_when_page_ready(self, row, connection, request_id, automatic=False, resume_ms=0,
-                                  direction=0):
+                                  retry=False, direction=0):
             """Start `row` once the page is on Home or Feed, so its request context exists."""
             self._keep_page_on_track_source()
             self.pending_start += 1
@@ -4806,21 +5150,24 @@ def build_application(show_on_start: bool = False):
                     and not self.webview.is_loading()
                 )
                 if ready or time.monotonic() > deadline:
-                    self._start_track(row, connection, request_id, automatic, resume_ms, direction)
+                    self._start_track(row, connection, request_id, automatic, resume_ms, retry,
+                                      direction)
                     return False
                 return True
 
             if check():
                 GLib.timeout_add(250, check)
 
-        def _start_track(self, row, connection, request_id, automatic=False, resume_ms=0, direction=0):
+        def _start_track(self, row, connection, request_id, automatic=False, resume_ms=0, retry=False,
+                         direction=0):
             """The one way a track starts: resolve it in the page, then play it with GStreamer.
 
+            `retry` is a new attempt after a lost connection: it keeps the outage on show.
             `direction` (1 next, -1 previous) marks a step by the user's Next or Previous: a
             track that can't play is then skipped in that direction, as after an automatic end."""
             playback_id = row.get("playbackId")
             if not self._remember_playback_track(row):
-                if automatic or direction:
+                if automatic or retry or direction:
                     # No caller to tell: fail the track so the normal skip path moves on.
                     self.selection_generation = (self.selection_generation + 1) % (2**31)
                     self.auto_skip.started(self.selection_generation, automatic, time.monotonic(),
@@ -4838,7 +5185,9 @@ def build_application(show_on_start: bool = False):
             self.selection_generation = (self.selection_generation + 1) % (2**31)
             generation = self.selection_generation
             self.auto_skip.started(generation, automatic, time.monotonic(), direction)
-            self.playback.begin(self.playback_tracks[playback_id])
+            if not retry:
+                self._cancel_outage()
+            self.playback.begin(self.playback_tracks[playback_id], retrying=retry)
             if self.playback_tracks[playback_id].get("encrypted") is True:
                 # No point asking the page: this track has no stream the plugin can play.
                 # An automatic start is then skipped like any track that fails at once.
@@ -4875,8 +5224,12 @@ def build_application(show_on_start: bool = False):
 
             self._evaluate(script, track_selected)
             GLib.timeout_add_seconds(15, self._resolution_timed_out, generation)
+            if retry:
+                GLib.timeout_add_seconds(CONNECTION_ATTEMPT_SECONDS, self._attempt_stalled, generation)
 
         def _position_ms(self):
+            if self.playback.held:
+                return int(self.playback.held_position() * 1000)
             if self.playback.pending_seek > 0:
                 return int(self.playback.pending_seek * 1000)
             if self.playback.active:
@@ -4995,6 +5348,93 @@ def build_application(show_on_start: bool = False):
             if row is not None:
                 self._play_when_page_ready(row, None, None, automatic=True)
             return False
+
+        def _connection_lost(self):
+            """Playback lost the connection. The track, position and queue stay as they are;
+            try again with growing pauses until it plays again or 10 minutes have passed."""
+            now = time.monotonic()
+            outage = self.outage
+            if outage is None:
+                row = {key: value for key, value in self.playback.metadata.items() if key != "waveform"}
+                if not is_playback_id(row.get("playbackId")):
+                    self.playback.stop("SoundCloud could not play this track")
+                    return
+                outage = self.outage = {"since": now, "attempts": 0, "notified": False, "row": row}
+                if self.notify:
+                    outage["notified"] = True
+                    notify_message("SoundCloud: connection lost, retrying")
+            self.outage_token += 1
+            self._save_queue()  # keep the position across a restart
+            if now - outage["since"] >= CONNECTION_GIVE_UP_SECONDS:
+                self._give_up_outage()
+                return
+            delay = connection_retry_delay(outage["attempts"])
+            outage["attempts"] += 1
+            GLib.timeout_add(int(delay * 1000), self._retry_connection,
+                             self.outage_token, self.selection_generation)
+
+        def _retry_connection(self, token, generation):
+            outage = self.outage
+            if (outage is None or token != self.outage_token
+                    or generation != self.selection_generation
+                    or not self.playback.connection_lost):
+                return False  # the user did something else, or playback is back
+            if time.monotonic() - outage["since"] >= CONNECTION_GIVE_UP_SECONDS:
+                self._give_up_outage()
+                return False
+            self._play_when_page_ready(
+                outage["row"], None, None, resume_ms=int(self.playback.held_position() * 1000),
+                retry=True,
+            )
+            return False
+
+        def _attempt_stalled(self, generation):
+            """A retry that neither played nor failed: count it as failed and wait again."""
+            if generation == self.selection_generation and self.playback.connection_lost:
+                self.selection_generation = (self.selection_generation + 1) % (2**31)
+                self.playback.lose_connection()
+            return False
+
+        def _give_up_outage(self):
+            position_ms = int(self.playback.held_position() * 1000)
+            self.playback.give_up_connection()
+            self.restored_position_ms = position_ms  # a later play resumes here
+            self._cancel_outage()
+            self._save_queue()
+            self._publish_status_once()
+
+        def _cancel_outage(self):
+            self.outage = None
+            self.outage_token += 1
+
+        def _connection_restored(self):
+            """Playing again at the saved position. A failure soon after still counts as the
+            same outage, so the notice for "back online" waits a few seconds."""
+            if self.outage is None:
+                return
+            self.outage_token += 1
+            GLib.timeout_add_seconds(CONNECTION_CONFIRM_SECONDS, self._confirm_recovery, self.outage_token)
+            self._queue_changed()
+            self._publish_status_once()
+
+        def _confirm_recovery(self, token):
+            outage = self.outage
+            if outage is not None and token == self.outage_token and not self.playback.connection_lost:
+                self.outage = None
+                if outage["notified"]:
+                    notify_message("SoundCloud: back online")
+            return False
+
+        def _pause_outage(self, connection, request_id):
+            """Pause during an outage: stop retrying and keep the position for the next play."""
+            position_ms = int(self.playback.held_position() * 1000)
+            self._cancel_outage()
+            self.pending_start += 1
+            self.selection_generation = (self.selection_generation + 1) % (2**31)
+            self.playback.stop()
+            self.restored_position_ms = position_ms
+            self._save_queue()
+            self._respond(connection, request_id, {"ok": True, "running": True}, publish_status=True)
 
         def _track_failed(self):
             """A track failed. If an automatic start failed at once, drop it and play the next."""
@@ -5276,6 +5716,18 @@ def build_application(show_on_start: bool = False):
             state["artDataUrl"] = self.artwork_cache.get(
                 remote_art, self._artwork_ready_from_thread
             )
+            remote_avatar = str(state.pop("accountAvatarUrl", ""))
+            state["accountAvatarDataUrl"] = self.avatar_cache.get(
+                remote_avatar, self._artwork_ready_from_thread
+            )
+            state.setdefault("accountName", "")
+            state.setdefault("accountUrl", "")
+            if not state["loggedIn"]:
+                self.track_likes.forget_account()
+            elif not self.track_likes.account:
+                self.track_likes.load_account_in_background(
+                    lambda: GLib.idle_add(self._publish_status_once)
+                )
             playback_id = str(state["playbackId"])
             liked = None
             if playback_id:
@@ -5354,6 +5806,7 @@ def build_application(show_on_start: bool = False):
                 "notify": self.notify,
                 "multiPress": self.multipress,
                 "trackUrl": track_url,
+                **self._account_status(self.page_status.values["loggedIn"] is True),
             }
             if not status.get("error") and time.monotonic() < self.notice_until:
                 status["error"] = self.notice
@@ -5375,6 +5828,15 @@ def build_application(show_on_start: bool = False):
             if with_duration and not status.get("duration"):
                 status["duration"] = _bounded_integer(
                     row.get("durationMs"), 0, MAX_TRACK_DURATION_MS) / 1000
+
+        def _account_status(self, logged_in):
+            """The signed-in account for the status; empty when signed out or not read yet."""
+            account = self.track_likes.account if logged_in else {}
+            return {
+                "accountName": account.get("name", ""),
+                "accountUrl": account.get("url", ""),
+                "accountAvatarUrl": account.get("avatar", ""),
+            }
 
         def _start_mpris(self):
             """Own the MPRIS name; without a bus, or if the name is taken, the plugin runs without it."""
@@ -5442,7 +5904,7 @@ def build_application(show_on_start: bool = False):
                     self.playback.toggle()
             elif resolving and not want_playing and self.queue.current is not None:
                 self._park_paused(self.queue.current)
-            elif not resolving and want_playing:
+            elif not resolving and want_playing and not self.playback.connection_lost:
                 self._handle_command("play-pause", None, None)
 
         def _park_paused(self, row):
@@ -5475,10 +5937,12 @@ def build_application(show_on_start: bool = False):
             return True
 
         def _resolution_timed_out(self, generation):
-            if (generation == self.selection_generation
-                    and self.playback.state == "resolving"):
+            waiting = self.playback.state == "resolving" or (
+                self.playback.connection_lost and not self.playback.active)
+            if generation == self.selection_generation and waiting:
                 self.selection_generation += 1
-                self.playback.stop("SoundCloud took too long to resolve this track")
+                # The page didn't answer in time: most likely the connection, so retry
+                self.playback.lose_connection(self.resume_ms / 1000)
             return False
 
         def _respond(self, connection, request_id, payload, publish_status=False):
@@ -5643,7 +6107,9 @@ def build_application(show_on_start: bool = False):
                         ),
                     )
             elif command == "play-pause":
-                if self.playback.active:
+                if self.playback.connection_lost:
+                    self._pause_outage(connection, request_id)
+                elif self.playback.active:
                     if self.playback.playing:
                         self._save_queue()  # keep the position the pause happened at
                     self._respond(
@@ -6119,10 +6585,14 @@ def send_track_notification(title: str, artist: str, run=subprocess.run, notifie
         pass
 
 
+def notify_message(message: str) -> None:
+    """`send_desktop_notification` on a thread, so the main loop never waits for it."""
+    threading.Thread(target=send_desktop_notification, args=(message,), daemon=True).start()
+
+
 def notify_track_started(title: str, artist: str) -> None:
     """`send_track_notification` on a thread, so the main loop never waits for it."""
     threading.Thread(target=send_track_notification, args=(title, artist), daemon=True).start()
-
 
 
 def open_popup() -> None:

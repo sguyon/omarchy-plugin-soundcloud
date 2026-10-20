@@ -96,6 +96,53 @@ function selectionAfterUpdate(index, count, reset) {
   return reset === true ? -1 : clampSelection(index, count)
 }
 
+// The filter field over the track list: it only searches the rows already
+// loaded (no API call). A row matches when every word of the query is in its
+// title or artist, ignoring case and accents. Each hit keeps its index in the
+// full list. The query is cut at filterMaxChars; words are matched literally.
+var filterMaxChars = 100
+
+function filterNormalize(value) {
+  return String(value === undefined || value === null ? "" : value)
+    .normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase()
+}
+
+function filterWords(query) {
+  var text = String(query === undefined || query === null ? "" : query).slice(0, filterMaxChars)
+  return filterNormalize(text).split(/\s+/).filter(function(word) { return word !== "" })
+}
+
+function filterTracks(rows, query) {
+  var list = Array.isArray(rows) ? rows : []
+  var words = filterWords(query)
+  var hits = []
+  for (var i = 0; i < list.length; i++) {
+    var row = list[i]
+    var text = row ? filterNormalize(row.title) + "\n" + filterNormalize(row.artist) : ""
+    var all = true
+    for (var w = 0; w < words.length && all; w++) all = text.indexOf(words[w]) >= 0
+    if (all && (row || words.length === 0)) hits.push({ track: row, index: i })
+  }
+  return hits
+}
+
+// "24" while the query is empty, "2 of 24" while filtering.
+function filterCountText(query, matches, total) {
+  return filterWords(query).length === 0 ? String(total) : matches + " of " + total
+}
+
+// The selected row follows its track when the visible rows change: its new
+// position, or -1 when it is gone (or nothing was selected).
+function selectionAfterFilter(before, index, after) {
+  var old = Array.isArray(before) ? before[clampSelection(index, before.length)] : null
+  var id = old ? String(old.playbackId || "") : ""
+  if (id === "" || !Array.isArray(after)) return -1
+  for (var i = 0; i < after.length; i++) {
+    if (after[i] && String(after[i].playbackId || "") === id) return i
+  }
+  return -1
+}
+
 // Tab and Shift+Tab walk the four tabs and then Queue (the fifth stop, at the
 // right end of the tab row) in order and wrap around.
 var tabStops = ["home", "feed", "likes", "history", "queue"]
@@ -113,9 +160,9 @@ function currentStop(selectedTab, queueOpen) {
   return queueOpen === true ? "queue" : selectedTab
 }
 
-// The tracks still to come: the badge on the Queue button counts these (the same
-// number as "N next" in the queue view), not the whole queue with the tracks
-// that already played.
+// Count badge on the Queue button: empty (hidden) at 0, "99+" from 100.
+// The tracks still to come: the badge counts these (the same number as "N next" in the
+// queue view), not the whole queue with the tracks that already played.
 function upcomingCount(length, cursor) {
   var total = Math.max(0, Math.floor(Number(length) || 0))
   var at = Math.floor(Number(cursor))
@@ -123,28 +170,113 @@ function upcomingCount(length, cursor) {
   return Math.max(0, total - at - 1)
 }
 
-// Count badge on the Queue button: empty (hidden) at 0, "99+" from 100.
 function queueBadgeText(length) {
   var count = Math.max(0, Math.floor(Number(length) || 0))
   if (count === 0) return ""
   return count > 99 ? "99+" : String(count)
 }
 
-function isCurrentSelectionResponse(activeRequestId, responseId) {
-  return Number(activeRequestId) > 0 && Number(activeRequestId) === Number(responseId)
+// The header avatar opens the Library, a fixed address that never comes from
+// the status; the tooltip names the signed-in account when it is known.
+var libraryUrl = "https://soundcloud.com/you/library"
+
+function accountTooltip(name) {
+  var text = String(name === undefined || name === null ? "" : name).replace(/\s+/g, " ").trim()
+  return text === "" ? "Open Library" : "Signed in as " + text + " (open Library)"
 }
 
-function isCurrentTrack(trackPlaybackId, currentPlaybackId) {
-  var current = String(currentPlaybackId || "")
-  return current !== "" && String(trackPlaybackId || "") === current
+// A profile picture is only shown from a small png/jpeg data URL the backend made.
+function accountAvatarSource(value) {
+  var url = String(value === undefined || value === null ? "" : value)
+  return /^data:image\/(png|jpeg);base64,/.test(url) && url.length <= 180000 ? url : ""
 }
 
-function errorShownOnRow(tracks, playbackId, playbackState) {
-  if (playbackState !== "error" || !Array.isArray(tracks)) return false
-  for (var index = 0; index < tracks.length; index++) {
-    if (tracks[index] && isCurrentTrack(tracks[index].playbackId, playbackId)) return true
-  }
-  return false
+// Left and Right seek like the website: a step is max(5, n) seconds where n counts
+// the key-repeat events since the key went down (a fresh press resets it, only the
+// seek keys count), and at most one seek goes out every 200 ms. The backend command
+// `seek-by:<signed seconds>` clamps to the track.
+var seekMinSeconds = 5
+var seekIntervalMs = 200
+
+function seekRepeatCount(previous, isAutoRepeat) {
+  var count = Math.max(0, Math.floor(Number(previous) || 0))
+  return isAutoRepeat === true ? count + 1 : 0
+}
+
+function seekSeconds(direction, repeats) {
+  var sign = Number(direction) < 0 ? -1 : (Number(direction) > 0 ? 1 : 0)
+  var count = Math.max(0, Math.floor(Number(repeats) || 0))
+  return sign * Math.max(seekMinSeconds, count)
+}
+
+// True when enough time has passed since the last seek that went out; a clock that
+// moved backwards also counts as due.
+function seekDue(now, lastAt) {
+  var last = Number(lastAt)
+  if (lastAt === undefined || lastAt === null || !Number.isFinite(last)) return true
+  var elapsed = Number(now) - last
+  return !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= seekIntervalMs
+}
+
+function seekByCommand(seconds) {
+  var value = Math.round(Number(seconds))
+  if (!Number.isFinite(value) || value === 0) return ""
+  return "seek-by:" + value
+}
+
+// Keys that seek: Left and Right only (h and l are no longer aliases: l likes).
+function isSeekKey(key) {
+  return key === 0x01000012 || key === 0x01000014
+}
+
+// List scrolling. A two-finger swipe moves the list listScrollFactor times as far as
+// the toolkit's own 1:1 handling (touchpad pixels), and a mouse notch (120 units) moves
+// a few rows. The change is the new contentY minus the old one, so it is positive
+// when the content moves up (a swipe towards the top of the screen).
+var listScrollFactor = 3
+var wheelNotchPixels = 60
+var minFlickVelocity = 200
+var maxFlickVelocity = 6000
+
+function scrollChange(pixelDeltaY, angleDeltaY) {
+  var pixels = Number(pixelDeltaY)
+  var angle = Number(angleDeltaY)
+  var base = 0
+  if (Number.isFinite(pixels) && pixels !== 0) base = pixels
+  else if (Number.isFinite(angle) && angle !== 0) base = angle / wheelNotch * wheelNotchPixels
+  return -base * listScrollFactor || 0
+}
+
+// The new contentY, kept inside the list (no overscroll).
+function scrolledContentY(contentY, change, originY, contentHeight, viewHeight) {
+  var top = Number(originY) || 0
+  var bottom = Math.max(top, top + (Number(contentHeight) || 0) - (Number(viewHeight) || 0))
+  var y = Number(contentY)
+  if (!Number.isFinite(y)) y = top
+  return Math.max(top, Math.min(bottom, y + (Number(change) || 0)))
+}
+
+// Running speed of the swipe in px/s: each event pulls the estimate towards the
+// speed it implies, so one slow or odd event does not decide the release speed.
+function swipeVelocity(previous, change, elapsedMs) {
+  var before = Number(previous) || 0
+  var dt = Number(elapsedMs)
+  var moved = Number(change)
+  if (!Number.isFinite(dt) || dt <= 0 || !Number.isFinite(moved)) return before
+  var speed = moved / dt * 1000
+  return before === 0 ? speed : before * 0.5 + speed * 0.5
+}
+
+// The speed to coast at after the fingers lift: 0 (no coasting) for a slow swipe.
+function flickStartVelocity(velocity) {
+  var speed = Number(velocity)
+  if (!Number.isFinite(speed) || Math.abs(speed) < minFlickVelocity) return 0
+  return Math.sign(speed) * Math.min(Math.abs(speed), maxFlickVelocity)
+}
+
+// Next and Previous follow the queue; an older backend that does not report it keeps them on.
+function queueButtonEnabled(actionBusy, hasTrack, allowed) {
+  return actionBusy !== true && hasTrack === true && allowed !== false
 }
 
 // Volume icon states follow Omarchy's own OSD (plugins/osd/OsdModel.js iconFor):
@@ -180,7 +312,7 @@ function volumeText(volume, muted) {
 }
 
 // A wheel notch moves the volume by 5 points. A mouse wheel sends 120 units
-// per notch and a smooth-scrolling swipe dozens of small events, so wheelSteps adds the
+// per notch and a touchpad swipe dozens of small events, so wheelSteps adds the
 // events up and gives one step per full notch. volumeStepCommand and
 // steppedVolume then only use the sign of one step.
 var volumeStep = 0.05
@@ -288,26 +420,20 @@ function repeatIconGlyph(mode) {
 var trackIdPattern = /^soundcloud:tracks:[1-9][0-9]*$/
 
 // Commands for one track by id; "" if the id is not a track id.
-function queuePlayCommand(playbackId) {
-  return trackIdPattern.test(String(playbackId || "")) ? "queue-play:" + playbackId : ""
+function queueNextCommand(playbackId) {
+  return trackIdPattern.test(String(playbackId || "")) ? "queue-next:" + playbackId : ""
 }
 
 function queueRemoveCommand(playbackId) {
   return trackIdPattern.test(String(playbackId || "")) ? "queue-remove:" + playbackId : ""
 }
 
-// "Play next" and "Add to queue" in a track row's menu.
-function queueNextCommand(playbackId) {
-  return trackIdPattern.test(String(playbackId || "")) ? "queue-next:" + playbackId : ""
-}
-
 function queueAddCommand(playbackId) {
   return trackIdPattern.test(String(playbackId || "")) ? "queue-add:" + playbackId : ""
 }
 
-// A track that only offers an encrypted stream cannot be played or queued.
-function isEncrypted(track) {
-  return !!track && track.encrypted === true
+function queuePlayCommand(playbackId) {
+  return trackIdPattern.test(String(playbackId || "")) ? "queue-play:" + playbackId : ""
 }
 
 // Moves a queue entry by a signed number of places (negative = earlier).
@@ -317,7 +443,6 @@ function queueMoveCommand(playbackId, offset) {
   return "queue-move:" + playbackId + ":" + places
 }
 
-// The command for the autoplay switch: the opposite of its current state.
 function toggleCommand(name, currentlyOn) {
   return (name === "autoplay" || name === "notify") ? name + ":" + (currentlyOn === true ? "off" : "on") : ""
 }
@@ -394,21 +519,6 @@ function queueDragOffset(pixels, rowStep, index, count) {
   return Math.max(1 - at, Math.min(total - 1 - at, places)) || 0
 }
 
-// Clear queue asks first: the toolbar switches to a confirm state that is
-// dropped when the queue view closes or when the queue changes (the signature
-// is what was in the queue when it was armed).
-function queueSignature(rows) {
-  var ids = []
-  var list = Array.isArray(rows) ? rows : []
-  for (var index = 0; index < list.length; index++) ids.push(String(list[index].playbackId))
-  return ids.join("|")
-}
-
-function clearConfirmStays(armedSignature, rows, queueOpen) {
-  return typeof armedSignature === "string" && queueOpen === true
-    && queueSignature(rows) === armedSignature && Array.isArray(rows) && rows.length > 0
-}
-
 // The dim text on the queue toolbar: how many tracks follow the playing one.
 function queueCountText(items) {
   var list = Array.isArray(items) ? items : []
@@ -416,9 +526,31 @@ function queueCountText(items) {
   return following > 0 ? following + " next" : "Empty"
 }
 
-// Next and Previous follow the queue; an older backend that does not report it keeps them on.
-function queueButtonEnabled(actionBusy, hasTrack, allowed) {
-  return actionBusy !== true && hasTrack === true && allowed !== false
+// Only SoundCloud's own track pages are opened in the browser.
+function trackPageUrl(url) {
+  var text = String(url || "")
+  return /^https:\/\/(www\.|m\.)?soundcloud\.com\/[^\s]+$/.test(text) && text.length <= 512 ? text : ""
+}
+
+function isEncrypted(track) {
+  return !!track && track.encrypted === true
+}
+
+function isCurrentSelectionResponse(activeRequestId, responseId) {
+  return Number(activeRequestId) > 0 && Number(activeRequestId) === Number(responseId)
+}
+
+function isCurrentTrack(trackPlaybackId, currentPlaybackId) {
+  var current = String(currentPlaybackId || "")
+  return current !== "" && String(trackPlaybackId || "") === current
+}
+
+function errorShownOnRow(tracks, playbackId, playbackState) {
+  if (playbackState !== "error" || !Array.isArray(tracks)) return false
+  for (var index = 0; index < tracks.length; index++) {
+    if (tracks[index] && isCurrentTrack(tracks[index].playbackId, playbackId)) return true
+  }
+  return false
 }
 
 function barIconColor(playing, accent, foreground) {
@@ -458,6 +590,9 @@ function keyAction(key, modifiers, text) {
     return ""
   }
   if (shift && (key === 0x53)) return "shuffle"
+  // "/" is Shift+7 or Shift+: on some layouts, so Shift is allowed with it.
+  if ((mods & ~keyShift) === 0 && (key === 0x2f || letter === "/")) return "filter"
+  if (mods === keyCtrl && key === 0x46) return "filter"
   if (none && (key === 0x48 || letter === "h")) return "ignore"
   // Super may still be held when Omarchy's SUPER+V sends its Ctrl+V, so Meta is
   // ignored for the paste keys; in a terminal that shortcut sends Shift+Insert.
@@ -485,6 +620,38 @@ function linkCommand(url, playNow) {
   return clean === "" ? "" : (playNow === true ? "link-play:" : "link-next:") + encodeURIComponent(clean)
 }
 
+// The message line at the bottom of the popup (ToastLine): one policy for
+// every message. An info message (a success, "Queued: ...") stays 4 s, an error
+// 8 s; a new message replaces the old one and restarts the time; while the
+// pointer is over it the time is paused, and 2 s are left once it leaves.
+var toastInfoMs = 4000
+var toastErrorMs = 8000
+var toastLeaveMs = 2000
+function toastLeaveDelay() { return toastLeaveMs }
+
+function toastDelay(kind) {
+  return kind === "error" ? toastErrorMs : toastInfoMs
+}
+
+// The same text pushed again by a status update (the backend repeats it) does
+// not restart the time; anything else does.
+function toastRestarts(currentKind, currentText, nextKind, nextText, fromStatus) {
+  return !(fromStatus === true && currentKind === nextKind && String(currentText) === String(nextText))
+}
+
+// A status error the user dismissed (click, timeout or a new action) stays
+// hidden while the backend keeps reporting the same text; an empty or a
+// different status error shows again.
+function statusErrorShows(dismissedText, nextText) {
+  return String(nextText) !== "" && String(nextText) !== String(dismissedText)
+}
+
+// Commands the user starts (not the background reads) remove the old error.
+function errorClearedByCommand(kind) {
+  return kind === "like" || kind === "ui" || kind === "queue-edit" || kind === "paste"
+    || kind === "action" || kind === "selection"
+}
+
 // What a paste does with the clipboard text: the backend command, or the
 // message to show when there is nothing to send.
 function pasteRequest(text, playNow) {
@@ -503,42 +670,76 @@ function pasteNotice(message) {
   return title === "" ? "Playing the link" : "Playing: " + title
 }
 
-// Left and Right seek like the website: a step is max(5, n) seconds where n counts
-// the key-repeat events since the key went down (a fresh press resets it, only the
-// seek keys count), and at most one seek goes out every 200 ms. The backend command
-// `seek-by:<signed seconds>` clamps to the track.
-var seekMinSeconds = 5
-var seekIntervalMs = 200
+// Clear queue asks first: the toolbar switches to a confirm state that is
+// dropped after clearConfirmMs of the pointer being away from the toolbar, when
+// the queue view closes or when the queue changes (the signature is what was in
+// the queue when it was armed).
+var clearConfirmMs = 12000
+function clearConfirmDelay() { return clearConfirmMs }
 
-function seekRepeatCount(previous, isAutoRepeat) {
-  var count = Math.max(0, Math.floor(Number(previous) || 0))
-  return isAutoRepeat === true ? count + 1 : 0
+// The countdown runs only while a confirmation is pending and the pointer is
+// away from the toolbar; coming back stops it, leaving starts it afresh.
+function clearConfirmCountdownRuns(armedSignature, pointerOverToolbar) {
+  return typeof armedSignature === "string" && pointerOverToolbar !== true
 }
 
-function seekSeconds(direction, repeats) {
-  var sign = Number(direction) < 0 ? -1 : (Number(direction) > 0 ? 1 : 0)
-  var count = Math.max(0, Math.floor(Number(repeats) || 0))
-  return sign * Math.max(seekMinSeconds, count)
+function queueSignature(rows) {
+  var ids = []
+  var list = Array.isArray(rows) ? rows : []
+  for (var index = 0; index < list.length; index++) ids.push(String(list[index].playbackId))
+  return ids.join("|")
 }
 
-// True when enough time has passed since the last seek that went out; a clock that
-// moved backwards also counts as due.
-function seekDue(now, lastAt) {
-  var last = Number(lastAt)
-  if (lastAt === undefined || lastAt === null || !Number.isFinite(last)) return true
-  var elapsed = Number(now) - last
-  return !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= seekIntervalMs
+function clearConfirmStays(armedSignature, rows, queueOpen) {
+  return typeof armedSignature === "string" && queueOpen === true
+    && queueSignature(rows) === armedSignature && Array.isArray(rows) && rows.length > 0
 }
 
-function seekByCommand(seconds) {
-  var value = Math.round(Number(seconds))
-  if (!Number.isFinite(value) || value === 0) return ""
-  return "seek-by:" + value
+// Omarchy's on-screen display (omarchy.osd): the same icon names and value it
+// uses for its own volume keys. progressText replaces the percent beside the
+// bar (a message would drop the bar), so it is not mistaken for the system
+// volume: this slider is the player's own volume.
+function volumeOsdPayload(volume, muted) {
+  var state = volumeIconState(volume, muted)
+  var percent = state === "muted" ? 0 : volumePercent(volume)
+  return JSON.stringify({ icon: "volume-" + state, value: percent, progressText: "SoundCloud " + percent + "%" })
 }
 
-// Keys that seek: Left and Right only (h and l are no longer aliases: l likes).
-function isSeekKey(key) {
-  return key === 0x01000012 || key === 0x01000014
+// The bar-icon swipe shows Omarchy's OSD through the shell's own IPC target
+// (omarchy-shell osd show <json>); the plugin cannot summon it itself.
+function osdCommand(volume, muted) {
+  return ["omarchy-shell", "osd", "show", volumeOsdPayload(volume, muted)]
+}
+
+// At most one OSD process per 80 ms while swiping; the latest value is sent
+// by a trailing timer.
+var osdIntervalMs = 80
+function osdDue(now, lastAt) {
+  return !(lastAt > 0) || now - lastAt >= osdIntervalMs || now < lastAt
+}
+
+// Waveform levels are only replaced when their content changed, so the canvas
+// does not repaint on every status push.
+function sameLevels(a, b) {
+  if (a === b) return true
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+  for (var index = 0; index < a.length; index++) {
+    if (a[index] !== b[index]) return false
+  }
+  return true
+}
+
+// A seek can make the backend report resolving/buffering for a moment, with the
+// title, duration and waveform empty. When the track is the same one (or the
+// status names none), that status must not wipe what is shown.
+function isTransientStatus(state, currentPlaybackId) {
+  state = state || {}
+  var current = String(currentPlaybackId || "")
+  var incoming = String(state.playbackId || "")
+  return current !== ""
+    && state.playerPresent !== false
+    && selectionIsPending(String(state.playbackState || ""))
+    && (incoming === "" || incoming === current)
 }
 
 // A status position that arrives within `windowMs` of an optimistic position
@@ -587,9 +788,19 @@ if (typeof module !== "undefined") {
     currentStop: currentStop,
     queueBadgeText: queueBadgeText,
     upcomingCount: upcomingCount,
-    isCurrentSelectionResponse: isCurrentSelectionResponse,
-    isCurrentTrack: isCurrentTrack,
-    errorShownOnRow: errorShownOnRow,
+    accountTooltip: accountTooltip,
+    accountAvatarSource: accountAvatarSource,
+    libraryUrl: libraryUrl,
+    scrollChange: scrollChange,
+    scrolledContentY: scrolledContentY,
+    swipeVelocity: swipeVelocity,
+    flickStartVelocity: flickStartVelocity,
+    seekRepeatCount: seekRepeatCount,
+    seekSeconds: seekSeconds,
+    seekDue: seekDue,
+    seekByCommand: seekByCommand,
+    isSeekKey: isSeekKey,
+    queueButtonEnabled: queueButtonEnabled,
     volumePercent: volumePercent,
     volumeTooltip: volumeTooltip,
     volumeIconState: volumeIconState,
@@ -609,39 +820,52 @@ if (typeof module !== "undefined") {
     sliderDisplayValue: sliderDisplayValue,
     volumeSetCommand: volumeSetCommand,
     repeatMode: repeatMode,
-    queuePlayCommand: queuePlayCommand,
-    queueRemoveCommand: queueRemoveCommand,
-    queueMoveCommand: queueMoveCommand,
-    toggleCommand: toggleCommand,
-    queueKeyMoveOffset: queueKeyMoveOffset,
-    queueDragOffset: queueDragOffset,
-    queueSignature: queueSignature,
-    clearConfirmStays: clearConfirmStays,
     repeatIconGlyph: repeatIconGlyph,
     queueNextCommand: queueNextCommand,
+    queueRemoveCommand: queueRemoveCommand,
     queueAddCommand: queueAddCommand,
-    isEncrypted: isEncrypted,
-    queueRowLabel: queueRowLabel,
-    upcomingQueue: upcomingQueue,
+    queuePlayCommand: queuePlayCommand,
+    queueMoveCommand: queueMoveCommand,
     queueIndexOf: queueIndexOf,
     queueCountText: queueCountText,
     queueSelectionAfterMove: queueSelectionAfterMove,
     queueSelectionAfterUpdate: queueSelectionAfterUpdate,
-    queueButtonEnabled: queueButtonEnabled,
-    barIconColor: barIconColor,
-    seekRepeatCount: seekRepeatCount,
-    seekSeconds: seekSeconds,
-    seekDue: seekDue,
-    seekByCommand: seekByCommand,
-    isSeekKey: isSeekKey,
+    queueKeyMoveOffset: queueKeyMoveOffset,
+    queueDragOffset: queueDragOffset,
     keyAction: keyAction,
+    filterTracks: filterTracks,
+    filterCountText: filterCountText,
+    selectionAfterFilter: selectionAfterFilter,
     actionRepeats: actionRepeats,
     pastedLinkUrl: pastedLinkUrl,
     linkCommand: linkCommand,
+    volumeOsdPayload: volumeOsdPayload,
+    toastDelay: toastDelay,
+    toastLeaveDelay: toastLeaveDelay,
+    toastRestarts: toastRestarts,
+    statusErrorShows: statusErrorShows,
+    errorClearedByCommand: errorClearedByCommand,
     pasteRequest: pasteRequest,
     pasteNotice: pasteNotice,
+    clearConfirmDelay: clearConfirmDelay,
+    queueSignature: queueSignature,
+    clearConfirmStays: clearConfirmStays,
+    clearConfirmCountdownRuns: clearConfirmCountdownRuns,
+    osdCommand: osdCommand,
+    osdDue: osdDue,
+    sameLevels: sameLevels,
+    isTransientStatus: isTransientStatus,
     positionFromStatus: positionFromStatus,
     seekedPosition: seekedPosition,
+    toggleCommand: toggleCommand,
+    queueRowLabel: queueRowLabel,
+    upcomingQueue: upcomingQueue,
+    trackPageUrl: trackPageUrl,
+    isEncrypted: isEncrypted,
+    isCurrentSelectionResponse: isCurrentSelectionResponse,
+    isCurrentTrack: isCurrentTrack,
+    errorShownOnRow: errorShownOnRow,
+    barIconColor: barIconColor,
     launchError: launchError
   }
 }

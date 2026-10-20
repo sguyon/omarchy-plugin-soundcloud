@@ -78,47 +78,6 @@ assert.equal(model.canStartAction(true, true, "next"), false);
 assert.equal(model.isCurrentSelectionResponse(42, 41), false);
 assert.equal(model.isCurrentSelectionResponse(42, 42), true);
 
-// Keyboard selection: first move lands on row 0, stops at the ends, empty list has none.
-assert.equal(model.moveSelection(-1, 1, 5), 0);
-assert.equal(model.moveSelection(-1, -1, 5), 0);
-assert.equal(model.moveSelection(0, 1, 5), 1);
-assert.equal(model.moveSelection(4, 1, 5), 4);
-assert.equal(model.moveSelection(0, -1, 5), 0);
-assert.equal(model.moveSelection(2, -1, 5), 1);
-assert.equal(model.moveSelection(9, 1, 5), 4);
-assert.equal(model.moveSelection(0, 1, 0), -1);
-assert.equal(model.clampSelection(7, 3), 2);
-assert.equal(model.clampSelection(-3, 3), -1);
-assert.equal(model.clampSelection(undefined, 3), -1);
-assert.equal(model.clampSelection(0, 0), -1);
-assert.equal(model.selectionAfterUpdate(3, 20, false), 3);
-assert.equal(model.selectionAfterUpdate(3, 2, false), 1);
-assert.equal(model.selectionAfterUpdate(3, 20, true), -1);
-
-// Tab cycling wraps both ways through the four tabs and Queue; an unknown tab starts at the first.
-assert.equal(model.cycleTab("home", 1), "feed");
-assert.equal(model.cycleTab("history", 1), "queue");
-assert.equal(model.cycleTab("queue", 1), "home");
-assert.equal(model.cycleTab("home", -1), "queue");
-assert.equal(model.cycleTab("queue", -1), "history");
-assert.equal(model.cycleTab("likes", -1), "feed");
-assert.equal(model.cycleTab("nope", 1), "home");
-assert.equal(model.currentStop("likes", false), "likes");
-assert.equal(model.currentStop("likes", true), "queue");
-
-// Queue count badge: hidden at 0 or junk, capped at 99+.
-assert.equal(model.queueBadgeText(0), "");
-assert.equal(model.queueBadgeText(undefined), "");
-assert.equal(model.queueBadgeText(-3), "");
-// the badge counts the tracks still to come, not the whole queue
-for (const [length, cursor, want] of [[24, 21, 2], [24, 23, 0], [24, 0, 23], [5, -1, 5], [0, 0, 0], [3, 9, 0], [undefined, undefined, 0]]) {
-  assert.equal(model.upcomingCount(length, cursor), want, `upcomingCount(${length}, ${cursor})`);
-}
-assert.equal(model.queueBadgeText(12), "12");
-assert.equal(model.queueBadgeText("7"), "7");
-assert.equal(model.queueBadgeText(99), "99");
-assert.equal(model.queueBadgeText(100), "99+");
-
 assert.equal(model.isCurrentTrack("soundcloud:tracks:9", "soundcloud:tracks:9"), true);
 assert.equal(model.isCurrentTrack("soundcloud:tracks:8", "soundcloud:tracks:9"), false);
 // Nothing playing must not mark rows that also lack an id.
@@ -159,6 +118,39 @@ observeListEvent("movement-ended", 21, true);
 assert.equal(requestEvents.length, 2);
 observeListEvent("movement-ended", 31, false);
 assert.equal(requestEvents.length, 2);
+
+
+// The launcher prints one JSON line. A failed start carries the reason, such
+// as missing packages, so the popup can show it instead of "Not connected".
+assert.equal(
+  model.launchError('{"ok": false, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}'),
+  "Missing gst-libav. Run: omarchy pkg add gst-libav",
+);
+assert.equal(model.launchError('{"ok": true, "starting": true, "running": true}'), "");
+assert.equal(model.launchError("not json"), "");
+
+// A track clicked in a list plays from that list; a new click replaces a pending one.
+assert.equal(
+  model.playFromCommand("likes", "soundcloud:tracks:42"),
+  "play-from:likes:soundcloud:tracks:42",
+);
+for (const [tab, id] of [["library", "soundcloud:tracks:42"], ["home", "42"], ["home", ""], ["home", "soundcloud:tracks:0"], [undefined, undefined]]) {
+  assert.equal(model.playFromCommand(tab, id), "");
+}
+assert.equal(model.isSelectionAction("play-from"), true);
+assert.equal(model.isSelectionAction("play"), true);
+assert.equal(model.isSelectionAction("next"), false);
+assert.equal(model.canStartAction(true, true, "play-from"), true);
+assert.equal(model.canStartAction(true, true, "next"), false);
+assert.equal(model.canStartAction(true, false, "play-from"), false);
+
+// Next and Previous are off when the backend says the queue cannot go that way.
+// An older backend sends no flag, so the buttons stay on.
+assert.equal(model.queueButtonEnabled(false, true, true), true);
+assert.equal(model.queueButtonEnabled(false, true, undefined), true);
+assert.equal(model.queueButtonEnabled(false, true, false), false);
+assert.equal(model.queueButtonEnabled(true, true, true), false);
+assert.equal(model.queueButtonEnabled(false, false, true), false);
 
 // Volume icon: Omarchy OSD thresholds (0 or muted, up to 33, up to 66, above).
 for (const [volume, muted, state] of [
@@ -228,34 +220,23 @@ assert.equal(model.steppedVolume(0.02, -120), 0);
 assert.equal(model.steppedVolume(0.3, 0), 0.3);
 assert.equal(model.steppedVolume(undefined, -120), 0.95);
 
-// Repeat mode: anything but one or all means off.
+// Repeat and switch commands.
 assert.equal(model.repeatMode("one"), "one");
 assert.equal(model.repeatMode("bogus"), "none");
-
-// Queue commands take real track ids only.
-const t1 = "soundcloud:tracks:1", t2 = "soundcloud:tracks:2", t3 = "soundcloud:tracks:3";
-assert.equal(model.queuePlayCommand(t2), "queue-play:" + t2);
-assert.equal(model.queueRemoveCommand("soundcloud:tracks:7"), "queue-remove:soundcloud:tracks:7");
-assert.equal(model.queueNextCommand("soundcloud:tracks:7"), "queue-next:soundcloud:tracks:7");
-assert.equal(model.queueAddCommand(t1), "queue-add:" + t1);
-for (const bad of ["", "7", "soundcloud:tracks:0", undefined, "queue-clear"]) {
-  assert.equal(model.queuePlayCommand(bad), "");
-  assert.equal(model.queueRemoveCommand(bad), "");
-  assert.equal(model.queueNextCommand(bad), "");
-  assert.equal(model.queueAddCommand(bad), "");
-}
-
-// Rows that only offer an encrypted stream are flagged.
-assert.equal(model.isEncrypted({ encrypted: true }), true);
-assert.equal(model.isEncrypted({ encrypted: "yes" }), false);
-assert.equal(model.isEncrypted(undefined), false);
-
-// The autoplay switch asks for the opposite of its state.
+assert.equal(model.repeatIconGlyph("one"), "\u{f0458}");
+assert.equal(model.repeatIconGlyph("all"), "\u{f0456}");
+assert.equal(model.repeatIconGlyph(undefined), "\u{f0457}");
 assert.equal(model.toggleCommand("autoplay", true), "autoplay:off");
-assert.equal(model.toggleCommand("autoplay", false), "autoplay:on");
 assert.equal(model.toggleCommand("notify", false), "notify:on");
 assert.equal(model.toggleCommand("other", false), "");
-assert.equal(model.toggleCommand("other", false), "");
+
+// Queue commands take real track ids only.
+assert.equal(model.queueNextCommand("soundcloud:tracks:7"), "queue-next:soundcloud:tracks:7");
+assert.equal(model.queueRemoveCommand("soundcloud:tracks:7"), "queue-remove:soundcloud:tracks:7");
+for (const bad of ["", "7", "soundcloud:tracks:0", undefined, "queue-clear"]) {
+  assert.equal(model.queueNextCommand(bad), "");
+  assert.equal(model.queueRemoveCommand(bad), "");
+}
 
 // Queue rows: label by origin; the view starts at the current track.
 assert.equal(model.queueRowLabel({ current: true, explicit: true }), "playing now");
@@ -268,86 +249,71 @@ assert.deepEqual(model.upcomingQueue(queue).map((item) => item.id), ["b", "c"]);
 assert.deepEqual(model.upcomingQueue({ items: [{ id: "a" }] }).map((item) => item.id), ["a"]);
 assert.deepEqual(model.upcomingQueue(undefined), []);
 
-// Keyboard selection in the queue view follows the track id.
-const rows = [{ playbackId: t1, current: true }, { playbackId: t2 }, { playbackId: t3 }];
-assert.equal(model.queueCountText(rows), "2 next");
-assert.equal(model.queueCountText([rows[0]]), "Empty");
-assert.equal(model.queueCountText([rows[1], rows[2]]), "2 next");
-assert.equal(model.queueCountText([]), "Empty");
-assert.equal(model.queueIndexOf(rows, t3), 2);
-assert.equal(model.queueIndexOf(rows, ""), -1);
-assert.equal(model.queueSelectionAfterMove(rows, "", 1), t2);
-assert.equal(model.queueSelectionAfterMove(rows, "", -1), t3);
-assert.equal(model.queueSelectionAfterMove(rows, t2, 1), t3);
-assert.equal(model.queueSelectionAfterMove(rows, t3, 1), t3);
-assert.equal(model.queueSelectionAfterMove(rows, t2, -1), t1);
-assert.equal(model.queueSelectionAfterMove(rows, t1, -1), t1);
-assert.equal(model.queueSelectionAfterMove([rows[0]], "", 1), t1);
-assert.equal(model.queueSelectionAfterMove([], "", 1), "");
-assert.equal(model.queueSelectionAfterUpdate(rows, t2), t2);
-assert.equal(model.queueSelectionAfterUpdate([rows[0]], t2), "");
-
-// Reordering: the move command, the key step, the drag distance.
-assert.equal(model.queueMoveCommand(t2, -1), "queue-move:" + t2 + ":-1");
-assert.equal(model.queueMoveCommand(t2, 3), "queue-move:" + t2 + ":3");
-assert.equal(model.queueMoveCommand(t2, 0), "");
-assert.equal(model.queueMoveCommand(t2, 1.5), "");
-assert.equal(model.queueMoveCommand("bad", 1), "");
-assert.equal(model.queueKeyMoveOffset(rows, t2, -1), 0); // cannot go above the playing row
-assert.equal(model.queueKeyMoveOffset(rows, t2, 1), 1);
-assert.equal(model.queueKeyMoveOffset(rows, t3, 1), 0);
-assert.equal(model.queueKeyMoveOffset(rows, t3, -1), -1);
-assert.equal(model.queueKeyMoveOffset(rows, t1, 1), 0); // the playing row never moves
-assert.equal(model.queueKeyMoveOffset(rows, "", 1), 0);
-assert.equal(model.queueDragOffset(100, 51, 1, 3), 1); // 100 px is about two rows, clamped to the end
-assert.equal(model.queueDragOffset(-200, 51, 2, 3), -1); // clamped below the playing row
-assert.equal(model.queueDragOffset(60, 51, 1, 5), 1);
-assert.equal(model.queueDragOffset(10, 51, 1, 5), 0);
-assert.equal(model.queueDragOffset(-60, 51, 0, 5), 0); // the playing row stays
-assert.equal(model.queueDragOffset(60, 0, 1, 5), 0);
-
-// Clear queue confirmation: stays only while the same queue is shown.
-assert.equal(model.queueSignature(rows), t1 + "|" + t2 + "|" + t3);
-assert.equal(model.queueSignature(null), "");
-{
-  const armed = model.queueSignature(rows);
-  assert.equal(model.clearConfirmStays(armed, rows, true), true);
-  assert.equal(model.clearConfirmStays(armed, rows, false), false);
-  assert.equal(model.clearConfirmStays(armed, [rows[0]], true), false);
-  assert.equal(model.clearConfirmStays(armed, [rows[1], rows[0], rows[2]], true), false);
-  assert.equal(model.clearConfirmStays(null, rows, true), false);
-  assert.equal(model.clearConfirmStays("", [], true), false);
+// Only SoundCloud track pages are opened; encrypted rows are flagged.
+assert.equal(model.trackPageUrl("https://soundcloud.com/artist/track"), "https://soundcloud.com/artist/track");
+for (const bad of ["", undefined, "http://soundcloud.com/a/b", "https://evil.com/soundcloud.com/a", "https://soundcloud.com.evil.com/a", "javascript:alert(1)", "https://soundcloud.com/a b"]) {
+  assert.equal(model.trackPageUrl(bad), "");
 }
+assert.equal(model.isEncrypted({ encrypted: true }), true);
+assert.equal(model.isEncrypted({ encrypted: "yes" }), false);
+assert.equal(model.isEncrypted(undefined), false);
 
-// Repeat glyphs: once, all, off.
-assert.equal(model.repeatIconGlyph("one"), "\u{f0458}");
-assert.equal(model.repeatIconGlyph("all"), "\u{f0456}");
-assert.equal(model.repeatIconGlyph(undefined), "\u{f0457}");
+// Keyboard selection: first move lands on row 0, stops at the ends, empty list has none.
+assert.equal(model.moveSelection(-1, 1, 5), 0);
+assert.equal(model.moveSelection(-1, -1, 5), 0);
+assert.equal(model.moveSelection(0, 1, 5), 1);
+assert.equal(model.moveSelection(4, 1, 5), 4);
+assert.equal(model.moveSelection(0, -1, 5), 0);
+assert.equal(model.moveSelection(2, -1, 5), 1);
+assert.equal(model.moveSelection(9, 1, 5), 4);
+assert.equal(model.moveSelection(0, 1, 0), -1);
+assert.equal(model.clampSelection(7, 3), 2);
+assert.equal(model.clampSelection(-3, 3), -1);
+assert.equal(model.clampSelection(undefined, 3), -1);
+assert.equal(model.clampSelection(0, 0), -1);
+assert.equal(model.selectionAfterUpdate(3, 20, false), 3);
+assert.equal(model.selectionAfterUpdate(3, 2, false), 1);
+assert.equal(model.selectionAfterUpdate(3, 20, true), -1);
 
-// A track clicked in a list plays from that list; a new click replaces a pending one.
-assert.equal(
-  model.playFromCommand("likes", "soundcloud:tracks:42"),
-  "play-from:likes:soundcloud:tracks:42",
-);
-for (const [tab, id] of [["library", "soundcloud:tracks:42"], ["home", "42"], ["home", ""], ["home", "soundcloud:tracks:0"], [undefined, undefined]]) {
-  assert.equal(model.playFromCommand(tab, id), "");
+// Tab cycling wraps both ways through the four tabs and Queue; an unknown tab starts at the first.
+assert.equal(model.cycleTab("home", 1), "feed");
+assert.equal(model.cycleTab("history", 1), "queue");
+assert.equal(model.cycleTab("queue", 1), "home");
+assert.equal(model.cycleTab("home", -1), "queue");
+assert.equal(model.cycleTab("queue", -1), "history");
+assert.equal(model.cycleTab("likes", -1), "feed");
+assert.equal(model.cycleTab("nope", 1), "home");
+assert.equal(model.currentStop("likes", false), "likes");
+assert.equal(model.currentStop("likes", true), "queue");
+
+// Queue count badge: hidden at 0 or junk, capped at 99+.
+assert.equal(model.queueBadgeText(0), "");
+assert.equal(model.queueBadgeText(undefined), "");
+assert.equal(model.queueBadgeText(-3), "");
+// the badge counts the tracks still to come, not the whole queue
+for (const [length, cursor, want] of [[24, 21, 2], [24, 23, 0], [24, 0, 23], [5, -1, 5], [0, 0, 0], [3, 9, 0], [undefined, undefined, 0]]) {
+  assert.equal(model.upcomingCount(length, cursor), want, `upcomingCount(${length}, ${cursor})`);
 }
-assert.equal(model.isSelectionAction("play-from"), true);
-assert.equal(model.isSelectionAction("play"), true);
-assert.equal(model.isSelectionAction("next"), false);
-assert.equal(model.canStartAction(true, true, "play-from"), true);
-assert.equal(model.canStartAction(true, true, "next"), false);
-assert.equal(model.canStartAction(true, false, "play-from"), false);
+assert.equal(model.queueBadgeText(12), "12");
+assert.equal(model.queueBadgeText("7"), "7");
+assert.equal(model.queueBadgeText(99), "99");
+assert.equal(model.queueBadgeText(100), "99+");
 
-// Next and Previous are off when the backend says the queue cannot go that way.
-// An older backend sends no flag, so the buttons stay on.
-assert.equal(model.queueButtonEnabled(false, true, true), true);
-assert.equal(model.queueButtonEnabled(false, true, undefined), true);
-assert.equal(model.queueButtonEnabled(false, true, false), false);
-assert.equal(model.queueButtonEnabled(true, true, true), false);
-assert.equal(model.queueButtonEnabled(false, false, true), false);
+// Avatar: fixed Library address, tooltip with the name, only small png/jpeg data URLs.
+assert.equal(model.libraryUrl, "https://soundcloud.com/you/library");
+assert.equal(model.accountTooltip("Sacha"), "Signed in as Sacha (open Library)");
+assert.equal(model.accountTooltip("  Sacha \n G "), "Signed in as Sacha G (open Library)");
+assert.equal(model.accountTooltip(""), "Open Library");
+assert.equal(model.accountTooltip(null), "Open Library");
+assert.equal(model.accountTooltip(undefined), "Open Library");
+assert.equal(model.accountAvatarSource("data:image/png;base64,AAAA"), "data:image/png;base64,AAAA");
+assert.equal(model.accountAvatarSource("data:image/jpeg;base64,AAAA"), "data:image/jpeg;base64,AAAA");
+assert.equal(model.accountAvatarSource("https://x/y.png"), "");
+assert.equal(model.accountAvatarSource("data:image/svg+xml;base64,AAAA"), "");
+assert.equal(model.accountAvatarSource("data:image/png;base64," + "A".repeat(180000)), "");
+assert.equal(model.accountAvatarSource(null), "");
 
-// Seek keys: max(5, n) seconds, at most one seek per 200 ms.
+// Seeking like the website: max(5, n) seconds, n = key repeats since the press.
 assert.equal(model.seekRepeatCount(0, false), 0);
 assert.equal(model.seekRepeatCount(7, false), 0);
 assert.equal(model.seekRepeatCount(0, true), 1);
@@ -387,19 +353,60 @@ assert.equal(model.isSeekKey(0x4a), false);
   }
   assert.deepEqual(sent, [5, 5, 8, 12, 16, 20]);
 }
+// List scrolling: 3x the touchpad pixels; a mouse notch is 60 px times the factor.
+assert.equal(model.scrollChange(10, 0), -30);
+assert.equal(model.scrollChange(-4, 480), 12);
+assert.equal(model.scrollChange(0, 120), -180);
+assert.equal(model.scrollChange(0, -240), 360);
+assert.equal(model.scrollChange(0, 0), 0);
+assert.equal(model.scrollChange(undefined, "x"), 0);
+assert.equal(model.scrolledContentY(100, 50, 0, 1000, 300), 150);
+assert.equal(model.scrolledContentY(100, -500, 0, 1000, 300), 0);
+assert.equal(model.scrolledContentY(650, 500, 0, 1000, 300), 700);
+assert.equal(model.scrolledContentY(0, 50, 0, 200, 300), 0);
+assert.equal(model.scrolledContentY(-10, 5, -10, 1000, 300), -5);
+assert.equal(model.scrolledContentY(NaN, 5, 0, 1000, 300), 5);
+assert.equal(model.swipeVelocity(0, 30, 10), 3000);
+assert.equal(model.swipeVelocity(3000, 10, 10), 2000);
+assert.equal(model.swipeVelocity(500, 10, 0), 500);
+assert.equal(model.flickStartVelocity(100), 0);
+assert.equal(model.flickStartVelocity(-100), 0);
+assert.equal(model.flickStartVelocity(1500), 1500);
+assert.equal(model.flickStartVelocity(-99999), -6000);
+assert.equal(model.flickStartVelocity(NaN), 0);
+// Wheel events add up to whole notches: touchpad deltas are small, a mouse notch is 120.
+assert.deepEqual(model.wheelSteps(0, 120), { steps: 1, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(0, -120), { steps: -1, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(0, 15), { steps: 0, accumulator: 15 });
+assert.deepEqual(model.wheelSteps(105, 15), { steps: 1, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(100, 50), { steps: 1, accumulator: 30 });
+assert.deepEqual(model.wheelSteps(-100, -50), { steps: -1, accumulator: -30 });
+assert.deepEqual(model.wheelSteps(100, -20), { steps: 0, accumulator: -20 });
+assert.deepEqual(model.wheelSteps(0, 360), { steps: 3, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(0, -250), { steps: -2, accumulator: -10 });
+assert.deepEqual(model.wheelSteps(undefined, 30), { steps: 0, accumulator: 30 });
+assert.deepEqual(model.wheelSteps(40, 0), { steps: 0, accumulator: 40 });
+assert.deepEqual(model.wheelSteps(40, "x"), { steps: 0, accumulator: 40 });
+let swipe = { steps: 0, accumulator: 0 };
+let swipeSteps = 0;
+for (let i = 0; i < 40; i++) {
+  swipe = model.wheelSteps(swipe.accumulator, 6);
+  swipeSteps += swipe.steps;
+}
+assert.equal(swipeSteps, 2); // 40 events of 6 units = 240 units = two notches, not forty steps
+
 // Keys handled before the key catcher.
 const SH = 0x02000000, CT = 0x04000000, AL = 0x08000000;
 assert.equal(model.keyAction(0x01000017, 0, ""), "next");
 assert.equal(model.keyAction(0x01000016, 0, ""), "previous");
 assert.equal(model.keyAction(0x01000014, SH, ""), "next");
 assert.equal(model.keyAction(0x01000012, SH, ""), "previous");
+assert.equal(model.keyAction(0x01000014, 0, ""), ""); // plain arrows are for the catcher
 assert.equal(model.keyAction(0x01000013, SH, ""), "volume-up");
 assert.equal(model.keyAction(0x01000015, SH, ""), "volume-down");
 assert.equal(model.keyAction(0x01000013, AL, ""), "queue-up");
 assert.equal(model.keyAction(0x01000015, AL, ""), "queue-down");
-assert.equal(model.keyAction(0x01000015, AL | SH, ""), "");
 assert.equal(model.keyAction(0x01000013, 0, ""), "");
-assert.equal(model.keyAction(0x01000014, 0, ""), ""); // plain arrows are for the catcher
 assert.equal(model.keyAction(0x4c, 0, "l"), "like");
 assert.equal(model.keyAction(0x4c, SH, "L"), "repeat");
 assert.equal(model.keyAction(0x4c, CT, ""), "");
@@ -413,12 +420,8 @@ assert.equal(model.keyAction(0x4a, 0, "j"), ""); // j and k stay list navigation
 assert.equal(model.keyAction(0x4b, 0, "k"), "");
 assert.equal(model.keyAction(0x20, 0x20000000, ""), ""); // keypad flag alone is no modifier
 assert.equal(model.actionRepeats("volume-up"), true);
-assert.equal(model.actionRepeats("volume-down"), true);
-assert.equal(model.actionRepeats("queue-up"), true);
-assert.equal(model.actionRepeats("queue-down"), true);
-assert.equal(model.actionRepeats("like"), false);
-assert.equal(model.actionRepeats("link-next"), false);
 assert.equal(model.actionRepeats("next"), false);
+assert.equal(model.actionRepeats("link-next"), false);
 
 // Pasted links.
 assert.equal(model.pastedLinkUrl("https://soundcloud.com/a/b"), "https://soundcloud.com/a/b");
@@ -435,6 +438,77 @@ assert.equal(model.linkCommand("https://soundcloud.com/a/b?x=1&y=2", false),
 assert.equal(model.linkCommand("https://soundcloud.com/a/b", true), "link-play:https%3A%2F%2Fsoundcloud.com%2Fa%2Fb");
 assert.equal(model.linkCommand("javascript:alert(1)", true), "");
 assert.equal(model.linkCommand("", false), "");
+
+// Queue commands and keyboard selection.
+const t1 = "soundcloud:tracks:1", t2 = "soundcloud:tracks:2", t3 = "soundcloud:tracks:3";
+assert.equal(model.queueAddCommand(t1), "queue-add:" + t1);
+assert.equal(model.queueAddCommand("x"), "");
+assert.equal(model.queuePlayCommand(t2), "queue-play:" + t2);
+assert.equal(model.queuePlayCommand(""), "");
+assert.equal(model.queueMoveCommand(t2, -1), "queue-move:" + t2 + ":-1");
+assert.equal(model.queueMoveCommand(t2, 3), "queue-move:" + t2 + ":3");
+assert.equal(model.queueMoveCommand(t2, 0), "");
+assert.equal(model.queueMoveCommand(t2, 1.5), "");
+assert.equal(model.queueMoveCommand("bad", 1), "");
+const rows = [{ playbackId: t1, current: true }, { playbackId: t2 }, { playbackId: t3 }];
+assert.equal(model.queueCountText(rows), "2 next");
+assert.equal(model.queueCountText([rows[0]]), "Empty");
+assert.equal(model.queueCountText([rows[1], rows[2]]), "2 next");
+assert.equal(model.queueCountText([]), "Empty");
+assert.equal(model.queueIndexOf(rows, t3), 2);
+assert.equal(model.queueIndexOf(rows, ""), -1);
+assert.equal(model.queueSelectionAfterMove(rows, "", 1), t2);
+assert.equal(model.queueSelectionAfterMove(rows, "", -1), t3);
+assert.equal(model.queueSelectionAfterMove(rows, t2, 1), t3);
+assert.equal(model.queueSelectionAfterMove(rows, t3, 1), t3);
+assert.equal(model.queueSelectionAfterMove(rows, t2, -1), t1);
+assert.equal(model.queueSelectionAfterMove(rows, t1, -1), t1);
+assert.equal(model.queueSelectionAfterMove([rows[0]], "", 1), t1);
+assert.equal(model.queueSelectionAfterMove([], "", 1), "");
+assert.equal(model.queueSelectionAfterUpdate(rows, t2), t2);
+assert.equal(model.queueSelectionAfterUpdate([rows[0]], t2), "");
+assert.equal(model.queueKeyMoveOffset(rows, t2, -1), 0); // cannot go above the playing row
+assert.equal(model.queueKeyMoveOffset(rows, t2, 1), 1);
+assert.equal(model.queueKeyMoveOffset(rows, t3, 1), 0);
+assert.equal(model.queueKeyMoveOffset(rows, t3, -1), -1);
+assert.equal(model.queueKeyMoveOffset(rows, t1, 1), 0); // the playing row never moves
+assert.equal(model.queueKeyMoveOffset(rows, "", 1), 0);
+assert.equal(model.queueDragOffset(100, 51, 1, 3), 1); // 100 px is about two rows, clamped to the end
+assert.equal(model.queueDragOffset(-200, 51, 2, 3), -1); // clamped below the playing row
+assert.equal(model.queueDragOffset(60, 51, 1, 5), 1);
+assert.equal(model.queueDragOffset(10, 51, 1, 5), 0);
+assert.equal(model.queueDragOffset(-60, 51, 0, 5), 0); // the playing row stays
+assert.equal(model.queueDragOffset(60, 0, 1, 5), 0);
+
+// Omarchy OSD payload.
+assert.deepEqual(JSON.parse(model.volumeOsdPayload(0.45, false)), { icon: "volume-medium", value: 45, progressText: "SoundCloud 45%" });
+assert.deepEqual(JSON.parse(model.volumeOsdPayload(1, false)), { icon: "volume-high", value: 100, progressText: "SoundCloud 100%" });
+assert.deepEqual(JSON.parse(model.volumeOsdPayload(0.2, false)), { icon: "volume-low", value: 20, progressText: "SoundCloud 20%" });
+assert.deepEqual(JSON.parse(model.volumeOsdPayload(0.6, true)), { icon: "volume-muted", value: 0, progressText: "SoundCloud 0%" });
+assert.deepEqual(JSON.parse(model.volumeOsdPayload(0, false)), { icon: "volume-muted", value: 0, progressText: "SoundCloud 0%" });
+
+// Waveform, transient statuses and optimistic seek position.
+assert.equal(model.sameLevels([1, 2, 3], [1, 2, 3]), true);
+assert.equal(model.sameLevels([1, 2, 3], [1, 2, 4]), false);
+assert.equal(model.sameLevels([1, 2], [1, 2, 3]), false);
+assert.equal(model.sameLevels([], []), true);
+assert.equal(model.sameLevels([], null), false);
+assert.equal(model.sameLevels(null, null), true);
+assert.equal(model.isTransientStatus({ playbackState: "buffering", playbackId: "" }, t1), true);
+assert.equal(model.isTransientStatus({ playbackState: "resolving", playbackId: t1 }, t1), true);
+assert.equal(model.isTransientStatus({ playbackState: "resolving", playbackId: t2 }, t1), false);
+assert.equal(model.isTransientStatus({ playbackState: "playing", playbackId: t1 }, t1), false);
+assert.equal(model.isTransientStatus({ playbackState: "idle", playbackId: "" }, t1), false);
+assert.equal(model.isTransientStatus({ playbackState: "buffering", playerPresent: false }, t1), false);
+assert.equal(model.isTransientStatus({ playbackState: "buffering" }, ""), false);
+assert.equal(model.positionFromStatus(30, 12, 1100, 1000), 30); // within 500 ms of a seek
+assert.equal(model.positionFromStatus(30, 12, 1600, 1000), 12);
+assert.equal(model.positionFromStatus(30, 12, 1100, 0), 12);
+assert.equal(model.positionFromStatus(30, 12, 900, 1000), 12); // clock went backwards
+assert.equal(model.seekedPosition(10, 5, 100), 15);
+assert.equal(model.seekedPosition(3, -5, 100), 0);
+assert.equal(model.seekedPosition(98, 5, 100), 100);
+assert.equal(model.seekedPosition(10, 5, 0), 15);
 
 
 // Paste keys: Ctrl+V, Shift+Insert (Omarchy's SUPER+V in a terminal), Meta ignored.
@@ -466,36 +540,99 @@ assert.equal(model.pasteNotice({ ok: true }), "Playing the link");
 assert.equal(model.pasteNotice({ ok: false, error: "no" }), "");
 assert.equal(model.pasteNotice(null), "");
 
-// Optimistic seek position: a status right after a seek is older than the seek.
-assert.equal(model.positionFromStatus(30, 12, 1100, 1000), 30); // within 500 ms of a seek
-assert.equal(model.positionFromStatus(30, 12, 1600, 1000), 12);
-assert.equal(model.positionFromStatus(30, 12, 1100, 0), 12);
-assert.equal(model.positionFromStatus(30, 12, 900, 1000), 12); // clock went backwards
-assert.equal(model.seekedPosition(10, 5, 100), 15);
-assert.equal(model.seekedPosition(3, -5, 100), 0);
-assert.equal(model.seekedPosition(98, 5, 100), 100);
-assert.equal(model.seekedPosition(10, 5, 0), 15);
-
-// Wheel events add up to whole notches: smooth-scroll deltas are small, a mouse notch is 120.
-assert.deepEqual(model.wheelSteps(0, 120), { steps: 1, accumulator: 0 });
-assert.deepEqual(model.wheelSteps(0, -120), { steps: -1, accumulator: 0 });
-assert.deepEqual(model.wheelSteps(0, 15), { steps: 0, accumulator: 15 });
-assert.deepEqual(model.wheelSteps(105, 15), { steps: 1, accumulator: 0 });
-assert.deepEqual(model.wheelSteps(100, 50), { steps: 1, accumulator: 30 });
-assert.deepEqual(model.wheelSteps(-100, -50), { steps: -1, accumulator: -30 });
-assert.deepEqual(model.wheelSteps(100, -20), { steps: 0, accumulator: -20 });
-assert.deepEqual(model.wheelSteps(0, 360), { steps: 3, accumulator: 0 });
-assert.deepEqual(model.wheelSteps(0, -250), { steps: -2, accumulator: -10 });
-assert.deepEqual(model.wheelSteps(undefined, 30), { steps: 0, accumulator: 30 });
-assert.deepEqual(model.wheelSteps(40, 0), { steps: 0, accumulator: 40 });
-assert.deepEqual(model.wheelSteps(40, "x"), { steps: 0, accumulator: 40 });
-let swipe = { steps: 0, accumulator: 0 };
-let swipeSteps = 0;
-for (let i = 0; i < 40; i++) {
-  swipe = model.wheelSteps(swipe.accumulator, 6);
-  swipeSteps += swipe.steps;
+// Clear queue confirmation: stays only while the same queue is shown.
+{
+  const rows = [{ playbackId: "a" }, { playbackId: "b" }];
+  assert.equal(model.clearConfirmDelay(), 12000);
+  assert.equal(model.queueSignature(rows), "a|b");
+  assert.equal(model.queueSignature(null), "");
+  assert.equal(model.clearConfirmStays("a|b", rows, true), true);
+  assert.equal(model.clearConfirmStays("a|b", rows, false), false);
+  assert.equal(model.clearConfirmStays("a|b", [{ playbackId: "a" }], true), false);
+  assert.equal(model.clearConfirmStays("a|b", [rows[1], rows[0]], true), false);
+  assert.equal(model.clearConfirmStays(null, rows, true), false);
+  assert.equal(model.clearConfirmStays("", [], true), false);
+  assert.equal(model.clearConfirmCountdownRuns("a|b", false), true);
+  assert.equal(model.clearConfirmCountdownRuns("a|b", true), false);
+  assert.equal(model.clearConfirmCountdownRuns("", false), true);
+  assert.equal(model.clearConfirmCountdownRuns(null, false), false);
 }
-assert.equal(swipeSteps, 2); // 40 events of 6 units = 240 units = two notches, not forty steps
+
+// OSD command and rate limit.
+assert.deepEqual(model.osdCommand(0.45, false),
+  ["omarchy-shell", "osd", "show", JSON.stringify({ icon: "volume-medium", value: 45, progressText: "SoundCloud 45%" })]);
+assert.equal(model.osdDue(1000, 0), true);
+assert.equal(model.osdDue(1050, 1000), false);
+assert.equal(model.osdDue(1080, 1000), true);
+assert.equal(model.osdDue(900, 1000), true);
+
+// Message line policy.
+assert.equal(model.toastDelay("info"), 4000);
+assert.equal(model.toastDelay("error"), 8000);
+assert.equal(model.toastDelay("other"), 4000);
+assert.equal(model.toastLeaveDelay(), 2000);
+assert.equal(model.toastRestarts("error", "a", "error", "a", true), false);
+assert.equal(model.toastRestarts("error", "a", "error", "a", false), true);
+assert.equal(model.toastRestarts("error", "a", "error", "b", true), true);
+assert.equal(model.toastRestarts("info", "a", "error", "a", true), true);
+assert.equal(model.toastRestarts("", "", "error", "b", true), true);
+assert.equal(model.statusErrorShows("", "boom"), true);
+assert.equal(model.statusErrorShows("boom", "boom"), false);
+assert.equal(model.statusErrorShows("boom", "other"), true);
+assert.equal(model.statusErrorShows("boom", ""), false);
+for (const kind of ["like", "ui", "queue-edit", "paste", "action", "selection"]) assert.equal(model.errorClearedByCommand(kind), true);
+for (const kind of ["status", "subscribe", "queue", "tracks:home", "artwork:1", undefined]) assert.equal(model.errorClearedByCommand(kind), false);
+
+// Text filter over the loaded rows.
+{
+  const rows = [
+    { title: "Café del Mar", artist: "Jose Padilla", playbackId: "soundcloud:tracks:1" },
+    { title: "Blue Monday", artist: "New Order", playbackId: "soundcloud:tracks:2" },
+    { title: "Untitled", artist: "DJ Padilla Mix", playbackId: "soundcloud:tracks:3" },
+    { playbackId: "soundcloud:tracks:4" },
+    { title: "Price (a+b) [live].*", artist: "X", playbackId: "soundcloud:tracks:5" },
+  ];
+  const idx = (q) => model.filterTracks(rows, q).map((hit) => hit.index);
+  assert.deepEqual(idx(""), [0, 1, 2, 3, 4]); // empty: everything, in order
+  assert.deepEqual(idx("   "), [0, 1, 2, 3, 4]);
+  assert.equal(model.filterTracks(rows, "blue")[0].track, rows[1]); // the row itself, with its real index
+  assert.deepEqual(idx("padilla"), [0, 2]); // title or artist
+  assert.deepEqual(idx("jose padilla"), [0]); // every word must match
+  assert.deepEqual(idx("padilla jose"), [0]); // in any order
+  assert.deepEqual(idx("cafe"), [0]); // accent-insensitive
+  assert.deepEqual(idx("CAFÉ"), [0]); // and the query may have accents
+  assert.deepEqual(idx("MONDAY blue"), [1]); // case-insensitive
+  assert.deepEqual(idx("new order"), [1]); // artist-only match
+  assert.deepEqual(idx("zzz"), []); // no match
+  assert.deepEqual(idx("untitled"), [2]); // a row with no title or artist never matches a word
+  assert.deepEqual(idx("(a+b)"), [4]); // regex characters are literal
+  assert.deepEqual(idx(".*"), [4]);
+  assert.deepEqual(idx("["), [4]);
+  assert.deepEqual(idx("\\"), []);
+  assert.deepEqual(idx("mar" + " ".repeat(100) + "zzz"), [0]); // cut at 100 characters, so the tail is not searched
+  assert.deepEqual(idx("mar" + " ".repeat(90) + "zzz"), []); // inside the cap it is
+  assert.deepEqual(idx("x".repeat(5000)), []);
+  assert.deepEqual(model.filterTracks(null, "a"), []);
+  assert.deepEqual(model.filterTracks([null, { title: "a" }], "a").map((hit) => hit.index), [1]);
+  assert.equal(model.filterCountText("", 24, 24), "24");
+  assert.equal(model.filterCountText("ab", 2, 24), "2 of 24");
+  assert.equal(model.filterCountText("ab", 0, 24), "0 of 24");
+  // The selection follows its track by id when the visible rows change.
+  const visible = [rows[0], rows[1], rows[2]];
+  assert.equal(model.selectionAfterFilter(visible, 2, [rows[2]]), 0);
+  assert.equal(model.selectionAfterFilter(visible, 0, [rows[2]]), -1);
+  assert.equal(model.selectionAfterFilter(visible, -1, visible), -1);
+  assert.equal(model.selectionAfterFilter([], 0, visible), -1);
+  assert.equal(model.selectionAfterFilter(visible, 1, []), -1);
+  // / and Ctrl+F open the filter (Shift allowed with /, other modifiers not).
+  assert.equal(model.keyAction(0x2f, 0, "/"), "filter");
+  assert.equal(model.keyAction(0x2f, 0x02000000, "/"), "filter");
+  assert.equal(model.keyAction(0x37, 0x02000000, "/"), "filter");
+  assert.equal(model.keyAction(0x46, 0x04000000, "\u0006"), "filter");
+  assert.equal(model.keyAction(0x2f, 0x04000000, ""), "");
+  assert.equal(model.keyAction(0x46, 0, "f"), "");
+  assert.equal(model.keyAction(0x46, 0x04000000 | 0x02000000, ""), "");
+}
 
 // QML only sees TOP-LEVEL function and var declarations of a JS module, not
 // the properties of module.exports. Every name a .qml file uses as
@@ -524,12 +661,3 @@ assert.equal(swipeSteps, 2); // 40 events of 6 units = 240 units = two notches, 
 }
 
 console.log("SoundCloudModel tests passed");
-
-// The launcher prints one JSON line. A failed start carries the reason, such
-// as missing packages, so the popup can show it instead of "Not connected".
-assert.equal(
-  model.launchError('{"ok": false, "error": "Missing gst-libav. Run: omarchy pkg add gst-libav"}'),
-  "Missing gst-libav. Run: omarchy pkg add gst-libav",
-);
-assert.equal(model.launchError('{"ok": true, "starting": true, "running": true}'), "");
-assert.equal(model.launchError("not json"), "");

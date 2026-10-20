@@ -13,34 +13,24 @@ without official SoundCloud API credentials.
 - Current track, artist, and artwork, with the bar icon highlighted during playback
 - Play/pause, previous, and next controls, with a play queue that continues with the
   next track and survives a restart
-- Media keys, `playerctl` and the shell's media display work: the backend shows up on the
-  session bus as an MPRIS player named SoundCloud, with the title, artist, cover and position,
-  and play, pause, next, previous, seek, volume, repeat and shuffle
-- Earbuds that only send play/pause: a second press within 0.7 s skips to the next track and
-  a third to the one before. It is on by default; the popup has no switch for it, the backend
-  takes `multipress:on` and `multipress:off` on its socket
-- Volume icon in the popup: click to mute, scroll over it or hover for a slider to
-  change the level. The player's own volume (not the system volume) is saved between sessions
+- Volume icon: click to mute, scroll over it to change the level (the percentage
+  shows briefly; over the bar icon Omarchy's volume display appears)
 - Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and
   Shift+Tab switch tabs, Space plays or pauses, Left/Right seek, PageDown or
   Shift+Right next, PageUp or Shift+Left previous, Shift+Up/Down volume, l like,
   Shift+L repeat, Shift+S shuffle, m mute, q queue, Alt+Up/Down move a queue row,
-  Ctrl+V add a copied SoundCloud link as play next, Ctrl+Shift+V play it now, Esc close
-- Queue button (the last stop of the tab row, with a badge counting the tracks still to
-  come): shows the playing track and what follows, each row marked "added by you" when you
-  queued it. Click a row, or select it and press Enter, to play it, or take it out of
-  the queue with the cross. Drag the handle (or press Alt+Up/Down on the selected row) to
-  reorder; the playing track stays first. A slim toolbar has shuffle, repeat and Clear, which
-  asks for a confirmation first. The Autoplay switch in the toolbar (on by default) keeps
-  playing when the queue ends: related tracks from SoundCloud are added, marked "related".
-  The bell switch next to it (on by default) shows a "Now playing" notification with the title
-  and artist each time a new track starts, not for a restart, a replay or a resume after
-  a restart. Tab and Shift+Tab reach it after History
-- Link in the clipboard while the popup is open: Ctrl+V (or SUPER+V, Shift+Insert in a
-  terminal) adds it as play next, Ctrl+Shift+V plays it now; the popup names the track
-  it queued
-- Hover a track in a list for a menu: play, play next, add to queue. Tracks that only
-  offer an encrypted stream are dimmed with a lock
+  Ctrl+V add a copied SoundCloud link as play next, Ctrl+Shift+V play it now,
+  `/` or Ctrl+F filters the list, Esc close (in the filter field: clear, then close it)
+- Filter (magnifier in the tab row): type to narrow the loaded tracks of the
+  current tab by title or artist (every word must match, case and accents ignored).
+  It only searches what is already loaded and makes no request
+- Queue button: shows the current track and what follows. Click a row to play it,
+  drag the handle to reorder, remove or clear, and a slim toolbar with shuffle,
+  repeat, an Autoplay station switch (related tracks when the queue ends) and a
+  switch for a notification on each track change
+- Hover a track in a list for a menu: play, play next, add to queue. Tracks that
+  only offer an encrypted stream are dimmed with a lock
+- Click the cover to open the track on SoundCloud; long titles scroll
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
@@ -48,7 +38,7 @@ without official SoundCloud API credentials.
   History also lists what you play here, because SoundCloud does not record it
 - Play any SoundCloud track link from the clipboard with a key binding, with a
   notification naming the track
-- Library arrow at the end of the tab row that opens your SoundCloud Library in the browser
+- Library link that opens your SoundCloud Library in the browser
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
@@ -204,8 +194,6 @@ not require another sign-in:
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached track lists (Home, Feed, Likes, History, and the tracks you
   played here), with titles, artists, and links
-- `settings.json`: the volume level, whether it is muted, whether Autoplay is on, whether
-  track notifications are on and whether earbud multi-press is on
 - `queue.json`: the play queue (titles, artists, links), its repeat and shuffle
   settings, and where you stopped in the current track
 
@@ -230,9 +218,9 @@ local GStreamer player. These private API schemas can change without notice.
 
 - **History** shows what SoundCloud recorded, plus the last 50 tracks you played in this
   plugin. In testing, SoundCloud's history did not include tracks played here, so the plugin
-  keeps its own list and merges it with SoundCloud's by play time, newest first.
-- Some tracks, mostly ad-supported ones, only offer encrypted streams. The plugin cannot
-  play those, so selecting one shows an error.
+  keeps its own list and shows it first. Plays made elsewhere afterwards appear below it.
+- Some tracks, such as many ad-supported ones, only offer DRM-encrypted streams. The plugin
+  cannot play those, so selecting one shows an error.
 
 ## How it works
 
@@ -250,7 +238,7 @@ widget talks to the backend over a private Unix socket.
   (`/users/{id}/track_likes` and `/me/play-history/tracks`) with the session token, a
   page at a time (24), and cached like the other lists. SoundCloud does not record plays
   from this player, so the plugin keeps its own list of the last 50 tracks it played and
-  merges them into SoundCloud's history by play time. The hidden page is kept on Home or Feed
+  shows them in front of SoundCloud's history. The hidden page is kept on Home or Feed
   while they are open, because playing a track needs the request context the page records
   there.
 - Pasted links are resolved with SoundCloud's `/resolve` API, only for soundcloud.com
@@ -269,11 +257,6 @@ widget talks to the backend over a private Unix socket.
   and shuffle settings, and the playback position are saved in
   `~/.local/share/omarchy-soundcloud/queue.json`; after a restart the last track
   shows as paused where you left it, and play resumes from there.
-- When the last queued track ends and Autoplay is on, the backend asks SoundCloud's
-  `/tracks/{id}/related` endpoint (with the signed-in session token) for tracks like the one
-  that just played, adds the playable ones to the queue and goes on with the first. Tracks
-  already in the queue and encrypted ones are left out; if the request fails the queue
-  simply ends.
 - Play/pause and seek control GStreamer when it is playing. Otherwise they control
   SoundCloud's own web player. Previous and next never touch it.
 - On Hyprland the backend sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` to avoid
@@ -329,27 +312,28 @@ The widget appears in the right section of the top bar, immediately before the s
 
 ## Development
 
-Run every check with one command, from any directory:
-
 ```sh
-scripts/verify.sh
+scripts/verify.sh          # python, node, Qt Quick and manifest/QML checks; no desktop, no network
+scripts/verify.sh --ui     # also the popup smoke test (opens the real popup)
+scripts/verify.sh --live   # also read-only calls to SoundCloud's private API
 ```
 
-It runs the Python and Node tests, `omarchy plugin validate .`, a QML syntax
-check of every `.qml` file (`qmllint`, errors only) and the Qt Quick tests in
-`tests/qml/`. It prints a PASS, FAIL or SKIP line per step (a missing `omarchy`,
-`qmllint` or `qmltestrunner` is skipped) and exits non-zero if a step fails.
-To run a single suite:
+Every step prints PASS, FAIL or SKIP; a missing optional tool is a SKIP with the reason.
+The Python tests need `node`, which runs the injected page scripts, but no GTK or display.
+The Qt Quick tests need `qmltestrunner` and the manifest check needs `omarchy`.
 
-```sh
-python3 -m unittest tests/test_soundcloud_app.py -v
-node tests/test_soundcloud_model.js
-omarchy plugin validate .
-QT_QPA_PLATFORM=offscreen qmltestrunner -input tests/qml
-```
-
-The Python tests need `node`, which runs the injected page scripts. They do not
-need GTK or a display.
+- `--ui` (`scripts/ui-smoke.sh`) needs a running Omarchy shell, a signed-in backend with a
+  track loaded, and `grim`, `wtype`, `tesseract` and `hyprctl`. It takes the keyboard for
+  about 20 s, never sends Enter or media keys, restores the playback state, and is safe to
+  skip: on a machine that cannot run it, it prints SKIP and exits 0. `--playback` adds
+  pause, seek and mute checks.
+- `--live` (`scripts/api-contract.py`) needs a signed-in session and network; it names the
+  endpoint when SoundCloud changes an interface.
+- Screen geometry is measured once by `scripts/calibrate.sh` and saved in
+  `~/.config/omarchy-soundcloud/test-config.json` (display facts only, outside the repo).
+  The UI scripts re-measure by themselves when monitors, scale or bar position change.
+- `scripts/screenshots.sh [dir] [--blur-avatar]` takes popup screenshots (ImageMagick for
+  the blur); `scripts/chaos-network.sh --yes` is an opt-in test that cuts the Wi-Fi.
 
 - QML changes take effect after `omarchy-restart-shell`.
 - Python changes take effect after `python3 soundcloud_app.py stop` and relaunching

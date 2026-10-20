@@ -1,13 +1,13 @@
 import QtQuick
 import "SoundCloudModel.js" as SoundCloudModel
 
-// Turns wheel and two-finger swipes over its area into volume steps. It is a
+// Turns wheel and touchpad swipes over its area into volume steps. It is a
 // transparent overlay: place it on top of the icon, clicks still reach what is
-// below. Events add up (a swipe sends many small ones, a mouse notch is 120
+// below. Events add up (a touchpad sends many small ones, a mouse notch is 120
 // units) and every full notch emits stepped(+1 or -1); the total is dropped
 // after a short idle. It uses a MouseArea wheel handler, the same path the
-// bar icon uses, because a WheelHandler inside the popup never fired for
-// swipes. No Quickshell imports so it can be tested with Qt Quick Test.
+// bar icon uses, because a WheelHandler inside the popup never fired for the
+// owner's touchpad. No Quickshell imports so it can be tested with Qt Quick Test.
 MouseArea {
   id: root
 

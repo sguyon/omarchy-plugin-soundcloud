@@ -34,6 +34,97 @@ TestCase {
     }
   }
 
+  // The popup layout: a full-size VolumeControl underlay (z: -1) below the
+  // content, a plain click target (a button) and a list with ListWheelScroll.
+  Component {
+    id: popupFactory
+    Item {
+      width: 200
+      height: 200
+      property alias list: list
+      property alias scroll: scroll
+      VolumeControl {
+        anchors.fill: parent
+        z: -1
+        onStepped: function(direction) { testCase.steps.push(direction) }
+      }
+      Column {
+        anchors.fill: parent
+        MouseArea {
+          width: 200
+          height: 40
+          onClicked: testCase.clicks++
+        }
+        Item {
+          width: 200
+          height: 100
+          Flickable {
+            id: list
+            anchors.fill: parent
+            contentHeight: 100
+            clip: true
+          }
+          ListWheelScroll {
+            id: scroll
+            anchors.fill: list
+            view: list
+          }
+        }
+      }
+    }
+  }
+
+  function makePopup(listContentHeight) {
+    steps = []
+    clicks = 0
+    var item = createTemporaryObject(popupFactory, testCase)
+    verify(item !== null)
+    item.list.contentHeight = listContentHeight
+    return item
+  }
+
+  function test_underlay_wheel_over_empty_area_steps_the_volume() {
+    var item = makePopup(1000)
+    mouseWheel(item, 100, 170, 0, 120)
+    compare(steps, [1])
+    mouseWheel(item, 100, 170, 0, -120)
+    compare(steps, [1, -1])
+  }
+
+  function test_underlay_wheel_over_a_click_target_steps_the_volume() {
+    var item = makePopup(1000)
+    mouseWheel(item, 100, 20, 0, 120)
+    compare(steps, [1])
+    mouseClick(item, 100, 20)
+    compare(clicks, 1)
+  }
+
+  function test_underlay_wheel_over_a_list_scrolls_it_and_not_the_volume() {
+    var item = makePopup(1000)
+    mouseWheel(item, 100, 90, 0, -120)
+    compare(steps.length, 0)
+    verify(item.list.contentY > 0)
+  }
+
+  function test_underlay_list_at_its_end_keeps_the_wheel() {
+    var item = makePopup(1000)
+    // At the top, scrolling up has nowhere to go; the volume must not move.
+    mouseWheel(item, 100, 90, 0, 120)
+    compare(item.list.contentY, 0)
+    compare(steps.length, 0)
+    // At the bottom, scrolling down likewise.
+    item.list.contentY = item.list.contentHeight - item.list.height
+    mouseWheel(item, 100, 90, 0, -120)
+    compare(steps.length, 0)
+  }
+
+  function test_underlay_list_that_does_not_scroll_keeps_the_wheel() {
+    var item = makePopup(50)
+    mouseWheel(item, 100, 90, 0, 120)
+    mouseWheel(item, 100, 90, 0, -120)
+    compare(steps.length, 0)
+  }
+
   function make() {
     steps = []
     clicks = 0

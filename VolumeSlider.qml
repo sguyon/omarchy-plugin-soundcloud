@@ -6,7 +6,8 @@ import "SoundCloudModel.js" as SoundCloudModel
 // it jumps there; dragging emits moved(value) at most once per throttleMs, plus
 // one last time on release, then committed(). While dragging the handle follows
 // the pointer and ignores `value` (the status would fight it); otherwise it
-// follows `value`. No Quickshell imports so it can be tested with Qt Quick Test.
+// follows `value`. No Quickshell
+// imports so it can be tested with Qt Quick Test.
 Item {
   id: root
 
@@ -81,11 +82,9 @@ Item {
     }
   }
 
-  MouseArea {
+  Interactive {
     id: area
     anchors.fill: parent
-    hoverEnabled: true
-    cursorShape: Qt.PointingHandCursor
     preventStealing: true
 
     function level(x) {

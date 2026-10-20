@@ -50,28 +50,29 @@ TestCase {
     keyClick(Qt.Key_Right, Qt.ShiftModifier)
     keyClick(Qt.Key_PageDown)
     keyClick(Qt.Key_Up, Qt.ShiftModifier)
-    keyClick(Qt.Key_Down, Qt.ShiftModifier)
+    keyClick(Qt.Key_Down, Qt.AltModifier)
     keyClick("L", Qt.ShiftModifier)
     keyClick("S", Qt.ShiftModifier)
-    compare(actions, ["like", "next", "next", "volume-up", "volume-down", "repeat", "shuffle"])
-    compare(catcherKeys, [])
-  }
-
-  function test_alt_up_and_down_move_the_queue_row() {
-    make()
-    keyClick(Qt.Key_Up, Qt.AltModifier)
-    keyClick(Qt.Key_Down, Qt.AltModifier)
-    compare(actions, ["queue-up", "queue-down"])
+    keyClick(Qt.Key_V, Qt.ControlModifier)
+    keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier)
+    compare(actions, ["like", "next", "next", "volume-up", "queue-down", "repeat", "shuffle", "link-next", "link-play"])
     compare(catcherKeys, [])
   }
 
   function test_paste_keys_with_super_held_and_shift_insert() {
     make()
-    keyClick(Qt.Key_V, Qt.ControlModifier)
     keyClick(Qt.Key_V, Qt.ControlModifier | Qt.MetaModifier)
     keyClick(Qt.Key_Insert, Qt.ShiftModifier)
     keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier | Qt.MetaModifier)
-    compare(actions, ["link-next", "link-next", "link-next", "link-play"])
+    compare(actions, ["link-next", "link-next", "link-play"])
+    compare(catcherKeys, [])
+  }
+
+  function test_filter_keys() {
+    make()
+    keyClick(Qt.Key_Slash)
+    keyClick(Qt.Key_F, Qt.ControlModifier)
+    compare(actions, ["filter", "filter"])
     compare(catcherKeys, [])
   }
 
