@@ -21,6 +21,7 @@ import os
 import pwd
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import ssl
@@ -4358,6 +4359,75 @@ def launch_backend(show: bool) -> dict[str, object]:
     return {"ok": True, "starting": True, "running": True}
 
 
+def wait_for_backend(timeout: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if request_backend("status", timeout=1.0) is not None:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def wait_for_playback(timeout: float = 12.0) -> dict[str, object]:
+    """The backend status once a track is playing or has failed, or the last status on timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        state = request_backend("status", timeout=4.0) or {}
+        if state.get("playing") or state.get("playbackState") == "error" or time.monotonic() >= deadline:
+            return state
+        time.sleep(0.4)
+
+
+def send_desktop_notification(message: str) -> None:
+    notifier = "/usr/bin/notify-send"
+    if os.access(notifier, os.X_OK):
+        # Track titles come from SoundCloud and some daemons render markup, so escape it.
+        safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        subprocess.run(
+            [notifier, "--app-name=SoundCloud", "--expire-time=4000", "SoundCloud", safe], check=False
+        )
+
+
+def open_popup() -> None:
+    shell = shutil.which("omarchy-shell")
+    if shell:
+        subprocess.run([shell, "shell", "summon", "brunosilveira.soundcloud"], check=False)
+
+
+def play_url_command(text: str, notify: bool, show: bool = False) -> int:
+    """Play a pasted SoundCloud track link, starting the backend if needed."""
+    def fail(message: str) -> int:
+        print(json.dumps({"ok": False, "error": message}, sort_keys=True))
+        if notify:
+            send_desktop_notification(message)
+        return 1
+
+    try:
+        _kind, link = parse_track_link(text)
+    except LinkError as error:
+        return fail(str(error))
+    if notify and request_backend("status", timeout=0.8) is None:
+        send_desktop_notification("Starting SoundCloud…")
+    if not launch_backend(show=False).get("running") or not wait_for_backend():
+        return fail("The SoundCloud backend didn't start")
+    response = request_backend("play-url:" + link, timeout=40.0)
+    if response is None:
+        return fail("The SoundCloud backend didn't answer")
+    if response.get("ok"):
+        state = wait_for_playback()
+        if state.get("playbackState") == "error":
+            return fail(CANT_PLAY_MESSAGE)
+        print(json.dumps(response, sort_keys=True))
+        if notify:
+            label = " — ".join(str(state[key]) for key in ("title", "artist") if state.get(key))
+            prefix = "Playing" if state.get("playing") else "Loading"
+            send_desktop_notification(f"{prefix}: {label}" if label else prefix)
+        if show:
+            open_popup()
+        return 0
+    return fail(str(response.get("error") or CANT_PLAY_MESSAGE))
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SoundCloud backend for the Omarchy bar")
     subparsers = parser.add_subparsers(dest="command")
@@ -4368,6 +4438,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     seek.add_argument("ratio", type=float)
     play = subparsers.add_parser("play")
     play.add_argument("playback_id")
+    play_url = subparsers.add_parser("play-url", help="play a SoundCloud track link")
+    play_url.add_argument("--notify", action="store_true", help="show what is playing, or what went wrong, as a desktop notification")
+    play_url.add_argument("--open", action="store_true", help="open the bar popup once the track starts")
+    play_url.add_argument("url")
     subparsers.add_parser("launch")
     subparsers.add_parser("ensure")
     for action in ("status", "play-pause", "next", "previous", "home", "likes", "feed", "show", "stop"):
@@ -4387,6 +4461,8 @@ def main(argv: list[str] | None = None) -> int:
         result = launch_backend(show=command == "launch")
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("running") else 1
+    if command == "play-url":
+        return play_url_command(args.url, args.notify, args.open)
     if command != "daemon":
         if command == "seek":
             if not math.isfinite(args.ratio):

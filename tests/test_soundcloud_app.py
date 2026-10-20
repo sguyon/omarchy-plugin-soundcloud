@@ -2234,6 +2234,171 @@ class ResolveLinkTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class PlayUrlCommandTest(unittest.TestCase):
+    def run_cli(self, argv, *, backend_running=True, responses=None, playback=None):
+        app = load_module()
+        sent, notices, popups = [], [], []
+
+        def request_backend(command, timeout=4.0):
+            if not backend_running:
+                return None
+            if command == "status":
+                return {"ok": True, "title": "Song 7", "artist": "Artist"}
+            sent.append(command)
+            return responses or {"ok": True, "running": True}
+
+        app.launch_backend = lambda show: {"running": backend_running}
+        app.wait_for_backend = lambda timeout=20.0: backend_running
+        app.request_backend = request_backend
+        app.send_desktop_notification = notices.append
+        app.open_popup = lambda: popups.append(True)
+        app.wait_for_playback = lambda timeout=12.0: playback or {
+            "playing": True, "playbackState": "playing", "title": "Song 7", "artist": "Artist"
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = app.main(argv)
+        return code, json.loads(output.getvalue()), sent, notices, popups
+
+    def test_a_good_link_is_normalised_and_sent_to_the_backend(self):
+        code, result, sent, notices, popups = self.run_cli(
+            ["play-url", "https://m.soundcloud.com/artist/song?si=abc"]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(sent, ["play-url:https://soundcloud.com/artist/song"])
+        self.assertEqual((notices, popups), ([], []))
+
+    def test_playback_outcome_decides_the_announcement(self):
+        with self.subTest('notify names the track that started playing'):
+            code, _result, _sent, notices, _popups = self.run_cli(
+                ["play-url", "--notify", "https://soundcloud.com/artist/song"]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(notices, ["Playing: Song 7 — Artist"])
+        with self.subTest('a track that fails to start is reported instead of announced'):
+            code, result, _sent, notices, popups = self.run_cli(
+                ["play-url", "--notify", "--open", "https://soundcloud.com/artist/song"],
+                playback={"playing": False, "playbackState": "error", "title": "Song 7", "artist": "Artist"},
+            )
+
+            self.assertEqual(code, 1)
+            self.assertEqual(result["error"], "SoundCloud can't play that track")
+            self.assertEqual(notices, ["SoundCloud can't play that track"])
+            self.assertEqual(popups, [])
+        with self.subTest('a track that is still loading is not announced as playing'):
+            code, _result, _sent, notices, _popups = self.run_cli(
+                ["play-url", "--notify", "https://soundcloud.com/artist/song"],
+                playback={"playing": False, "playbackState": "resolving", "title": "Song 7", "artist": "Artist"},
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(notices, ["Loading: Song 7 — Artist"])
+
+    def test_waiting_for_playback_stops_at_playing_error_or_timeout(self):
+        app = load_module()
+        states = iter([{"playbackState": "resolving"}, {"playbackState": "resolving"}, {"playing": True}])
+        app.request_backend = lambda command, timeout=4.0: next(states)
+        with mock.patch.object(app.time, "sleep"):
+            self.assertEqual(app.wait_for_playback(), {"playing": True})
+
+        app.request_backend = lambda command, timeout=4.0: {"playbackState": "error"}
+        self.assertEqual(app.wait_for_playback(), {"playbackState": "error"})
+
+        app.request_backend = lambda command, timeout=4.0: {"playbackState": "resolving"}
+        with mock.patch.object(app.time, "sleep"):
+            self.assertEqual(app.wait_for_playback(timeout=0.0), {"playbackState": "resolving"})
+
+    def test_open_shows_the_popup_only_after_the_track_starts(self):
+        *_rest, popups = self.run_cli(["play-url", "--open", "https://soundcloud.com/artist/song"])
+        self.assertEqual(popups, [True])
+
+        *_rest, popups = self.run_cli(
+            ["play-url", "--open", "https://soundcloud.com/artist/song"],
+            responses={"ok": False, "error": "Track not found"},
+        )
+        self.assertEqual(popups, [])
+
+    def test_failures_are_reported_and_notify_only_when_asked(self):
+        with self.subTest('a bad link fails without starting or contacting the backend'):
+            code, result, sent, notices, _popups = self.run_cli(
+                ["play-url", "--notify", "https://example.com/a/b"], backend_running=False
+            )
+
+            self.assertEqual(code, 1)
+            self.assertFalse(result["ok"])
+            self.assertEqual(sent, [])
+            self.assertEqual(notices, ["That isn't a SoundCloud link"])
+        with self.subTest('failures notify only when asked'):
+            quiet = self.run_cli(["play-url", "not a link"])
+            loud = self.run_cli(["play-url", "--notify", "not a link"])
+
+            self.assertEqual(quiet[3], [])
+            self.assertEqual(loud[3], ["That isn't a SoundCloud link"])
+            # A good link stays silent without --notify, too.
+            self.assertEqual(self.run_cli(["play-url", "https://soundcloud.com/artist/song"])[3], [])
+        with self.subTest('backend errors are reported'):
+            code, result, _sent, notices, _popups = self.run_cli(
+                ["play-url", "--notify", "https://soundcloud.com/artist/song"],
+                responses={"ok": False, "running": True, "error": "Track not found. It may be private or deleted"},
+            )
+
+            self.assertEqual(code, 1)
+            self.assertEqual(result["error"], "Track not found. It may be private or deleted")
+            self.assertEqual(notices, ["Track not found. It may be private or deleted"])
+        with self.subTest('a backend that will not start is reported'):
+            code, result, sent, notices, _popups = self.run_cli(
+                ["play-url", "--notify", "https://soundcloud.com/artist/song"], backend_running=False
+            )
+
+            self.assertEqual(code, 1)
+            self.assertEqual(sent, [])
+            # A cold start is announced so the wait is not silent, then the failure is reported.
+            self.assertEqual(notices, ["Starting SoundCloud…", "The SoundCloud backend didn't start"])
+
+    def test_every_cannot_play_path_says_the_same_thing(self):
+        app = load_module()
+        no_text = self.run_cli(
+            ["play-url", "https://soundcloud.com/artist/song"], responses={"ok": False, "running": True}
+        )
+        errored = self.run_cli(
+            ["play-url", "https://soundcloud.com/artist/song"],
+            playback={"playing": False, "playbackState": "error"},
+        )
+        request, _calls = make_resolver({ResolveLinkTest.RESOLVE_SONG: track_payload(7, duration=None)})
+        with self.assertRaises(app.LinkError) as unusable:
+            app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                "https://soundcloud.com/artist/song"
+            )
+
+        self.assertEqual(
+            {no_text[1]["error"], errored[1]["error"], str(unusable.exception)}, {app.CANT_PLAY_MESSAGE}
+        )
+
+    def test_repeated_messages_come_from_one_definition(self):
+        app = load_module()
+
+        for text, message in (
+            ("https://soundcloud.com/artist/sets/mix", app.PLAYLIST_MESSAGE),
+            ("https://soundcloud.com/artist", app.ARTIST_PAGE_MESSAGE),
+            ("https://soundcloud.com/artist/song/extra", app.NOT_A_TRACK_MESSAGE),
+            ("https://example.com/a/b", app.NOT_SOUNDCLOUD_MESSAGE),
+        ):
+            with self.assertRaises(app.LinkError) as raised:
+                app.parse_track_link(text)
+            self.assertEqual(str(raised.exception), message)
+        for kind, message in (("playlist", app.PLAYLIST_MESSAGE), ("user", app.ARTIST_PAGE_MESSAGE),
+                              ("other", app.NOT_A_TRACK_MESSAGE)):
+            request, _calls = make_resolver({ResolveLinkTest.RESOLVE_SONG: {"kind": kind, "id": 1}})
+            with self.assertRaises(app.LinkError) as raised:
+                app.TrackLikes(lambda: "token", None, request=request).resolve_link(
+                    "https://soundcloud.com/artist/song"
+                )
+            self.assertEqual(str(raised.exception), message)
+
+
 class LocalPlayHistoryTest(unittest.TestCase):
     def row(self, number):
         return {"url": f"https://soundcloud.com/artist/song-{number}", "title": f"Song {number}"}

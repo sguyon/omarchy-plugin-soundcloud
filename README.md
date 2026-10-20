@@ -19,6 +19,9 @@ without official SoundCloud API credentials.
 - Home and Feed tabs that load more tracks as you scroll
 - Likes and History tabs for your account, newest first, that load more as you scroll.
   History also lists what you play here, because SoundCloud does not record it
+- Play any SoundCloud track link from the clipboard with a key binding, with a
+  notification naming the track
+- Library link that opens your SoundCloud Library in the browser
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
@@ -36,6 +39,9 @@ Install them if needed:
 ```sh
 omarchy pkg add gst-plugins-good gst-libav
 ```
+
+Playing a link from a key binding also needs `wl-paste` (the `wl-clipboard` package) and
+`notify-send` (`libnotify`). Check with `command -v wl-paste notify-send`.
 
 If a dependency is missing, the popup names the packages to install instead of
 connecting. To verify all runtime dependencies from a terminal:
@@ -57,6 +63,8 @@ from a keybinding or script with:
 omarchy-shell shell toggle brunosilveira.soundcloud
 ```
 
+See [Key bindings](#key-bindings) to put it on a key.
+
 ## First sign-in
 
 1. Click the SoundCloud icon in the top bar.
@@ -77,6 +85,67 @@ keeps running.
 - Popup: artwork, metadata, playback controls, and a seekable waveform
 - Home, Feed, Likes, and History tabs: click a track to play it
 - Library link: opens your SoundCloud Library in the default browser
+
+## Key bindings
+
+The plugin does not add key bindings itself, because Omarchy has no install hook for
+plugins. Add the ones you want to `~/.config/hypr/bindings.lua`. Hyprland reloads on save;
+check for mistakes with `hyprctl configerrors`.
+
+| Action | Command | Example key |
+|---|---|---|
+| Open or close the popup | `omarchy-shell shell toggle brunosilveira.soundcloud` | `SUPER + SHIFT + M` |
+| Play the track link on the clipboard | `soundcloud_app.py play-url --notify "$(wl-paste …)"` | `SUPER + SHIFT + ALT + P` |
+
+The keys are only suggestions. See which are taken with `omarchy menu keybindings --print`.
+If a key is already used, call `hl.unbind` for it before binding it again.
+
+### Open or close the popup
+
+```lua
+-- SUPER+SHIFT+M is Omarchy's default "Music" key, so unbind it first.
+hl.unbind("SUPER + SHIFT + M")
+o.bind("SUPER + SHIFT + M", "SoundCloud", "omarchy-shell shell toggle brunosilveira.soundcloud")
+```
+
+Use `summon` instead of `toggle` to always open the popup, or `hide` to close it.
+
+### Play the link on the clipboard
+
+Copy a track link, for example with "Copy link address" in your browser, then press the key:
+
+```lua
+o.bind("SUPER + SHIFT + ALT + P", "SoundCloud: play link from clipboard",
+  [[python3 -I "$HOME/.config/omarchy/plugins/brunosilveira.soundcloud/soundcloud_app.py" play-url --notify "$(wl-paste --no-newline --type text)"]])
+```
+
+Options for `play-url`:
+
+- `--notify` shows a short notification, because a key binding has no terminal to print to.
+  It names the track ("Playing: title — artist") or says what went wrong. It also says
+  "Starting SoundCloud…" when the backend has to start, which can take a few seconds.
+- `--open` also opens the popup once the track starts. It is off by default so a paste does
+  not cover your screen.
+
+Without either option the command prints JSON and exits non-zero on failure, which suits
+scripts.
+
+## Play a link
+
+Copy a SoundCloud track link, for example with "Copy link address" in your browser, and
+play it in the plugin with:
+
+```sh
+python3 soundcloud_app.py play-url "https://soundcloud.com/artist/track"
+```
+
+To play whatever link is on the clipboard with one key, see [Key bindings](#key-bindings).
+
+Track links work with or without `https://`, with `www.` or `m.`, and with tracking
+parameters such as `?si=`, which are dropped. Private track links with a secret token and
+`on.soundcloud.com` short links work too. Links to artists, playlists, and other
+SoundCloud pages are not supported yet and say so. A track that SoundCloud does not allow
+playing, or that is private or deleted, gives a clear message.
 
 ## Troubleshooting
 
@@ -154,6 +223,8 @@ widget talks to the backend over a private Unix socket.
   merges them into SoundCloud's history by play time. The hidden page is kept on Home or Feed
   while they are open, because playing a track needs the request context the page records
   there.
+- Pasted links are resolved with SoundCloud's `/resolve` API, only for soundcloud.com
+  track pages, and then played like any list track.
 - Home and Feed are built from the SoundCloud page's own API responses and
   paginated through SoundCloud's API cursors. Each list keeps at most 100 tracks
   and is cached so the popup has content right after a restart.
@@ -199,6 +270,7 @@ python3 soundcloud_app.py previous
 python3 soundcloud_app.py next
 python3 soundcloud_app.py seek 0.5     # seek to 50%
 python3 soundcloud_app.py play soundcloud:tracks:123456
+python3 soundcloud_app.py play-url <link> [--notify] [--open]   # play a SoundCloud track link
 python3 soundcloud_app.py show         # show the SoundCloud window
 python3 soundcloud_app.py stop
 ```
