@@ -1945,7 +1945,7 @@ def _queue_status_fields(payload: dict[str, object]) -> dict[str, object]:
 
 
 def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
-    """The optional volume and setting keys of a status payload."""
+    """The optional volume, setting and track link keys of a status payload."""
     fields: dict[str, object] = {}
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
@@ -1953,6 +1953,9 @@ def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
     for key in ("muted",):
         if isinstance(payload.get(key), bool):
             fields[key] = payload[key]
+    if "trackUrl" in payload:
+        track_url = _bounded_string(payload["trackUrl"], MAX_URL_BYTES)
+        fields["trackUrl"] = track_url if track_url and is_soundcloud_uri(track_url) else ""
     return fields
 
 
@@ -4705,13 +4708,16 @@ def build_application(show_on_start: bool = False):
         def _raw_status(self):
             gst_status = self.playback.status()
             saved = self.queue.current
+            track_url = str(self.playback.metadata.get("url", ""))
             if (self.restored_position_ms is not None and saved is not None
                     and not self.playback.active and gst_status["playbackState"] == "idle"):
                 gst_status = restored_status(saved, self.restored_position_ms)
+                track_url = str(saved.get("url", ""))
             status = {
                 **merge_status(self.page_status.values, gst_status),
                 **queue_status(self.queue),
                 **self.playback.volume_status(),
+                "trackUrl": track_url,
             }
             if not status.get("error") and time.monotonic() < self.notice_until:
                 status["error"] = self.notice
@@ -4728,6 +4734,8 @@ def build_application(show_on_start: bool = False):
                 return
             if not (status.get("title") or status.get("artist")):
                 status["title"], status["artist"] = str(row.get("title", "")), str(row.get("artist", ""))
+                if not status.get("trackUrl"):
+                    status["trackUrl"] = str(row.get("url", ""))
 
         def _publish_status(self):
             if not self.status_subscribers:

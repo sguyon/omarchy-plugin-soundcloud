@@ -4517,6 +4517,33 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual((len(self.evaluated), self.application.playback.state), (started, "error"))
         self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
 
+    def test_the_status_carries_the_playing_tracks_page_link(self):
+        self.build()
+        self.fill("home", 2)
+        self.assertEqual(self.application.build_status()["trackUrl"], "")
+
+        self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve()
+
+        self.assertEqual(self.application.build_status()["trackUrl"], "https://soundcloud.com/artist/song-2")
+
+    def test_a_restored_track_has_its_link_too(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n) for n in (1, 2)], 1, "likes")
+        self.build(saved=(queue, 5_000))
+
+        self.assertEqual(self.application.build_status()["trackUrl"], "https://soundcloud.com/artist/song-2")
+
+    # MPRIS wiring
+
+    # earbud multi-press
+
+    class Invocation:
+        def __init__(self): self.result = "pending"
+        def return_value(self, _value): self.result = "ok"
+        def return_dbus_error(self, name, _message): self.result = name
+
+
 class SeekCommandTest(unittest.TestCase):
     """The seek and seek-by socket commands, through the real application class."""
 
@@ -5111,17 +5138,21 @@ class SettingsStatusFieldsTest(unittest.TestCase):
     def test_the_new_keys_pass_when_valid(self):
         app = load_module()
 
-        status = app.validate_status_payload({**self.BASE, "volume": 0.5, "muted": True})
+        status = app.validate_status_payload({
+            **self.BASE, "volume": 0.5, "muted": True, "trackUrl": "https://soundcloud.com/artist/song"})
 
         self.assertEqual((status["volume"], status["muted"]), (0.5, True))
+        self.assertEqual(status["trackUrl"], "https://soundcloud.com/artist/song")
 
-    def test_invalid_values_are_left_out(self):
+    def test_invalid_values_are_left_out_and_a_foreign_track_url_is_emptied(self):
         app = load_module()
 
-        status = app.validate_status_payload({**self.BASE, "volume": 2, "muted": "yes"})
+        status = app.validate_status_payload({
+            **self.BASE, "volume": 2, "muted": "yes", "trackUrl": "https://evil.example/x"})
 
         for key in ("volume", "muted"):
             self.assertNotIn(key, status)
+        self.assertEqual(status["trackUrl"], "")
         self.assertNotIn("volume", app.validate_status_payload({**self.BASE, "volume": float("nan")}))
 
     def test_a_payload_without_the_new_keys_is_unchanged(self):
@@ -5129,7 +5160,7 @@ class SettingsStatusFieldsTest(unittest.TestCase):
 
         status = app.validate_status_payload(self.BASE)
 
-        for key in ("volume", "muted"):
+        for key in ("volume", "muted", "trackUrl"):
             self.assertNotIn(key, status)
 
 
