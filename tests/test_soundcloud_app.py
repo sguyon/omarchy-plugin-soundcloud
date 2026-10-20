@@ -2480,6 +2480,297 @@ class LocalPlayHistoryTest(unittest.TestCase):
         self.assertEqual(set(app.API_LIST_REFRESH_SECONDS), set(app.API_TRACK_LISTS))
 
 
+class PlayQueueTest(unittest.TestCase):
+    def row(self, number):
+        return {
+            "playbackId": f"soundcloud:tracks:{number}",
+            "title": f"Song {number}",
+            "artist": "Artist",
+            "url": f"https://soundcloud.com/artist/song-{number}",
+            "artUrl": "",
+            "playCount": 0,
+            "durationMs": 1000,
+        }
+
+    def queue(self, count=5, index=0, **options):
+        app = load_module()
+        queue = app.PlayQueue(**options)
+        queue.replace([self.row(n) for n in range(1, count + 1)], index, "home")
+        return queue
+
+    def titles(self, rows):
+        return [row["title"] for row in rows]
+
+    def test_replace_sanitizes_clamps_and_caps_the_list(self):
+        with self.subTest('replace puts the cursor on the clicked track'):
+            queue = self.queue(5, index=2)
+
+            self.assertEqual(queue.current["title"], "Song 3")
+            self.assertEqual((queue.cursor, queue.length, queue.source), (2, 5, "home"))
+        with self.subTest('a bad index is clamped and an empty list empties the queue'):
+            queue = self.queue(3, index=99)
+            self.assertEqual(queue.current["title"], "Song 3")
+            queue.replace([self.row(1)], -4, "feed")
+            self.assertEqual(queue.current["title"], "Song 1")
+            queue.replace([], 0, "feed")
+            self.assertIsNone(queue.current)
+            self.assertEqual(queue.length, 0)
+            self.assertIsNone(queue.advance(True))
+            self.assertIsNone(queue.previous(0.0))
+        with self.subTest('replace drops duplicate urls and keeps the clicked track'):
+            app = load_module()
+            queue = app.PlayQueue()
+            rows = [self.row(1), self.row(2), self.row(1), self.row(3), self.row(3)]
+
+            queue.replace(rows, 3, "home")
+
+            self.assertEqual(self.titles(queue.items), ["Song 1", "Song 2", "Song 3"])
+            self.assertEqual(queue.current["title"], "Song 3")
+        with self.subTest('rows without a url are ignored and rows are copied'):
+            app = load_module()
+            queue = app.PlayQueue()
+            mine = self.row(1)
+
+            queue.replace([mine, {"title": "No url"}, "junk", None, {"url": 5}], 0, "home")
+            mine["title"] = "Changed"
+
+            self.assertEqual(self.titles(queue.items), ["Song 1"])
+        with self.subTest('the queue is capped and keeps the clicked track in view'):
+            app = load_module()
+            queue = app.PlayQueue()
+
+            queue.replace([self.row(n) for n in range(1, 301)], 250, "home")
+
+            self.assertEqual(queue.length, app.MAX_TRACKS)
+            self.assertEqual(queue.current["title"], "Song 251")
+
+    def test_next_walks_the_list_and_stops_at_the_end(self):
+        queue = self.queue(3)
+
+        self.assertEqual(queue.advance(True)["title"], "Song 2")
+        self.assertEqual(queue.advance(False)["title"], "Song 3")
+        self.assertIsNone(queue.advance(True))
+        self.assertIsNone(queue.advance(False))
+        self.assertEqual(queue.current["title"], "Song 3")
+        self.assertFalse(queue.can_next)
+
+    def test_play_next_rules(self):
+        with self.subTest('play next items go after the cursor in the order added'):
+            queue = self.queue(3)
+
+            queue.play_next(self.row(10))
+            queue.play_next(self.row(11))
+            order = [queue.advance(True)["title"] for _ in range(4)]
+
+            self.assertEqual(order, ["Song 10", "Song 11", "Song 2", "Song 3"])
+        with self.subTest('play next works on an empty queue and ignores bad rows'):
+            app = load_module()
+            queue = app.PlayQueue()
+
+            queue.play_next({"title": "No url"})
+            self.assertFalse(queue.can_next)
+            queue.play_next(self.row(7))
+
+            self.assertTrue(queue.can_next)
+            self.assertEqual(queue.advance(True)["title"], "Song 7")
+            self.assertEqual(queue.current["title"], "Song 7")
+        with self.subTest('a repeated play next keeps one copy in its first place'):
+            queue = self.queue(2)
+
+            for number in (10, 11, 10):
+                queue.play_next(self.row(number))
+
+            self.assertEqual(self.titles(queue.explicit), ["Song 10", "Song 11"])
+        with self.subTest('a played explicit item is not repeated in the list'):
+            queue = self.queue(4)
+            queue.play_next(self.row(3))
+
+            order = [queue.advance(True)["title"] for _ in range(3)]
+
+            self.assertEqual(order, ["Song 3", "Song 2", "Song 4"])
+            self.assertEqual(self.titles(queue.items), ["Song 1", "Song 3", "Song 2", "Song 4"])
+        with self.subTest('replace keeps the explicit items'):
+            queue = self.queue(3)
+            queue.play_next(self.row(10))
+
+            queue.replace([self.row(20), self.row(21)], 0, "feed")
+
+            self.assertEqual(queue.current["title"], "Song 20")
+            self.assertEqual(self.titles(queue.explicit), ["Song 10"])
+            self.assertEqual(queue.advance(True)["title"], "Song 10")
+            self.assertEqual(queue.advance(True)["title"], "Song 21")
+
+    def test_previous_rules(self):
+        with self.subTest('previous restarts after the threshold and goes back before it'):
+            app = load_module()
+            queue = self.queue(3, index=2)
+
+            self.assertEqual(app.PREVIOUS_RESTART_SECONDS, 3.0)
+            self.assertEqual(queue.previous(app.PREVIOUS_RESTART_SECONDS), "restart")
+            self.assertEqual(queue.previous(10.0), "restart")
+            self.assertEqual(queue.current["title"], "Song 3")
+            self.assertEqual(queue.previous(2.9)["title"], "Song 2")
+            self.assertEqual(queue.current["title"], "Song 2")
+        with self.subTest('previous restarts when there is nothing before'):
+            queue = self.queue(3)
+
+            self.assertEqual(queue.previous(0.0), "restart")
+            self.assertEqual(queue.current["title"], "Song 1")
+            self.assertTrue(queue.can_previous)
+        with self.subTest('previous treats a hostile position as the start'):
+            queue = self.queue(3, index=1)
+
+            for position in (True, "9", None, float("nan"), -5.0):
+                queue.replace([self.row(n) for n in range(1, 4)], 1, "home")
+                self.assertEqual(queue.previous(position)["title"], "Song 1")
+            queue.replace([self.row(n) for n in range(1, 4)], 1, "home")
+            self.assertEqual(queue.previous(float("inf")), "restart")
+        with self.subTest('previous after a play next item returns to the list track'):
+            queue = self.queue(3)
+            queue.play_next(self.row(10))
+            queue.advance(True)
+
+            self.assertEqual(queue.previous(0.0)["title"], "Song 1")
+
+    def test_repeat_modes(self):
+        with self.subTest('repeat one repeats on an automatic end but not on a user next'):
+            queue = self.queue(3, repeat="one")
+
+            self.assertEqual(queue.advance(False)["title"], "Song 1")
+            self.assertEqual(queue.advance(False)["title"], "Song 1")
+            self.assertEqual(queue.advance(True)["title"], "Song 2")
+        with self.subTest('repeat all wraps at the end'):
+            queue = self.queue(2, index=1, repeat="all")
+
+            self.assertTrue(queue.can_next)
+            self.assertEqual(queue.advance(False)["title"], "Song 1")
+            self.assertEqual(queue.advance(True)["title"], "Song 2")
+            self.assertEqual(queue.advance(True)["title"], "Song 1")
+        with self.subTest('repeat none ends and an unknown mode is refused'):
+            queue = self.queue(1)
+
+            self.assertEqual(queue.repeat, "none")
+            self.assertIsNone(queue.advance(False))
+            queue.repeat = "all"
+            queue.repeat = "bogus"
+            self.assertEqual(queue.repeat, "all")
+
+    def test_shuffle_rules(self):
+        with self.subTest('shuffle permutes only the part after the cursor'):
+            import random
+            app = load_module()
+            queue = app.PlayQueue(rng=random.Random(4))
+            queue.replace([self.row(n) for n in range(1, 21)], 5, "home")
+            before = self.titles(queue.items)
+
+            queue.shuffle = True
+
+            after = self.titles(queue.items)
+            self.assertEqual(after[:6], before[:6])
+            self.assertEqual(sorted(after[6:]), sorted(before[6:]))
+            self.assertNotEqual(after[6:], before[6:])
+            self.assertEqual(queue.current["title"], "Song 6")
+        with self.subTest('shuffle uses the injected random source and survives a replace'):
+            app = load_module()
+
+            class Reverse:
+                def shuffle(self, items):
+                    items.reverse()
+
+            queue = app.PlayQueue(rng=Reverse(), shuffle=True)
+            queue.replace([self.row(n) for n in range(1, 6)], 1, "home")
+
+            self.assertEqual(self.titles(queue.items), ["Song 1", "Song 2", "Song 5", "Song 4", "Song 3"])
+            queue.shuffle = False
+            self.assertEqual(queue.length, 5)
+            self.assertFalse(queue.shuffle)
+
+    def test_dead_tracks_are_removed_and_playback_moves_on(self):
+        with self.subTest('a dead track after the cursor is removed'):
+            queue = self.queue(4)
+
+            queue.mark_dead("soundcloud:tracks:3")
+
+            self.assertEqual(self.titles(queue.items), ["Song 1", "Song 2", "Song 4"])
+            self.assertEqual(queue.current["title"], "Song 1")
+        with self.subTest('a dead track before the cursor keeps the current one'):
+            queue = self.queue(4, index=2)
+
+            queue.mark_dead("https://soundcloud.com/artist/song-1")
+
+            self.assertEqual(queue.current["title"], "Song 3")
+            self.assertEqual(queue.cursor, 1)
+        with self.subTest('a dead current track hands over to the next one'):
+            queue = self.queue(3, index=1)
+            queue.play_next(self.row(10))
+
+            self.assertEqual(queue.mark_dead("soundcloud:tracks:2")["title"], "Song 10")
+            self.assertEqual(queue.advance(True)["title"], "Song 3")
+        with self.subTest('a dead last track ends the queue or wraps under repeat all'):
+            queue = self.queue(2, index=1)
+            self.assertIsNone(queue.mark_dead("soundcloud:tracks:2"))
+            self.assertEqual(queue.length, 1)
+
+            queue = self.queue(2, index=1, repeat="all")
+            self.assertEqual(queue.mark_dead("soundcloud:tracks:2")["title"], "Song 1")
+        with self.subTest('a dead explicit item is removed and the last dead track empties the queue'):
+            queue = self.queue(1)
+            queue.play_next(self.row(10))
+
+            queue.mark_dead("soundcloud:tracks:10")
+            self.assertEqual(queue.explicit, [])
+            self.assertIsNone(queue.mark_dead("soundcloud:tracks:1"))
+            self.assertIsNone(queue.current)
+            self.assertEqual((queue.length, queue.cursor), (0, 0))
+            self.assertIsNone(queue.mark_dead("soundcloud:tracks:1"))
+            self.assertIsNone(queue.mark_dead(None))
+
+    def ids(self, rows):
+        return [row["playbackId"].rpartition(":")[2] for row in rows]
+
+    def test_add_last_rules(self):
+        with self.subTest('add last plays after the whole list and after play next items'):
+            queue = self.queue(3)
+
+            self.assertTrue(queue.add_last(self.row(20)))
+            self.assertTrue(queue.add_last(self.row(21)))
+            queue.play_next(self.row(10))
+            order = [queue.advance(True)["title"] for _ in range(5)]
+
+            self.assertEqual(order, ["Song 10", "Song 2", "Song 3", "Song 20", "Song 21"])
+            self.assertEqual(self.titles(queue.items), ["Song 1", "Song 10", "Song 2", "Song 3", "Song 20", "Song 21"])
+            self.assertIsNone(queue.advance(True))
+            self.assertEqual(queue.current["title"], "Song 21")
+        with self.subTest('add last marks its rows and keeps one copy by url'):
+            queue = self.queue(3)
+            queue.play_next(self.row(10))
+
+            self.assertTrue(queue.add_last(self.row(20)))
+            self.assertFalse(queue.add_last(self.row(20)))   # already added
+            self.assertFalse(queue.add_last(self.row(10)))   # waiting as play next
+            self.assertFalse(queue.add_last(self.row(3)))    # coming up in the list
+            self.assertFalse(queue.add_last({"title": "No url"}))
+            self.assertFalse(queue.add_last(None))
+
+            self.assertEqual(self.titles(queue.added), ["Song 20"])
+            self.assertEqual((queue.added[0]["added"], queue.added[0]["explicit"]), (True, True))
+        with self.subTest('add last allows a track that was already played'):
+            queue = self.queue(3, index=1)
+
+            self.assertTrue(queue.add_last(self.row(1)))
+            queue.advance(True)
+
+            self.assertEqual([queue.advance(True)["title"]], ["Song 1"])
+        with self.subTest('add last makes next possible and plays on an empty queue'):
+            app = load_module()
+            queue = app.PlayQueue()
+
+            queue.add_last(self.row(7))
+
+            self.assertTrue(queue.can_next)
+            self.assertEqual(queue.advance(True)["title"], "Song 7")
+            self.assertFalse(queue.can_next)
+
 class TrackLikesTest(unittest.TestCase):
     def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
         app = load_module()

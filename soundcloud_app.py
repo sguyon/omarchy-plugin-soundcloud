@@ -19,6 +19,7 @@ import json
 import math
 import os
 import pwd
+import random
 import re
 import secrets
 import shutil
@@ -66,8 +67,12 @@ LIST_ARTWORK_PIXELS = 512 * 512
 LIST_ARTWORK_DIMENSION = 512
 MAX_COOKIE_STORE_BYTES = 512 * 1024
 MAX_TRACK_CACHE_BYTES = 1024 * 1024
+MAX_QUEUE_SOURCE_BYTES = 64
 MAX_SETTINGS_BYTES = 4096
 NOTIFICATION_TIMEOUT_SECONDS = 3.0
+# Previous restarts the track from this position on. The website's real value is unverified.
+PREVIOUS_RESTART_SECONDS = 3.0
+REPEAT_MODES = ("none", "one", "all")
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
@@ -740,6 +745,233 @@ def with_local_plays(server_tracks: list[dict[str, object]],
         if known is None or played_at(track) > played_at(known):
             latest[track.get("url")] = track
     return sorted(latest.values(), key=played_at, reverse=True)
+
+
+def _queue_rows(rows: object) -> list[dict[str, object]]:
+    """Copies of the rows that have a URL, one per URL, in order."""
+    seen: set[str] = set()
+    clean = []
+    for row in rows if isinstance(rows, list) else []:
+        url = row.get("url") if isinstance(row, dict) else None
+        if isinstance(url, str) and url and url not in seen:
+            seen.add(url)
+            # "current" is computed for the queue view, never stored
+            clean.append({key: value for key, value in row.items() if key != "current"})
+    return clean
+
+
+class PlayQueue:
+    """A list with a cursor, plus "play next" items kept apart from the list.
+
+    Like the website: starting a track from a list replaces the list and keeps the
+    explicit items. Explicit items play before the next list item, in the order added,
+    and join the list at the cursor when they start, so Previous can come back through them.
+    Rows have the shape `validate_tracks_payload` produces.
+
+    Two kinds of user-queued rows differ in where they play. "Play next" goes right
+    after the current track, ahead of the rest of the list. "Add to queue" (`add_last`) goes
+    after every list item still to come, so the whole list plays first; among themselves,
+    both kinds play in the order added. The website's "Add to Next up" is closer to play next;
+    this plugin keeps the two apart so a long list can be queued up without being jumped.
+    """
+
+    def __init__(self, repeat: str = "none", shuffle: bool = False, rng: object | None = None):
+        self._items: list[dict[str, object]] = []
+        self._explicit: list[dict[str, object]] = []
+        self._added: list[dict[str, object]] = []
+        self._cursor = 0
+        self._repeat = repeat if repeat in REPEAT_MODES else "none"
+        self._shuffle = shuffle is True
+        self._rng = rng if rng is not None else random.Random()
+        self.source = ""
+
+    @property
+    def items(self) -> list[dict[str, object]]:
+        return list(self._items)
+
+    @property
+    def explicit(self) -> list[dict[str, object]]:
+        return list(self._explicit)
+
+    @property
+    def added(self) -> list[dict[str, object]]:
+        return list(self._added)
+
+    @property
+    def current(self) -> dict[str, object] | None:
+        return self._items[self._cursor] if 0 <= self._cursor < len(self._items) else None
+
+    @property
+    def cursor(self) -> int:
+        return self._cursor
+
+    @property
+    def length(self) -> int:
+        return len(self._items)
+
+    @property
+    def can_next(self) -> bool:
+        return bool(self._explicit) or bool(self._added) or self._cursor + 1 < len(self._items) or (
+            self._repeat == "all" and bool(self._items)
+        )
+
+    @property
+    def can_previous(self) -> bool:
+        # With nothing before the current track, Previous restarts it.
+        return self.current is not None
+
+    @property
+    def repeat(self) -> str:
+        return self._repeat
+
+    @repeat.setter
+    def repeat(self, mode: str) -> None:
+        if mode in REPEAT_MODES:
+            self._repeat = mode
+
+    @property
+    def shuffle(self) -> bool:
+        return self._shuffle
+
+    @shuffle.setter
+    def shuffle(self, enabled: bool) -> None:
+        enabled = enabled is True
+        if enabled and not self._shuffle:
+            self._permute_after_cursor()
+        self._shuffle = enabled
+
+    def _permute_after_cursor(self) -> None:
+        # Only what is still to come moves; what was played and the current track stay.
+        tail = self._items[self._cursor + 1:]
+        self._rng.shuffle(tail)
+        self._items[self._cursor + 1:] = tail
+
+    def replace(self, rows: list[dict[str, object]], index: int, source: str = "") -> None:
+        """Start from `rows` with the cursor on `rows[index]`. Explicit items stay."""
+        clean = _queue_rows(rows)
+        wanted = None
+        if isinstance(index, int) and not isinstance(index, bool) and isinstance(rows, list) \
+                and 0 <= index < len(rows) and isinstance(rows[index], dict):
+            wanted = rows[index].get("url")
+        position = next((n for n, row in enumerate(clean) if row["url"] == wanted), None)
+        if position is None:
+            position = index if isinstance(index, int) and not isinstance(index, bool) else 0
+            position = max(0, min(position, len(clean) - 1))
+        start = max(0, min(position, len(clean) - MAX_TRACKS))
+        self._items = clean[start:start + MAX_TRACKS]
+        self._cursor = position - start
+        self.source = _bounded_string(source, MAX_QUEUE_SOURCE_BYTES) or ""
+        if self._shuffle:
+            self._permute_after_cursor()
+
+    def play_next(self, row: dict[str, object]) -> None:
+        """Queue `row` after the current track and after earlier "play next" items."""
+        clean = _queue_rows([row])
+        if clean and len(self._explicit) < MAX_TRACKS and all(
+            known["url"] != clean[0]["url"] for known in self._explicit
+        ):
+            # A row already waiting at the end moves up instead of playing twice.
+            self._added = [known for known in self._added if known["url"] != clean[0]["url"]]
+            self._explicit.append({**clean[0], "explicit": True})
+
+    def add_last(self, row: dict[str, object]) -> bool:
+        """Queue `row` after every list item still to come ("Add to queue"), in the order added.
+
+        Returns False, and changes nothing, for a row that is unusable, already waiting as
+        a user-queued row, or already coming up in the list (no duplicates by URL)."""
+        clean = _queue_rows([row])
+        if not clean or len(self._added) >= MAX_TRACKS:
+            return False
+        url = clean[0]["url"]
+        waiting = [*self._explicit, *self._added, *self._items[self._cursor + 1:]]
+        if any(known["url"] == url for known in waiting):
+            return False
+        self._added.append({**clean[0], "explicit": True, "added": True})
+        return True
+
+    def _step(self, automatic: bool) -> dict[str, object] | None:
+        """Move to the next track and return it, or return None and stay."""
+        if automatic and self._repeat == "one" and self.current is not None:
+            return self.current
+        if self._explicit:
+            self._enter(self._explicit.pop(0))
+        elif self._cursor + 1 < len(self._items):
+            self._cursor += 1
+        elif self._added:
+            self._enter(self._added.pop(0))
+        elif self._repeat == "all" and self._items:
+            self._cursor = 0
+            if self._shuffle:
+                self._permute_after_cursor()
+        else:
+            return None
+        return self.current
+
+    def _enter(self, row: dict[str, object]) -> None:
+        """Make a user-queued row the current one, placed right after the cursor in the list."""
+        for position, item in enumerate(self._items):
+            if item["url"] == row["url"]:
+                del self._items[position]
+                if position <= self._cursor:
+                    self._cursor -= 1
+                break
+        if not self._items:
+            self._cursor = -1
+        self._cursor += 1
+        self._items.insert(self._cursor, row)
+        if len(self._items) > MAX_TRACKS:
+            del self._items[0]
+            self._cursor -= 1
+
+    def advance(self, user_initiated: bool) -> dict[str, object] | None:
+        """The next track to play, or None at the end. An automatic end repeats under repeat one."""
+        return self._step(automatic=not user_initiated)
+
+    def previous(self, position_seconds: object) -> dict[str, object] | str | None:
+        """"restart" when the track is past the threshold or nothing is before it, else the previous track."""
+        if not self._items:
+            return None
+        position = 0.0
+        if isinstance(position_seconds, (int, float)) and not isinstance(position_seconds, bool) \
+                and not math.isnan(position_seconds):
+            position = float(position_seconds)
+        if position >= PREVIOUS_RESTART_SECONDS or self._cursor <= 0:
+            return "restart"
+        self._cursor -= 1
+        return self.current
+
+    def snapshot(self) -> tuple:
+        """The list, the user-queued rows and the cursor, to put back with `restore`."""
+        return list(self._items), list(self._explicit), list(self._added), self._cursor
+
+    def restore(self, snapshot: tuple) -> None:
+        items, explicit, added, cursor = snapshot
+        self._items, self._explicit, self._added, self._cursor = list(items), list(explicit), list(added), cursor
+
+    def mark_dead(self, track_id: object) -> dict[str, object] | None:
+        """Drop a track that can't play, by playback id or URL. Returns what to play now, if any."""
+        if not isinstance(track_id, str) or not track_id:
+            return self.current
+
+        def alive(row):
+            return track_id not in (row.get("playbackId"), row.get("url"))
+
+        self._explicit = [row for row in self._explicit if alive(row)]
+        self._added = [row for row in self._added if alive(row)]
+        removed = [n for n, row in enumerate(self._items) if not alive(row)]
+        if not removed:
+            return self.current
+        current_died = self._cursor in removed
+        self._cursor -= sum(1 for n in removed if n < self._cursor)
+        self._items = [row for row in self._items if alive(row)]
+        if not current_died:
+            return self.current
+        # The cursor now points at the next list item; step from just before it.
+        self._cursor -= 1
+        replacement = self._step(automatic=False)
+        if replacement is None:
+            self._cursor = max(0, min(self._cursor, len(self._items) - 1))
+        return replacement
 
 
 def load_more_script(source: str) -> str | None:
