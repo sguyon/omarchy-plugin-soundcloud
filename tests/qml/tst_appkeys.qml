@@ -57,6 +57,14 @@ TestCase {
     compare(catcherKeys, [])
   }
 
+  function test_alt_up_and_down_move_the_queue_row() {
+    make()
+    keyClick(Qt.Key_Up, Qt.AltModifier)
+    keyClick(Qt.Key_Down, Qt.AltModifier)
+    compare(actions, ["queue-up", "queue-down"])
+    compare(catcherKeys, [])
+  }
+
   function test_h_is_swallowed_without_an_action() {
     make()
     keyClick("h")

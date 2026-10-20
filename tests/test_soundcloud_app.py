@@ -5881,6 +5881,18 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("enabled: !encrypted && (!root.actionBusy || root.selectionBusy)", qml)
         self.assertIn("if (!track || SoundCloudModel.isEncrypted(track)) return", qml)
 
+    def test_queue_rows_can_be_dragged_moved_by_key_and_cleared_after_a_confirmation(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertIn("SoundCloudModel.queueMoveCommand(playbackId, offset)", qml)
+        self.assertIn("SoundCloudModel.queueDragOffset(", qml)
+        self.assertIn('moveQueueRow(queueSelectedId, SoundCloudModel.queueKeyMoveOffset(', qml)
+        self.assertIn('onClicked: root.armClearQueue()', qml)
+        self.assertIn('sendUi("queue-clear")', qml)
+        # Clear is never sent by the first click.
+        self.assertLess(qml.index("function armClearQueue"), qml.index('sendUi("queue-clear")'))
+        self.assertNotIn('onClicked: root.sendUi("queue-clear")', qml)
+
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 

@@ -279,6 +279,12 @@ function repeatMode(value) {
   return value === "one" || value === "all" ? value : "none"
 }
 
+// Material Design glyphs: repeat-once, repeat, repeat-off.
+function repeatIconGlyph(mode) {
+  mode = repeatMode(mode)
+  return mode === "one" ? "󰑘" : (mode === "all" ? "󰑖" : "󰑗")
+}
+
 var trackIdPattern = /^soundcloud:tracks:[1-9][0-9]*$/
 
 // Commands for one track by id; "" if the id is not a track id.
@@ -302,6 +308,13 @@ function queueAddCommand(playbackId) {
 // A track that only offers an encrypted stream cannot be played or queued.
 function isEncrypted(track) {
   return !!track && track.encrypted === true
+}
+
+// Moves a queue entry by a signed number of places (negative = earlier).
+function queueMoveCommand(playbackId, offset) {
+  var places = Number(offset)
+  if (!trackIdPattern.test(String(playbackId || "")) || !Number.isInteger(places) || places === 0) return ""
+  return "queue-move:" + playbackId + ":" + places
 }
 
 // The small label under a queue row.
@@ -353,6 +366,43 @@ function queueSelectionAfterUpdate(items, selectedId) {
   return queueIndexOf(items, selectedId) >= 0 ? String(selectedId) : ""
 }
 
+// How many places a queue row can move by one key press: 0 for the playing row,
+// when nothing is selected, or at the ends (the playing row stays first).
+function queueKeyMoveOffset(items, selectedId, direction) {
+  var list = Array.isArray(items) ? items : []
+  var at = queueIndexOf(list, selectedId)
+  if (at < 1 || !(list[at] && list[at].current !== true)) return 0
+  var step = Number(direction) < 0 ? -1 : (Number(direction) > 0 ? 1 : 0)
+  var target = at + step
+  return target >= 1 && target <= list.length - 1 ? step : 0
+}
+
+// Drag handle: the signed places a row dragged by `pixels` moves, clamped so it
+// stays below the playing row (index 0) and inside the list.
+function queueDragOffset(pixels, rowStep, index, count) {
+  var step = Number(rowStep)
+  var total = Math.max(0, Math.floor(Number(count) || 0))
+  var at = Math.floor(Number(index))
+  if (!(step > 0) || !Number.isFinite(Number(pixels)) || at < 1 || at > total - 1) return 0
+  var places = Math.round(Number(pixels) / step)
+  return Math.max(1 - at, Math.min(total - 1 - at, places)) || 0
+}
+
+// Clear queue asks first: the toolbar switches to a confirm state that is
+// dropped when the queue view closes or when the queue changes (the signature
+// is what was in the queue when it was armed).
+function queueSignature(rows) {
+  var ids = []
+  var list = Array.isArray(rows) ? rows : []
+  for (var index = 0; index < list.length; index++) ids.push(String(list[index].playbackId))
+  return ids.join("|")
+}
+
+function clearConfirmStays(armedSignature, rows, queueOpen) {
+  return typeof armedSignature === "string" && queueOpen === true
+    && queueSignature(rows) === armedSignature && Array.isArray(rows) && rows.length > 0
+}
+
 // The dim text on the queue toolbar: how many tracks follow the playing one.
 function queueCountText(items) {
   var list = Array.isArray(items) ? items : []
@@ -373,8 +423,8 @@ function barIconColor(playing, accent, foreground) {
 // Shift+arrows into moves). Returns an action name, "ignore" for a key that is
 // swallowed on purpose (h, no longer a seek alias), or "" to leave it alone.
 //   PageDown, Shift+Right: next      PageUp, Shift+Left: previous
-//   Shift+Up/Down: volume +/- 5      l: like/unlike
-//   Shift+L: repeat   Shift+S: shuffle
+//   Shift+Up/Down: volume +/- 5      Alt+Up/Down: move the queue row
+//   l: like/unlike   Shift+L: repeat   Shift+S: shuffle
 // j/k stay list navigation (Omarchy convention) although the website uses K/J
 // for previous/next.
 var keyShift = 0x02000000
@@ -393,6 +443,8 @@ function keyAction(key, modifiers, text) {
   if (shift && key === 0x01000012) return "previous"
   if (shift && key === 0x01000013) return "volume-up"
   if (shift && key === 0x01000015) return "volume-down"
+  if (mods === keyAlt && key === 0x01000013) return "queue-up"
+  if (mods === keyAlt && key === 0x01000015) return "queue-down"
   if (key === 0x4c || (none && letter === "l")) {
     if (none) return "like"
     if (shift) return "repeat"
@@ -406,6 +458,7 @@ function keyAction(key, modifiers, text) {
 // Held keys repeat only for the ones that make sense repeated.
 function actionRepeats(action) {
   return action === "volume-up" || action === "volume-down"
+    || action === "queue-up" || action === "queue-down"
 }
 
 // Left and Right seek like the website: a step is max(5, n) seconds where n counts
@@ -516,6 +569,12 @@ if (typeof module !== "undefined") {
     repeatMode: repeatMode,
     queuePlayCommand: queuePlayCommand,
     queueRemoveCommand: queueRemoveCommand,
+    queueMoveCommand: queueMoveCommand,
+    queueKeyMoveOffset: queueKeyMoveOffset,
+    queueDragOffset: queueDragOffset,
+    queueSignature: queueSignature,
+    clearConfirmStays: clearConfirmStays,
+    repeatIconGlyph: repeatIconGlyph,
     queueNextCommand: queueNextCommand,
     queueAddCommand: queueAddCommand,
     isEncrypted: isEncrypted,

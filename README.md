@@ -18,11 +18,13 @@ without official SoundCloud API credentials.
 - Keys in the popup: Up/Down or j/k move the selection, Enter plays it, Tab and
   Shift+Tab switch tabs, Space plays or pauses, Left/Right seek, PageDown or
   Shift+Right next, PageUp or Shift+Left previous, Shift+Up/Down volume, l like,
-  Shift+L repeat, Shift+S shuffle, m mute, q queue, Esc close
+  Shift+L repeat, Shift+S shuffle, m mute, q queue, Alt+Up/Down move a queue row, Esc close
 - Queue button (the last stop of the tab row, with a badge counting the tracks still to
   come): shows the playing track and what follows, each row marked "added by you" when you
   queued it. Click a row, or select it and press Enter, to play it, or take it out of
-  the queue with the cross. Tab and Shift+Tab reach it after History
+  the queue with the cross. Drag the handle (or press Alt+Up/Down on the selected row) to
+  reorder; the playing track stays first. A slim toolbar has shuffle, repeat and Clear, which
+  asks for a confirmation first. Tab and Shift+Tab reach it after History
 - Hover a track in a list for a menu: play, play next, add to queue. Tracks that only
   offer an encrypted stream are dimmed with a lock
 - SoundCloud-style waveform progress display with click-to-seek

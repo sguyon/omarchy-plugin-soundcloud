@@ -279,6 +279,43 @@ assert.equal(model.queueSelectionAfterMove([], "", 1), "");
 assert.equal(model.queueSelectionAfterUpdate(rows, t2), t2);
 assert.equal(model.queueSelectionAfterUpdate([rows[0]], t2), "");
 
+// Reordering: the move command, the key step, the drag distance.
+assert.equal(model.queueMoveCommand(t2, -1), "queue-move:" + t2 + ":-1");
+assert.equal(model.queueMoveCommand(t2, 3), "queue-move:" + t2 + ":3");
+assert.equal(model.queueMoveCommand(t2, 0), "");
+assert.equal(model.queueMoveCommand(t2, 1.5), "");
+assert.equal(model.queueMoveCommand("bad", 1), "");
+assert.equal(model.queueKeyMoveOffset(rows, t2, -1), 0); // cannot go above the playing row
+assert.equal(model.queueKeyMoveOffset(rows, t2, 1), 1);
+assert.equal(model.queueKeyMoveOffset(rows, t3, 1), 0);
+assert.equal(model.queueKeyMoveOffset(rows, t3, -1), -1);
+assert.equal(model.queueKeyMoveOffset(rows, t1, 1), 0); // the playing row never moves
+assert.equal(model.queueKeyMoveOffset(rows, "", 1), 0);
+assert.equal(model.queueDragOffset(100, 51, 1, 3), 1); // 100 px is about two rows, clamped to the end
+assert.equal(model.queueDragOffset(-200, 51, 2, 3), -1); // clamped below the playing row
+assert.equal(model.queueDragOffset(60, 51, 1, 5), 1);
+assert.equal(model.queueDragOffset(10, 51, 1, 5), 0);
+assert.equal(model.queueDragOffset(-60, 51, 0, 5), 0); // the playing row stays
+assert.equal(model.queueDragOffset(60, 0, 1, 5), 0);
+
+// Clear queue confirmation: stays only while the same queue is shown.
+assert.equal(model.queueSignature(rows), t1 + "|" + t2 + "|" + t3);
+assert.equal(model.queueSignature(null), "");
+{
+  const armed = model.queueSignature(rows);
+  assert.equal(model.clearConfirmStays(armed, rows, true), true);
+  assert.equal(model.clearConfirmStays(armed, rows, false), false);
+  assert.equal(model.clearConfirmStays(armed, [rows[0]], true), false);
+  assert.equal(model.clearConfirmStays(armed, [rows[1], rows[0], rows[2]], true), false);
+  assert.equal(model.clearConfirmStays(null, rows, true), false);
+  assert.equal(model.clearConfirmStays("", [], true), false);
+}
+
+// Repeat glyphs: once, all, off.
+assert.equal(model.repeatIconGlyph("one"), "\u{f0458}");
+assert.equal(model.repeatIconGlyph("all"), "\u{f0456}");
+assert.equal(model.repeatIconGlyph(undefined), "\u{f0457}");
+
 // A track clicked in a list plays from that list; a new click replaces a pending one.
 assert.equal(
   model.playFromCommand("likes", "soundcloud:tracks:42"),
@@ -350,6 +387,9 @@ assert.equal(model.keyAction(0x01000014, SH, ""), "next");
 assert.equal(model.keyAction(0x01000012, SH, ""), "previous");
 assert.equal(model.keyAction(0x01000013, SH, ""), "volume-up");
 assert.equal(model.keyAction(0x01000015, SH, ""), "volume-down");
+assert.equal(model.keyAction(0x01000013, AL, ""), "queue-up");
+assert.equal(model.keyAction(0x01000015, AL, ""), "queue-down");
+assert.equal(model.keyAction(0x01000015, AL | SH, ""), "");
 assert.equal(model.keyAction(0x01000013, 0, ""), "");
 assert.equal(model.keyAction(0x01000014, 0, ""), ""); // plain arrows are for the catcher
 assert.equal(model.keyAction(0x4c, 0, "l"), "like");
@@ -363,6 +403,8 @@ assert.equal(model.keyAction(0x4b, 0, "k"), "");
 assert.equal(model.keyAction(0x20, 0x20000000, ""), ""); // keypad flag alone is no modifier
 assert.equal(model.actionRepeats("volume-up"), true);
 assert.equal(model.actionRepeats("volume-down"), true);
+assert.equal(model.actionRepeats("queue-up"), true);
+assert.equal(model.actionRepeats("queue-down"), true);
 assert.equal(model.actionRepeats("like"), false);
 assert.equal(model.actionRepeats("next"), false);
 

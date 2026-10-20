@@ -56,6 +56,8 @@ BarWidget {
   // moves ("" = none).
   property string queueSelectedId: ""
   readonly property var queueRows: SoundCloudModel.upcomingQueue(queueData)
+  // The queue as it was when Clear was pressed (null = no confirmation pending).
+  property var clearArmedSignature: null
   // The list row whose action menu is open ("tab:playbackId"), if any.
   property string menuRowKey: ""
   property int activeSelectionRequestId: 0
@@ -195,7 +197,38 @@ BarWidget {
       sendUi("repeat")
     } else if (action === "shuffle") {
       sendUi("shuffle")
+    } else if (action === "queue-up" || action === "queue-down") {
+      if (queueOpen) moveQueueRow(queueSelectedId, SoundCloudModel.queueKeyMoveOffset(
+        queueRows, queueSelectedId, action === "queue-up" ? -1 : 1))
     }
+  }
+
+  // Clear queue asks first (see SoundCloudModel.clearConfirmStays).
+  function armClearQueue() {
+    if (queueLength <= 0) return
+    clearArmedSignature = SoundCloudModel.queueSignature(queueRows)
+  }
+
+  function cancelClearQueue() {
+    clearArmedSignature = null
+  }
+
+  function confirmClearQueue() {
+    cancelClearQueue()
+    sendUi("queue-clear")
+  }
+
+  onQueueRowsChanged: {
+    if (clearArmedSignature !== null
+        && !SoundCloudModel.clearConfirmStays(clearArmedSignature, queueRows, queueOpen)) cancelClearQueue()
+  }
+  onQueueOpenChanged: {
+    if (!queueOpen && clearArmedSignature !== null) cancelClearQueue()
+  }
+
+  function moveQueueRow(playbackId, offset) {
+    var command = SoundCloudModel.queueMoveCommand(playbackId, offset)
+    if (command !== "") sendCommand(command, "queue-edit")
   }
 
   function toggle() {
@@ -660,6 +693,12 @@ BarWidget {
       else if (message.ok === false) lastError = String(message.error || "SoundCloud could not read the queue")
       queueSelectedId = SoundCloudModel.queueSelectionAfterUpdate(queueRows, queueSelectedId)
       if (queueStale) refreshQueue()
+    } else if (kind === "queue-edit") {
+      // queue-move answers with the new queue view.
+      if (message.ok !== false && message.queue) queueData = message.queue
+      if (message.ok === false) lastError = String(message.error || "SoundCloud could not move this track")
+      queueSelectedId = SoundCloudModel.queueSelectionAfterUpdate(queueRows, queueSelectedId)
+      uiRefreshTimer.restart()
     } else if (kind === "ui") {
       if (message.ok !== true || message.error) lastError = String(message.error || "SoundCloud action failed")
       else uiRefreshTimer.restart()
@@ -769,9 +808,10 @@ BarWidget {
       }
     }
 
-    // Keys: Esc closes (an open row menu first), Up/Down (or j/k) move the selection (in the list or the
-    // queue), Enter plays it, Tab/Shift+Tab switch tabs and Queue, Space plays or
-    // pauses, Left/Right seek (5 s, longer while held), q the queue, m mutes.
+    // Keys: Esc closes (a pending Clear or an open row menu first), Up/Down (or j/k)
+    // move the selection (in the list or the queue), Enter plays it, Tab/Shift+Tab
+    // switch tabs and Queue, Space plays or pauses, Left/Right seek (5 s, longer
+    // while held), q the queue, m mutes, Alt+Up/Down move the selected queue row.
     // AppKeys adds PageDown/Shift+Right next,
     // PageUp/Shift+Left previous, Shift+Up/Down volume, l like, Shift+L repeat
     // and Shift+S shuffle. j/k stay list keys (Omarchy), so unlike the website
@@ -783,7 +823,8 @@ BarWidget {
       // Forwarded keys reach seekKeys first, which counts the repeats.
       Keys.forwardTo: [appKeys, seekKeys]
       onCloseRequested: {
-        if (root.menuRowKey !== "") root.menuRowKey = ""
+        if (root.clearArmedSignature !== null) root.cancelClearQueue()
+        else if (root.menuRowKey !== "") root.menuRowKey = ""
         else root.close()
       }
       onMoveRequested: function(dx, dy) {
@@ -1541,22 +1582,75 @@ BarWidget {
           ? errorText.implicitHeight + parent.spacing : 0))
         visible: root.running && root.loggedIn && root.queueOpen
 
-        // One slim row: how many tracks follow.
+        // One slim row: how many tracks follow, then the queue switches as icon buttons.
         Item {
           id: queueHeader
           width: parent.width
-          height: queueCount.implicitHeight + Style.space(8)
+          height: queueHeaderButtons.implicitHeight
 
           Text {
-            id: queueCount
             anchors.left: parent.left
             anchors.leftMargin: Style.space(6)
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: SoundCloudModel.queueCountText(root.queueRows)
-            color: root.dim
+            text: root.clearArmedSignature !== null ? "Clear queue?" : SoundCloudModel.queueCountText(root.queueRows)
+            color: root.clearArmedSignature !== null ? root.bar.foreground : root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
+          }
+
+          Row {
+            id: queueHeaderButtons
+            visible: root.clearArmedSignature === null
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(6)
+            spacing: Style.space(2)
+
+            Button {
+              iconText: "󰒟"
+              foreground: root.bar.foreground
+              selected: root.shuffle
+              tooltipText: root.shuffle ? "Shuffle: on" : "Shuffle: off"
+              onClicked: root.sendUi("shuffle")
+            }
+            Button {
+              iconText: SoundCloudModel.repeatIconGlyph(root.repeat)
+              foreground: root.bar.foreground
+              selected: root.repeat !== "none"
+              tooltipText: root.repeat === "one" ? "Repeat: this track"
+                : (root.repeat === "all" ? "Repeat: all" : "Repeat: off")
+              onClicked: root.sendUi("repeat")
+            }
+            Button {
+              iconText: "󰆴"
+              foreground: root.bar.foreground
+              enabled: root.queueLength > 0
+              opacity: enabled ? 1 : 0.4
+              tooltipText: "Clear the queue"
+              onClicked: root.armClearQueue()
+            }
+          }
+
+          // After Clear: confirm or cancel (Esc, a queue change or leaving the view also cancel).
+          Row {
+            visible: root.clearArmedSignature !== null
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
+            Button {
+              iconText: "󰄬"
+              foreground: Color.accent
+              tooltipText: "Yes, clear the queue"
+              onClicked: root.confirmClearQueue()
+            }
+            Button {
+              iconText: "󰅖"
+              foreground: root.bar.foreground
+              tooltipText: "Keep the queue"
+              onClicked: root.cancelClearQueue()
+            }
           }
         }
 
@@ -1577,10 +1671,16 @@ BarWidget {
             required property var modelData
             width: queueList.width
             height: Style.space(40)
+            readonly property real rowStep: height + queueList.spacing
             property var item: modelData
             property bool isCurrent: item.current === true
             property string artworkId: String(item.artworkId || "")
             property string itemArtDataUrl: String(root.trackArtworkData[artworkId] || "")
+            // Drag handle: how far the row has been dragged (pixels), 0 at rest.
+            property real dragDy: 0
+            property bool dragging: false
+            z: dragging ? 5 : 0
+            transform: Translate { y: dragDy }
 
             Component.onCompleted: root.requestTrackArtwork(artworkId)
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
@@ -1659,7 +1759,7 @@ BarWidget {
             Column {
               anchors.left: queueArtwork.right
               anchors.leftMargin: Style.space(9)
-              anchors.right: queueRemove.left
+              anchors.right: queueHandle.left
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
@@ -1683,6 +1783,49 @@ BarWidget {
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
+              }
+            }
+
+            // Drag to reorder: the row follows the pointer and, on release, moves by
+            // the whole rows it was dragged over (queue-move). The playing row has
+            // no handle, and nothing can go above it.
+            Item {
+              id: queueHandle
+              anchors.right: queueRemove.left
+              anchors.rightMargin: Style.space(2)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(22)
+              height: Style.space(32)
+              visible: !isCurrent
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "󰍜"
+                color: handleMouse.pressed || handleMouse.containsMouse ? root.bar.foreground : root.dim
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+
+              MouseArea {
+                id: handleMouse
+                property real startY: 0
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+                function listY(mouse) { return mapToItem(queueList.contentItem, mouse.x, mouse.y).y }
+                onPressed: function(mouse) { startY = listY(mouse); dragging = true }
+                onPositionChanged: function(mouse) {
+                  if (pressed) dragDy = listY(mouse) - startY
+                }
+                onReleased: function(mouse) {
+                  var at = SoundCloudModel.queueIndexOf(root.queueRows, item.playbackId)
+                  root.moveQueueRow(item.playbackId, SoundCloudModel.queueDragOffset(
+                    dragDy, rowStep, at, root.queueRows.length))
+                  dragging = false
+                  dragDy = 0
+                }
+                onCanceled: { dragging = false; dragDy = 0 }
               }
             }
 
