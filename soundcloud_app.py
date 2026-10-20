@@ -61,6 +61,7 @@ LIST_ARTWORK_PIXELS = 512 * 512
 LIST_ARTWORK_DIMENSION = 512
 MAX_COOKIE_STORE_BYTES = 512 * 1024
 MAX_TRACK_CACHE_BYTES = 1024 * 1024
+MAX_SETTINGS_BYTES = 4096
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
@@ -643,6 +644,26 @@ def load_more_source_from_command(command: str) -> str | None:
         "load-more:home": "home",
         "load-more:feed": "feed",
     }.get(command)
+
+
+def volume_from_command(command: str) -> float | None:
+    """The level a `volume:<0..1>` command sets, clamped to 0..1."""
+    return _command_number(command, "volume:", 0.0, 1.0)
+
+
+def volume_step_from_command(command: str) -> float | None:
+    """The signed change a `volume-step:<float>` command asks for."""
+    return _command_number(command, "volume-step:", -1.0, 1.0)
+
+
+def _command_number(command: str, prefix: str, minimum: float, maximum: float) -> float | None:
+    if not command.startswith(prefix):
+        return None
+    try:
+        number = float(command.removeprefix(prefix))
+    except ValueError:
+        return None
+    return max(minimum, min(maximum, number)) if math.isfinite(number) else None
 
 
 def playback_id_from_command(command: str) -> str | None:
@@ -1457,8 +1478,21 @@ def validate_status_payload(payload: object) -> dict[str, object] | None:
         "duration": duration,
         "position": min(position, duration) if duration else position,
         "waveform": validate_waveform(payload.get("waveform", [])),
+        **_setting_status_fields(payload),
         **({"error": error} if error else {}),
     }
+
+
+def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
+    """The optional volume and setting keys of a status payload."""
+    fields: dict[str, object] = {}
+    volume = _finite_number(payload.get("volume"), 0, 1)
+    if volume is not None:
+        fields["volume"] = volume
+    for key in ("muted",):
+        if isinstance(payload.get(key), bool):
+            fields[key] = payload[key]
+    return fields
 
 
 def merge_status(page_cache: dict[str, object], gst_status: dict[str, object]) -> dict[str, object]:
@@ -1585,6 +1619,36 @@ def sanitize_track_cache(payload: object) -> dict[str, list[dict[str, object]]]:
         if isinstance(validated_tracks, list) and validated_tracks:
             sanitized[source] = validated_tracks
     return sanitized
+
+
+DEFAULT_SETTINGS: dict[str, object] = {"v": 1, "volume": 1.0, "muted": False}
+
+
+def sanitize_settings(payload: object) -> dict[str, object]:
+    """Saved settings checked key by key. Anything missing or invalid gets its default."""
+    settings = dict(DEFAULT_SETTINGS)
+    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != 1:
+        return settings
+    volume = _finite_number(payload.get("volume"), 0, 1)
+    if volume is not None:
+        settings["volume"] = volume
+    for key in ("muted",):
+        if isinstance(payload.get(key), bool):
+            settings[key] = payload[key]
+    return settings
+
+
+class SettingsStore:
+    """Volume and mute in `settings.json`."""
+
+    def __init__(self, directory_fd: int, maximum_bytes: int = MAX_SETTINGS_BYTES):
+        self._store = PrivateJsonStore(directory_fd, "settings.json", maximum_bytes)
+
+    def load(self) -> dict[str, object]:
+        return sanitize_settings(self._store.load())
+
+    def save(self, settings: dict[str, object]) -> None:
+        self._store.save(sanitize_settings(settings))
 
 
 def _image_kind_and_dimensions(data: bytes) -> tuple[str, int, int] | None:
@@ -2393,10 +2457,16 @@ class GstPlayback:
     hls_cache = None
     hls_uri = ""
 
-    def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args)):
+    def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args),
+                 volume: float = 1.0, muted: bool = False):
         self.Gst = Gst
         Gst.init(None)
         self.current = None
+        self.volume = max(0.0, min(1.0, volume))
+        self.muted = muted is True
+        # The level an unmute from volume 0 returns to
+        self.restore_volume = self.volume if self.volume > 0 else 0.5
+        self.volume_target = None
         self.on_change = on_change
         self.schedule = schedule
         self.active = False
@@ -2441,12 +2511,45 @@ class GstPlayback:
                 self.state = "paused" if self.has_started else "buffering"
             self.on_change()
 
+    def set_volume(self, level: float) -> None:
+        """Set the volume (0..1). Volume 0 mutes, as on the website; any other level unmutes."""
+        self.volume = round(max(0.0, min(1.0, level)), 4)
+        if self.volume > 0:
+            self.restore_volume = self.volume
+        self.muted = self.volume == 0
+        self._apply_volume()
+
+    def adjust_volume(self, step: float) -> None:
+        self.set_volume(self.volume + step)
+
+    def toggle_mute(self) -> None:
+        """Mute keeps the volume. Unmuting from volume 0 returns to the last audible level."""
+        if self.muted:
+            if self.volume == 0:
+                self.volume = self.restore_volume
+            self.muted = False
+        else:
+            self.muted = True
+        self._apply_volume()
+
+    def volume_status(self) -> dict[str, object]:
+        return {"volume": self.volume, "muted": self.muted}
+
+    def _apply_volume(self) -> None:
+        if self.volume_target is None:
+            return
+        try:
+            self.volume_target.set_property("volume", 0.0 if self.muted else self.volume)
+        except (AttributeError, TypeError, ValueError):
+            pass
+
     def _stop_current(self) -> None:
         self.generation += 1
         self.seek_in_flight = False
         self.last_seek = None
         previous = self.current
         self.current = None
+        self.volume_target = None
         if previous is None:
             return
         watch = self.bus_watches.pop(id(previous), None)
@@ -2508,6 +2611,8 @@ class GstPlayback:
             self.state = "error"
             return False
         self.current = pipeline
+        self.volume_target = pipeline
+        self._apply_volume()
         self._watch_bus(pipeline, self.generation)
         pipeline.set_property("uri", uri)
         result = pipeline.set_state(self.Gst.State.PLAYING)
@@ -2524,7 +2629,7 @@ class GstPlayback:
             pipeline = self.Gst.parse_launch(
                 "appsrc name=source format=time is-live=false block=true "
                 "caps=audio/mpeg,mpegversion=1,layer=3 ! mpegaudioparse ! "
-                "mpg123audiodec ! audioconvert ! audioresample ! autoaudiosink"
+                "mpg123audiodec ! audioconvert ! audioresample ! volume name=volume ! autoaudiosink"
             )
         except Exception:
             self.active = False
@@ -2538,6 +2643,8 @@ class GstPlayback:
             self.state = "error"
             return False
         self.current = pipeline
+        self.volume_target = pipeline.get_by_name("volume")
+        self._apply_volume()
         self._watch_bus(pipeline, self.generation)
         generation = self.generation
         target = self.Gst.State.PAUSED if paused else self.Gst.State.PLAYING
@@ -3004,6 +3111,11 @@ def build_application(show_on_start: bool = False):
         cookie_records = cookie_store.migrate_legacy_sqlite()
     track_cache_store = PrivateJsonStore(profile_fd, "tracks.json", MAX_TRACK_CACHE_BYTES)
     track_cache = sanitize_track_cache(track_cache_store.load())
+    settings_store = SettingsStore(profile_fd)
+    try:
+        saved_settings = settings_store.load()
+    except OSError:
+        saved_settings = dict(DEFAULT_SETTINGS)
     socket_path = runtime_socket_path()
     prepare_runtime_socket_path(socket_path)
     install_path = Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".config/omarchy/plugins/brunosilveira.soundcloud"
@@ -3024,6 +3136,8 @@ def build_application(show_on_start: bool = False):
                 Gst,
                 lambda: GLib.idle_add(self._publish_status_once),
                 GLib.idle_add,
+                volume=cast(float, saved_settings["volume"]),
+                muted=saved_settings["muted"] is True,
             )
             self.list_artwork_cache = ArtworkCache(
                 maximum_entries=48,
@@ -3053,6 +3167,7 @@ def build_application(show_on_start: bool = False):
             }
             self.selection_generation = 0
             self.track_cache_save_pending = False
+            self.settings_save_pending = False
             self.had_subscriber = False
             self.disconnect_generation = 0
             self.cookie_save_source = 0
@@ -3079,6 +3194,7 @@ def build_application(show_on_start: bool = False):
                 GLib.idle_add(self.window.hide)
 
         def do_shutdown(self):
+            self._save_settings()
             self.control_server.close()
             self.playback.close()
             self.artwork_cache.close()
@@ -3452,6 +3568,19 @@ def build_application(show_on_start: bool = False):
         def _artwork_ready_from_thread(self):
             GLib.idle_add(self._publish_status_once)
 
+        def _save_settings(self):
+            self.settings_save_pending = False
+            try:
+                settings_store.save({"v": 1, **self.playback.volume_status()})
+            except OSError:
+                pass
+            return False
+
+        def _settings_changed(self):
+            if not self.settings_save_pending:
+                self.settings_save_pending = True
+                GLib.idle_add(self._save_settings)
+
         def _secure_status(self, payload):
             state = validate_status_payload(payload)
             if state is None:
@@ -3502,9 +3631,10 @@ def build_application(show_on_start: bool = False):
             return False
 
         def build_status(self):
-            return self._secure_status(
-                merge_status(self.page_status.values, self.playback.status())
-            )
+            return self._secure_status({
+                **merge_status(self.page_status.values, self.playback.status()),
+                **self.playback.volume_status(),
+            })
 
         def _publish_status(self):
             if not self.status_subscribers:
@@ -3709,6 +3839,23 @@ def build_application(show_on_start: bool = False):
                             publish_status=True,
                         ),
                     )
+            elif command.startswith(("volume:", "volume-step:")) or command == "mute":
+                level = volume_from_command(command)
+                step = volume_step_from_command(command)
+                ok = command == "mute" or level is not None or step is not None
+                if command == "mute":
+                    self.playback.toggle_mute()
+                elif level is not None:
+                    self.playback.set_volume(level)
+                elif step is not None:
+                    self.playback.adjust_volume(step)
+                if ok:
+                    self._settings_changed()
+                self._respond(
+                    connection, request_id,
+                    {"ok": ok, "running": True, **self.playback.volume_status()},
+                    publish_status=True,
+                )
             elif command.startswith("seek:"):
                 try:
                     ratio = float(command.partition(":")[2])

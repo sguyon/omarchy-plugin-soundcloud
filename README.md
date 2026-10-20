@@ -104,6 +104,7 @@ not require another sign-in:
 
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached Home and Feed track lists (titles, artists, links)
+- `settings.json`: the volume level and whether it is muted
 
 The runtime directory `$XDG_RUNTIME_DIR/omarchy-soundcloud/` (lock file and the
 optional `pagination.log`) is also kept until logout.

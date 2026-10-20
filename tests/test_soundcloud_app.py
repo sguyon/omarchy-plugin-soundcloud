@@ -2482,12 +2482,15 @@ class FakeConnection:
 class SeekCommandTest(unittest.TestCase):
     """The seek and seek-by socket commands, through the real application class."""
 
-    def build(self):
+    def build(self, settings=None):
         self.app = load_module()
         self.glib, self.gst = FakeGLib(), fake_gst()
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        data = directory / "data" / "omarchy-soundcloud"
+        data = self.data = directory / "data" / "omarchy-soundcloud"
         data.mkdir(parents=True, mode=0o700)
+        if settings is not None:
+            (data / "settings.json").write_text(json.dumps(settings))
+            os.chmod(data / "settings.json", 0o600)
         Gtk = type("Gtk", (), {"Application": type("Application", (), {
             "__init__": lambda self, **_kw: None, "hold": lambda self: None,
             "quit": lambda self: None, "do_shutdown": lambda self: None,
@@ -2721,6 +2724,245 @@ class LaunchBackendTest(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(stdout.getvalue())["error"], self.missing["error"])
+
+
+class SettingsCommandParsingTest(unittest.TestCase):
+    def test_volume_commands_accept_finite_numbers_and_clamp(self):
+        app = load_module()
+
+        self.assertEqual(app.volume_from_command("volume:0.4"), 0.4)
+        self.assertEqual(app.volume_from_command("volume:7"), 1.0)
+        self.assertEqual(app.volume_from_command("volume:-2"), 0.0)
+        for bad in ("volume:", "volume:loud", "volume:nan", "volume:inf", "volume-step:0.1", "mute"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(app.volume_from_command(bad))
+        self.assertEqual(app.volume_step_from_command("volume-step:-0.05"), -0.05)
+        self.assertEqual(app.volume_step_from_command("volume-step:5"), 1.0)
+        for bad in ("volume-step:", "volume-step:x", "volume-step:inf", "volume:0.5"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(app.volume_step_from_command(bad))
+
+
+class SettingsStoreTest(unittest.TestCase):
+    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False}
+
+    def store(self, content=None):
+        app = load_module()
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        path = directory / "settings.json"
+        if content is not None:
+            path.write_bytes(content)
+            os.chmod(path, 0o600)
+        return app, app.SettingsStore(fd), path
+
+    def test_bad_settings_files_and_values_fall_back_to_the_defaults(self):
+        with self.subTest('missing or garbage files give the defaults'):
+            for content in (None, b"{broken", b"[1,2]", b'{"v":2,"volume":0.2}', b"\xff\xfe"):
+                with self.subTest(content=content):
+                    _app, store, _path = self.store(content)
+                    self.assertEqual(store.load(), self.DEFAULTS)
+        with self.subTest('each bad value falls back on its own'):
+            _app, store, _path = self.store(json.dumps({
+                "v": 1, "volume": 3, "muted": True}).encode())
+
+            self.assertEqual(store.load(), {**self.DEFAULTS, "muted": True})
+            _app, store, _path = self.store(json.dumps({
+                "v": 1, "volume": 0.2, "muted": "yes"}).encode())
+
+            self.assertEqual(store.load(), {**self.DEFAULTS, "volume": 0.2})
+        with self.subTest('an oversized file is ignored'):
+            app, store, _path = self.store(b'{"v":1,"volume":0.2,"pad":"' + b"x" * 5000 + b'"}')
+
+            self.assertGreater(5000, app.MAX_SETTINGS_BYTES)
+            self.assertEqual(store.load(), self.DEFAULTS)
+
+    def test_settings_round_trip_privately(self):
+        _app, store, path = self.store()
+
+        store.save({"v": 1, "volume": 0.35, "muted": True})
+
+        self.assertEqual(store.load(), {"v": 1, "volume": 0.35, "muted": True})
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_only_the_known_keys_are_kept_so_a_new_setting_is_added_on_purpose(self):
+        app, store, _path = self.store()
+
+        store.save({"v": 1, "volume": 0.5, "muted": False, "somethingNew": True})
+
+        self.assertEqual(store.load(), {"v": 1, "volume": 0.5, "muted": False})
+        self.assertEqual(set(app.DEFAULT_SETTINGS), {"v", "volume", "muted"})
+
+
+class GstVolumeTest(unittest.TestCase):
+    def player(self, Gst=None, **options):
+        player = load_module().GstPlayback(Gst or fake_gst(), lambda: None, **options)
+        self.addCleanup(player.hls_executor.shutdown, False)
+        return player
+
+    def start(self, player, protocol="", mime_type=""):
+        player.begin({"title": "A", "playbackId": "soundcloud:tracks:1"})
+        self.assertTrue(player.play("https://x.sndcdn.com/a", {"title": "A"}, protocol, mime_type))
+
+    def test_the_volume_reaches_a_playbin_and_the_hls_volume_element(self):
+        player = self.player(volume=0.5)
+        self.start(player)
+        self.assertEqual(player.current.properties["volume"], 0.5)
+        player.set_volume(0.25)
+        self.assertEqual(player.current.properties["volume"], 0.25)
+
+        hls = self.player(volume=0.5)
+        self.start(hls, "hls", "audio/mpeg")
+        self.assertEqual(hls.current.volume.properties["volume"], 0.5)
+        hls.set_volume(0.75)
+        self.assertEqual(hls.current.volume.properties["volume"], 0.75)
+
+    def test_the_hls_pipeline_has_a_volume_element_before_the_sink(self):
+        Gst = fake_gst()
+        described = []
+        parse = Gst.parse_launch
+        Gst.parse_launch = staticmethod(lambda text: described.append(text) or parse(text))
+        player = self.player(Gst)
+
+        self.start(player, "hls", "audio/mpeg")
+
+        self.assertIn("audioresample ! volume name=volume ! autoaudiosink", described[0])
+
+    def test_volume_zero_means_muted_and_mute_keeps_the_volume(self):
+        player = self.player()
+        self.start(player)
+
+        player.set_volume(0.6)
+        player.toggle_mute()
+        self.assertEqual(player.volume_status(), {"volume": 0.6, "muted": True})
+        self.assertEqual(player.current.properties["volume"], 0.0)
+        player.toggle_mute()
+        self.assertEqual(player.volume_status(), {"volume": 0.6, "muted": False})
+        self.assertEqual(player.current.properties["volume"], 0.6)
+
+        player.set_volume(0)
+        self.assertEqual(player.volume_status(), {"volume": 0.0, "muted": True})
+        player.toggle_mute()  # unmuting from 0 returns to the last audible level
+        self.assertEqual(player.volume_status(), {"volume": 0.6, "muted": False})
+        player.set_volume(0)
+        player.set_volume(0.3)  # raising the volume unmutes
+        self.assertEqual(player.volume_status(), {"volume": 0.3, "muted": False})
+
+    def test_steps_adjust_and_clamp(self):
+        player = self.player(volume=0.5)
+
+        player.adjust_volume(0.1)
+        self.assertEqual(player.volume, 0.6)
+        player.adjust_volume(0.7)
+        self.assertEqual(player.volume, 1.0)
+        player.adjust_volume(-2)
+        self.assertEqual(player.volume_status(), {"volume": 0.0, "muted": True})
+
+    def test_a_new_track_starts_at_the_current_volume_and_mute(self):
+        player = self.player(volume=0.4, muted=True)
+
+        self.start(player)
+
+        self.assertEqual(player.current.properties["volume"], 0.0)
+        player.toggle_mute()
+        self.assertEqual(player.current.properties["volume"], 0.4)
+        self.start(player)
+        self.assertEqual(player.current.properties["volume"], 0.4)
+
+    def test_changing_the_volume_with_nothing_playing_is_fine(self):
+        player = self.player()
+
+        player.set_volume(0.2)
+        player.toggle_mute()
+
+        self.assertEqual(player.volume_status(), {"volume": 0.2, "muted": True})
+
+
+class SettingsStatusFieldsTest(unittest.TestCase):
+    BASE = {"playerPresent": False, "playing": False, "title": "", "artist": "", "artUrl": "",
+            "loggedIn": True, "url": "", "duration": 0, "position": 0}
+
+    def test_the_new_keys_pass_when_valid(self):
+        app = load_module()
+
+        status = app.validate_status_payload({**self.BASE, "volume": 0.5, "muted": True})
+
+        self.assertEqual((status["volume"], status["muted"]), (0.5, True))
+
+    def test_invalid_values_are_left_out(self):
+        app = load_module()
+
+        status = app.validate_status_payload({**self.BASE, "volume": 2, "muted": "yes"})
+
+        for key in ("volume", "muted"):
+            self.assertNotIn(key, status)
+        self.assertNotIn("volume", app.validate_status_payload({**self.BASE, "volume": float("nan")}))
+
+    def test_a_payload_without_the_new_keys_is_unchanged(self):
+        app = load_module()
+
+        status = app.validate_status_payload(self.BASE)
+
+        for key in ("volume", "muted"):
+            self.assertNotIn(key, status)
+
+
+class VolumeCommandTest(unittest.TestCase):
+    """The volume socket commands, through the real application class."""
+
+    build = SeekCommandTest.build
+    command = SeekCommandTest.command
+    start = SeekCommandTest.start
+
+    def saved_settings(self):
+        fd = os.open(self.data, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        return self.app.SettingsStore(fd).load()
+
+    def test_volume_commands_change_the_status_and_are_saved_privately(self):
+        self.build()
+
+        reply = self.command("volume:0.4")
+        self.assertEqual((reply.reply["ok"], reply.reply["volume"], reply.reply["muted"]), (True, 0.4, False))
+        self.assertEqual(self.command("mute").reply["muted"], True)
+        status = self.application.build_status()
+        self.assertEqual((status["volume"], status["muted"]), (0.4, True))  # mute keeps the volume
+        self.assertEqual(self.command("volume-step:-0.1").reply["volume"], 0.3)
+        self.assertFalse(self.application.build_status()["muted"])
+        self.assertFalse(self.command("volume:loud").reply["ok"])
+        self.assertFalse(self.command("volume-step:inf").reply["ok"])
+        self.assertEqual(self.application.playback.volume, 0.3)
+        self.command("volume:0")
+        self.assertTrue(self.application.build_status()["muted"])
+
+        self.assertFalse((self.data / "settings.json").exists())  # debounced
+        self.glib.run_idle()
+        self.assertEqual(self.saved_settings()["volume"], 0.0)
+        self.assertTrue(self.saved_settings()["muted"])
+        self.assertEqual(stat.S_IMODE((self.data / "settings.json").stat().st_mode), 0o600)
+
+    def test_a_volume_set_before_a_track_applies_to_the_next_one(self):
+        self.build()
+        self.command("volume:0.25")
+
+        pipeline = self.start()
+
+        self.assertEqual(pipeline.properties["volume"], 0.25)
+
+    def test_saved_settings_are_restored_at_startup(self):
+        self.build(settings={"v": 1, "volume": 0.3, "muted": True})
+
+        status = self.application.build_status()
+
+        self.assertEqual((status["volume"], status["muted"]), (0.3, True))
+
+    def test_defaults_without_a_settings_file(self):
+        self.build()
+
+        status = self.application.build_status()
+
+        self.assertEqual((status["volume"], status["muted"]), (1.0, False))
 
 
 class BarWidgetTest(unittest.TestCase):
