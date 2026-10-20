@@ -1211,6 +1211,60 @@ eval({json.dumps(capture_script)});
         self.assertIn("/tracks?", result["calls"][1])
         self.assertNotIn("private-test-value", completed.stdout)
 
+    def test_home_rows_with_only_encrypted_streams_carry_the_encrypted_flag(self):
+        app = load_module()
+        capture_script = app.api_request_capture_script()
+        harness = f"""
+const posted = [];
+global.location = {{ href: 'https://soundcloud.com/discover', hostname: 'soundcloud.com', pathname: '/discover' }};
+global.window = global;
+window.webkit = {{ messageHandlers: {{
+  omarchyTracks: {{ postMessage(value) {{ posted.push(JSON.parse(value)); }} }},
+  omarchyPlayback: {{ postMessage() {{}} }}
+}} }};
+const stream = (protocol, name) => ({{ url: 'https://api-v2.soundcloud.com/media/' + name, format: {{ protocol, mime_type: 'audio/mpeg' }} }});
+const track = (id, name, transcodings) => ({{ kind: 'track', id, urn: 'soundcloud:tracks:' + id,
+  permalink_url: 'https://soundcloud.com/a/' + name, title: name, duration: 1000, user: {{ username: 'A' }},
+  media: transcodings === undefined ? undefined : {{ transcodings }} }});
+window.fetch = async function() {{
+  return new Response(JSON.stringify({{ collection: [
+    track(1, 'locked', [stream('cbc-encrypted-hls', 'a'), stream('ctr-encrypted-hls', 'b')]),
+    track(2, 'plain', [stream('hls', 'c'), stream('ctr-encrypted-hls', 'd')]),
+    track(3, 'progressive', [stream('progressive', 'e')]),
+    track(4, 'empty', []),
+    track(5, 'nomedia', undefined),
+    track(6, 'junk', [null, 'x', {{ url: 'https://api-v2.soundcloud.com/media/f' }}])
+  ], next_href: null }}), {{ status: 200 }});
+}};
+global.XMLHttpRequest = function() {{}};
+XMLHttpRequest.prototype.open = function() {{}};
+XMLHttpRequest.prototype.setRequestHeader = function() {{}};
+XMLHttpRequest.prototype.send = function() {{}};
+XMLHttpRequest.prototype.addEventListener = function() {{}};
+eval({json.dumps(capture_script)});
+(async () => {{
+  await window.fetch(new Request('https://api-v2.soundcloud.com/mixed-selections?client_id=public-test', {{ headers: {{ authorization: 'OAuth private-test-value' }} }}));
+  for (let index = 0; index < 6; index++) await new Promise(setImmediate);
+  process.stdout.write(JSON.stringify({{ posted }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
+        posted = json.loads(completed.stdout)["posted"]
+
+        self.assertEqual(len(posted), 1)
+        by_title = {track["title"]: track for track in posted[0]["tracks"]}
+        self.assertIs(by_title["locked"].get("encrypted"), True)
+        for title in ("plain", "progressive", "empty", "nomedia"):
+            self.assertNotIn("encrypted", by_title[title], title)
+        # junk entries offer no playable stream either, as track_from_entry decides
+        self.assertIs(by_title["junk"].get("encrypted"), True)
+        # the flag passes the same validation the likes rows go through, and only when true
+        checked = {row["title"]: row for row in app.validate_tracks_payload(posted[0])["tracks"]}
+        self.assertIs(checked["locked"]["encrypted"], True)
+        self.assertNotIn("encrypted", checked["plain"])
+        self.assertLessEqual(len(completed.stdout), 20_000)
+        self.assertNotIn("private-test-value", completed.stdout)
+
     def test_playback_resolves_unknown_track_id_directly_without_dom_or_list_map(self):
         app = load_module()
         capture_script = app.api_request_capture_script()
@@ -3135,6 +3189,45 @@ class QueueStatusTest(unittest.TestCase):
         self.assertEqual(app.restored_status(row, 900_000)["position"], 200.0)
 
 
+class AutoSkipTest(unittest.TestCase):
+    def test_only_a_fast_failure_of_an_automatic_start_is_skipped(self):
+        app = load_module()
+        skip = app.AutoSkip()
+        skip.begin_chain(5)
+
+        skip.started(1, automatic=False, now=10.0)
+        self.assertFalse(skip.should_skip(1, 10.5))      # a track the user picked
+        skip.started(2, automatic=True, now=20.0)
+        self.assertFalse(skip.should_skip(2, 22.5))      # failed after the window
+        self.assertFalse(skip.should_skip(1, 20.5))      # a stale generation
+        self.assertTrue(skip.should_skip(2, 21.9))
+
+    def test_the_chain_is_capped_at_the_queue_length_when_it_began(self):
+        app = load_module()
+        skip = app.AutoSkip()
+        skip.begin_chain(3)
+
+        results = []
+        for generation in range(1, 6):
+            skip.started(generation, automatic=True, now=0.0)
+            results.append(skip.should_skip(generation, 0.1))
+
+        self.assertEqual(results, [True, True, True, False, False])
+        self.assertEqual(skip.notice(), "Skipped 3 tracks that can't play")
+
+    def test_a_user_start_ends_the_chain_and_one_skip_reads_in_the_singular(self):
+        app = load_module()
+        skip = app.AutoSkip()
+        skip.begin_chain(2)
+        skip.started(1, automatic=True, now=0.0)
+        skip.should_skip(1, 0.1)
+        self.assertEqual(skip.notice(), "Skipped 1 track that can't play")
+
+        skip.started(2, automatic=False, now=1.0)
+
+        self.assertEqual(skip.skipped, 0)
+
+
 class TrackLikesTest(unittest.TestCase):
     def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
         app = load_module()
@@ -4334,6 +4427,36 @@ class GstVolumeTest(unittest.TestCase):
 
 
 class TrackFlagsTest(unittest.TestCase):
+    def transcodings(self, *protocols):
+        return {"transcodings": [
+            {"url": f"https://api-v2.soundcloud.com/media/{n}", "format": {"protocol": protocol}}
+            for n, protocol in enumerate(protocols)]}
+
+    def test_a_track_offering_only_encrypted_streams_is_marked(self):
+        app = load_module()
+
+        row = app.track_from_entry(like_item(
+            1, media=self.transcodings("cbc-encrypted-hls", "ctr-encrypted-hls")))
+
+        self.assertIs(row["encrypted"], True)
+
+    def test_a_playable_stream_or_no_media_information_leaves_the_row_unchanged(self):
+        app = load_module()
+        plain = app.track_from_entry(like_item(1))
+        for media in (self.transcodings("hls", "ctr-encrypted-hls"), self.transcodings("progressive"),
+                      self.transcodings(), {"transcodings": "x"}, "x"):
+            with self.subTest(media=media):
+                row = app.track_from_entry(like_item(1, media=media))
+                self.assertEqual(row, plain)
+                self.assertNotIn("encrypted", row)
+
+    def test_malformed_transcodings_count_as_no_plain_stream(self):
+        app = load_module()
+
+        row = app.track_from_entry(like_item(1, media={"transcodings": [None, {"format": "hls"}]}))
+
+        self.assertIs(row["encrypted"], True)
+
     def test_the_row_validator_keeps_the_flags_only_when_true(self):
         app = load_module()
         base = PlayQueueTest.row(None, 1)

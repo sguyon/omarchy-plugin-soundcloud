@@ -77,6 +77,8 @@ NOTIFICATION_TIMEOUT_SECONDS = 3.0
 PREVIOUS_RESTART_SECONDS = 3.0
 REPEAT_MODES = ("none", "one", "all")
 QUEUE_SOURCES = ("home", "feed", "likes", "history")
+# A track that fails this soon after an automatic start is skipped instead of stopping the queue.
+AUTO_SKIP_WINDOW_SECONDS = 2.0
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
@@ -1252,6 +1254,11 @@ def api_request_capture_script() -> str:
             tracks.push(track);
             const transcodings = value.media && Array.isArray(value.media.transcodings)
               ? value.media.transcodings : [];
+            // Offered streams but none the plugin can play: only encrypted HLS.
+            if (transcodings.length > 0 && !transcodings.some((item) => item && item.format
+                && ['hls', 'progressive'].includes(item.format.protocol))) {
+              track.encrypted = true;
+            }
             const playable = transcodings
               .filter((item) => item && item.format && typeof item.url === 'string'
                 && item.url.length <= 4096
@@ -2037,6 +2044,48 @@ class PageStatusCache:
         self.evaluate(self.script, finished)
 
 
+class AutoSkip:
+    """Remembers which track start was automatic, so a track that fails at once can be skipped.
+
+    A chain of skips starts when a track ends by itself and is capped at the queue length
+    then, so a queue where nothing plays cannot loop. A track the user picks is never skipped.
+    The user's own Next (`direction` 1) and Previous (-1) are skipped on failure too, in their
+    direction, with the same cap.
+    """
+
+    def __init__(self):
+        self.automatic = False
+        self.direction = 0
+        self.generation = -1
+        self.started_at = 0.0
+        self.skipped = 0
+        self.limit = 0
+
+    def begin_chain(self, queue_length: int) -> None:
+        self.skipped = 0
+        self.limit = queue_length
+
+    def started(self, generation: int, automatic: bool, now: float, direction: int = 0) -> None:
+        self.generation = generation
+        self.automatic = automatic
+        self.direction = direction
+        self.started_at = now
+        if not automatic and not direction:
+            self.skipped = 0
+
+    def should_skip(self, generation: int, now: float) -> bool:
+        """Whether the failure of the track started under `generation` moves on. Counts it."""
+        if (not (self.automatic or self.direction) or generation != self.generation
+                or now - self.started_at > AUTO_SKIP_WINDOW_SECONDS
+                or self.skipped >= self.limit):
+            return False
+        self.skipped += 1
+        return True
+
+    def notice(self) -> str:
+        return f"Skipped {self.skipped} track{'' if self.skipped == 1 else 's'} that can't play"
+
+
 def validate_waveform(value: object) -> list[int]:
     if not isinstance(value, list) or len(value) > MAX_WAVEFORM_BARS:
         return []
@@ -2819,6 +2868,14 @@ def track_from_entry(item: object) -> dict[str, object] | None:
     art_url = track.get("artwork_url") or user.get("avatar_url") or ""
     play_count = track.get("playback_count")
     played_at = item.get("played_at")
+    media = track.get("media") if isinstance(track.get("media"), dict) else {}
+    transcodings = media.get("transcodings") if isinstance(media.get("transcodings"), list) else []
+    # Offered streams but none the plugin can play: only encrypted HLS.
+    encrypted = bool(transcodings) and not any(
+        isinstance(entry, dict) and isinstance(entry.get("format"), dict)
+        and entry["format"].get("protocol") in ("hls", "progressive")
+        for entry in transcodings
+    )
     return {
         "playbackId": f"soundcloud:tracks:{track_id}",
         "title": _truncate_bytes(title.strip()[:MAX_TITLE_BYTES], MAX_TITLE_BYTES),
@@ -2829,6 +2886,7 @@ def track_from_entry(item: object) -> dict[str, object] | None:
         "durationMs": duration,
         **({"playedAt": played_at} if isinstance(played_at, int) and not isinstance(played_at, bool)
            and 0 < played_at <= MAX_PLAYED_AT_MS else {}),
+        **({"encrypted": True} if encrypted else {}),
     }
 
 
