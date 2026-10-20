@@ -2453,6 +2453,43 @@ class PlayUrlCommandTest(unittest.TestCase):
                 )
             self.assertEqual(str(raised.exception), message)
 
+    def test_next_uses_link_next_and_otherwise_behaves_like_play_now(self):
+        with self.subTest('next sends link next and announces that it was queued'):
+            queued = {"ok": True, "running": True, "queued": True, "title": "Song 9", "artist": "Band"}
+
+            code, result, sent, notices, popups = self.run_cli(
+                ["play-url", "--next", "--notify", "--open", "https://m.soundcloud.com/artist/song?si=abc"],
+                responses=queued, playback={"playbackState": "error"},  # never read: it plays later
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(result, queued)
+            self.assertEqual(sent, ["link-next:https://soundcloud.com/artist/song"])
+            self.assertEqual(notices, ["Playing next: Song 9 — Band"])
+            self.assertEqual(popups, [True])
+        with self.subTest('next on an idle player waits for the track like play now'):
+            code, _result, sent, notices, _popups = self.run_cli(
+                ["play-url", "--next", "--notify", "https://soundcloud.com/artist/song"]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(sent, ["link-next:https://soundcloud.com/artist/song"])
+            self.assertEqual(notices, ["Playing: Song 7 — Artist"])
+        with self.subTest('next validates the link and reports backend errors like play now'):
+            code, result, sent, notices, _popups = self.run_cli(
+                ["play-url", "--next", "--notify", "https://soundcloud.com/artist/sets/mix"],
+                backend_running=False,
+            )
+            self.assertEqual((code, sent, notices), (1, [], ["Playlists aren't supported yet. Copy a track link"]))
+            self.assertFalse(result["ok"])
+
+            code, result, _sent, notices, popups = self.run_cli(
+                ["play-url", "--next", "--notify", "--open", "https://soundcloud.com/artist/song"],
+                responses={"ok": False, "running": True, "error": "Track not found. It may be private or deleted"},
+            )
+            self.assertEqual((code, popups), (1, []))
+            self.assertEqual(notices, ["Track not found. It may be private or deleted"])
+
 
 class DesktopNotificationTest(unittest.TestCase):
     def test_desktop_notification_separates_options_times_out_and_cleans_the_text(self):
@@ -4711,6 +4748,163 @@ class QueuePlaybackTest(unittest.TestCase):
     # pasted links
 
     LINK = "https://soundcloud.com/artist/song-50"
+
+    def stub_links(self, track="row", error=None):
+        """Make the link lookup answer without the network; returns the texts it was asked for."""
+        calls = []
+
+        def resolve_link(text):
+            calls.append(text)
+            if error is not None:
+                raise error
+            return self.row(50) if track == "row" else track
+
+        self.application.track_likes.resolve_link = resolve_link
+        return calls
+
+    def run_link(self, command):
+        connection = self.command(command)
+        self.glib.run_idle()  # the lookup finished off the main loop and now reports back
+        return connection
+
+    def test_link_next_rules(self):
+        with self.subTest('link next queues the track as play next while something plays'):
+            self.play_four()
+            calls = self.stub_links()
+            started = len(self.evaluated)
+            self.glib.timers.clear()
+
+            reply = self.run_link("link-next:" + self.LINK).reply
+
+            self.assertEqual(calls, [self.LINK])
+            self.assertEqual((reply["ok"], reply["queued"], reply["title"], reply["artist"]),
+                             (True, True, "Song 50", "Artist"))
+            self.assertEqual([row["title"] for row in self.application.queue.explicit], ["Song 50"])
+            self.assertEqual(len(self.evaluated), started)  # the current track plays on
+            self.assertTrue(self.glib.timers)  # the status goes out
+            self.assertIn("soundcloud:tracks:50", self.application.playback_tracks)
+            self.command("next")
+            self.assertEqual(self.started_id(), "50")
+            self.glib.run_idle()
+            self.assertIn("soundcloud:tracks:50", json.loads(self.queue_file.read_text())["items"][1]["playbackId"])
+        with self.subTest('link next accepts a percent encoded link and a raw one with a secret token'):
+            self.play_four()
+            calls = self.stub_links()
+
+            encoded = "https%3A%2F%2Fsoundcloud.com%2Fartist%2Fsong-50%3Fsecret_token%3Ds-AbC12"
+            self.assertTrue(self.run_link("link-next:" + encoded).reply["ok"])
+            self.assertTrue(self.run_link("link-next:https://soundcloud.com/artist/song-50?secret_token=s-AbC12").reply["ok"])
+            self.assertTrue(self.run_link("link-next:soundcloud.com%2Fartist%2Fsong-50").reply["ok"])
+
+            self.assertEqual(calls, ["https://soundcloud.com/artist/song-50?secret_token=s-AbC12"] * 2
+                             + ["soundcloud.com/artist/song-50"])
+        with self.subTest('link next plays at once when nothing is playing'):
+            self.build()
+            self.stub_links()
+
+            reply = self.run_link("link-next:" + self.LINK)
+            self.assertEqual(self.started_id(), "50")
+            self.resolve()
+
+            self.assertTrue(reply.reply["ok"])
+            self.assertNotIn("queued", reply.reply)
+            self.assertEqual(self.queue_ids(), ["50"])
+            self.assertEqual(self.application.playback.state, "playing")
+        with self.subTest('link next plays at once after the last track has ended'):
+            self.build()
+            self.command("autoplay:off")
+            self.play_last_of_two()
+            self.end_track()
+            self.stub_links()
+
+            self.run_link("link-next:" + self.LINK)
+
+            self.assertEqual(self.started_id(), "50")
+            self.assertEqual(self.application.queue.explicit, [])
+        with self.subTest('link next queues behind a paused track'):
+            self.play_four()
+            self.command("play-pause")
+            deliver(self.application.playback, "state", self.gst.State.PAUSED)
+            self.assertEqual(self.application.playback.state, "paused")
+            self.stub_links()
+
+            reply = self.run_link("link-next:" + self.LINK).reply
+
+            self.assertTrue(reply["queued"])
+            self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+
+    def test_link_play_replaces_the_queue_and_plays_the_track_now(self):
+        self.play_four()
+        calls = self.stub_links()
+
+        reply = self.run_link("link-play:" + self.LINK)
+        self.assertEqual(self.started_id(), "50")
+        self.resolve()
+
+        self.assertEqual(calls, [self.LINK])
+        self.assertTrue(reply.reply["ok"])
+        self.assertEqual(self.queue_ids(), ["50"])
+        self.assertEqual(self.application.queue.explicit, [])
+
+    def test_link_errors_keep_the_user_facing_messages_in_the_reply_and_the_status(self):
+        self.play_four()
+        calls = self.stub_links()
+        app = self.app
+
+        for command, message in (
+            ("link-next:not a link", app.NOT_SOUNDCLOUD_MESSAGE),
+            ("link-play:https://example.com/a/b", app.NOT_SOUNDCLOUD_MESSAGE),
+            ("link-next:https://soundcloud.com/artist", app.ARTIST_PAGE_MESSAGE),
+            ("link-play:https://soundcloud.com/artist/sets/mix", app.PLAYLIST_MESSAGE),
+            ("link-next:https://soundcloud.com/artist/song/extra", app.NOT_A_TRACK_MESSAGE),
+            ("link-next:", "Copy a single SoundCloud track link first"),
+        ):
+            reply = self.run_link(command).reply
+            self.assertEqual((reply["ok"], reply["error"]), (False, message), command)
+            self.assertEqual(self.application.build_status()["error"], message, command)
+        self.assertEqual(calls, [])  # nothing was looked up
+
+    def test_link_lookup_errors_reach_the_reply_and_the_status(self):
+        self.play_four()
+        app = self.app
+
+        for error, message in (
+            (app.LinkError(app.PLAYLIST_MESSAGE), app.PLAYLIST_MESSAGE),
+            (app.LinkError(app.ARTIST_PAGE_MESSAGE), app.ARTIST_PAGE_MESSAGE),
+            (app.LinkError(app.CANT_PLAY_MESSAGE), app.CANT_PLAY_MESSAGE),
+            (PermissionError("no"), "Sign in to SoundCloud first"),
+            (OSError("down"), "Couldn't reach SoundCloud. Try again"),
+        ):
+            self.stub_links(error=error)
+            for command in ("link-next:" + self.LINK, "link-play:" + self.LINK):
+                reply = self.run_link(command).reply
+                self.assertEqual((reply["ok"], reply["error"]), (False, message), command)
+                self.assertEqual(self.application.build_status()["error"], message)
+        self.stub_links(track=None)
+        self.assertEqual(self.run_link("link-next:" + self.LINK).reply["error"], app.CANT_PLAY_MESSAGE)
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        self.assertEqual(self.application.queue.explicit, [])
+        self.assertEqual(self.application.playback.state, "playing")
+
+    def test_a_link_error_leaves_the_status_after_a_few_seconds(self):
+        self.play_four()
+        self.stub_links(error=self.app.LinkError(self.app.PLAYLIST_MESSAGE))
+        self.run_link("link-next:" + self.LINK)
+
+        self.application.notice_until = 0.0
+
+        self.assertFalse(self.application.build_status().get("error"))
+
+    def test_links_parse_with_their_mode_and_decode_only_a_wholly_encoded_link(self):
+        app = load_module()
+
+        self.assertEqual(app.link_from_command("link-next:https://a/b%20c"), ("next", "https://a/b%20c"))
+        self.assertEqual(app.link_from_command("link-play:x%2Fy"), ("play", "x/y"))
+        self.assertEqual(app.link_from_command("link-play:x%2fy"), ("play", "x/y"))
+        self.assertEqual(app.link_from_command("link-play:"), ("play", ""))
+        self.assertIsNone(app.link_from_command("link:x"))
+        self.assertIsNone(app.link_from_command("link-nextx"))
+        self.assertIsNone(app.link_from_command("play-url:https://a/b"))
 
     def test_picking_an_encrypted_only_track_fails_at_once_with_the_real_reason(self):
         self.build()

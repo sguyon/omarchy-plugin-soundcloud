@@ -708,6 +708,21 @@ def queue_move_from_command(command: str) -> tuple[str, int] | None:
     return track_id, max(-MAX_TRACKS, min(MAX_TRACKS, int(offset)))
 
 
+def link_from_command(command: str) -> tuple[str, str] | None:
+    """`link-next:<url>` or `link-play:<url>` as (mode, link text), mode "next" or "play".
+
+    The URL may be percent-encoded as a whole (no slash left in it) or raw. Whether it is a
+    SoundCloud track link is decided later by `parse_track_link`, as the CLI does.
+    """
+    for prefix, mode in (("link-next:", "next"), ("link-play:", "play")):
+        if command.startswith(prefix):
+            text = command.removeprefix(prefix)
+            if "/" not in text and re.search(r"%2f", text, re.IGNORECASE):
+                text = unquote(text)
+            return mode, text
+    return None
+
+
 def repeat_from_command(command: str, current: str) -> str | None:
     """The mode a `repeat` command asks for: bare `repeat` cycles none, one, all."""
     if command == "repeat":
@@ -4460,12 +4475,27 @@ def build_application(show_on_start: bool = False):
                 self._play_when_page_ready(row, None, None, automatic=True)
             return False
 
-        def _play_link(self, link_text, connection, request_id):
-            """Play a pasted track link. The link is checked here the way the CLI checks it; the
-            lookup runs off the main loop and always reports back."""
+        def _nothing_playing(self):
+            """Whether a pasted link should start at once: no track loaded, or the last one ended."""
+            state = self.playback.state
+            if state in ("idle", "error"):
+                return self.restored_position_ms is None
+            return state == "paused" and self.queue_finished
+
+        def _play_link(self, mode, link_text, connection, request_id, show_error=False):
+            """Play a pasted track link ("play"), or queue it as play next, or play it at once
+            when nothing is playing ("next"). The link is checked here the way the CLI checks it;
+            the lookup runs off the main loop. A failure goes in the reply and, with `show_error`,
+            in the status for the popup."""
 
             def fail(message):
-                self._respond(connection, request_id, {"ok": False, "running": True, "error": message})
+                if show_error:
+                    self.notice = message
+                    self.notice_until = time.monotonic() + SKIP_NOTICE_SECONDS
+                self._respond(
+                    connection, request_id, {"ok": False, "running": True, "error": message},
+                    publish_status=show_error,
+                )
                 return False
 
             try:
@@ -4477,6 +4507,16 @@ def build_application(show_on_start: bool = False):
                 if track is None or not self._remember_playback_track(track):
                     return fail(error or CANT_PLAY_MESSAGE)
                 track = self.playback_tracks[track["playbackId"]]
+                if mode == "next" and not self._nothing_playing():
+                    self.queue.play_next(track)
+                    self._queue_changed()
+                    self._respond(
+                        connection, request_id,
+                        {"ok": True, "running": True, "queued": True,
+                         "title": track["title"], "artist": track["artist"]},
+                        publish_status=True,
+                    )
+                    return False
                 self.queue.replace([track], 0, "")
                 self._queue_changed()
                 self._play_when_page_ready(track, connection, request_id)
@@ -5098,6 +5138,8 @@ def build_application(show_on_start: bool = False):
                      **({} if done else {"error": "That track can't be moved"})},
                     publish_status=done,
                 )
+            elif (link := link_from_command(command)) is not None:
+                self._play_link(link[0], link[1], connection, request_id, show_error=True)
             elif command.startswith(("volume:", "volume-step:")) or command == "mute":
                 level = volume_from_command(command)
                 step = volume_step_from_command(command)
@@ -5172,7 +5214,7 @@ def build_application(show_on_start: bool = False):
                     publish_status=True,
                 )
             elif command.startswith("play-url:"):
-                self._play_link(command.removeprefix("play-url:"), connection, request_id)
+                self._play_link("play", command.removeprefix("play-url:"), connection, request_id)
             elif (playback_id := playback_id_from_command(command)) is not None:
                 row = self.playback_tracks.get(playback_id)
                 if row is None:
@@ -5406,8 +5448,10 @@ def open_popup() -> None:
         subprocess.run([shell, "shell", "summon", "brunosilveira.soundcloud"], check=False)
 
 
-def play_url_command(text: str, notify: bool, show: bool = False) -> int:
-    """Play a pasted SoundCloud track link, starting the backend if needed."""
+def play_url_command(text: str, notify: bool, show: bool = False, queue_next: bool = False) -> int:
+    """Play a pasted SoundCloud track link, starting the backend if needed.
+
+    With `queue_next` the track plays after the current one instead, or at once if nothing is playing."""
     def fail(message: str) -> int:
         print(json.dumps({"ok": False, "error": message}, sort_keys=True))
         if notify:
@@ -5422,9 +5466,17 @@ def play_url_command(text: str, notify: bool, show: bool = False) -> int:
         send_desktop_notification("Starting SoundCloud…")
     if not launch_backend(show=False).get("running") or not wait_for_backend():
         return fail("The SoundCloud backend didn't start")
-    response = request_backend("play-url:" + link, timeout=40.0)
+    response = request_backend(("link-next:" if queue_next else "play-url:") + link, timeout=40.0)
     if response is None:
         return fail("The SoundCloud backend didn't answer")
+    if response.get("ok") and response.get("queued") is True:
+        print(json.dumps(response, sort_keys=True))
+        if notify:
+            label = " — ".join(str(response[key]) for key in ("title", "artist") if response.get(key))
+            send_desktop_notification(f"Playing next: {label}" if label else "Playing next")
+        if show:
+            open_popup()
+        return 0
     if response.get("ok"):
         state = wait_for_playback()
         if state.get("playbackState") == "error":
@@ -5453,6 +5505,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     play_url = subparsers.add_parser("play-url", help="play a SoundCloud track link")
     play_url.add_argument("--notify", action="store_true", help="show what is playing, or what went wrong, as a desktop notification")
     play_url.add_argument("--open", action="store_true", help="open the bar popup once the track starts")
+    play_url.add_argument("--next", action="store_true", help="play after the current track instead of now (plays at once if nothing is playing)")
     play_url.add_argument("url")
     subparsers.add_parser("launch")
     subparsers.add_parser("ensure")
@@ -5474,7 +5527,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("running") else 1
     if command == "play-url":
-        return play_url_command(args.url, args.notify, args.open)
+        return play_url_command(args.url, args.notify, args.open, args.next)
     if command != "daemon":
         if command == "seek":
             if not math.isfinite(args.ratio):
