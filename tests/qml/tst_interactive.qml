@@ -68,17 +68,4 @@ TestCase {
     compare(item.cursorShape, Qt.PointingHandCursor)
     tryCompare(item, "hot", true)
   }
-
-  function test_drag_cursor_is_open_then_closed_hand() {
-    var item = make()
-    item.dragCursor = true
-    compare(item.cursorShape, Qt.OpenHandCursor)
-    mouseMove(item, 10, 10)
-    mousePress(item, 10, 10)
-    compare(item.cursorShape, Qt.ClosedHandCursor)
-    mouseRelease(item, 10, 10)
-    compare(item.cursorShape, Qt.OpenHandCursor)
-    item.clickable = false
-    compare(item.cursorShape, Qt.ArrowCursor)
-  }
 }

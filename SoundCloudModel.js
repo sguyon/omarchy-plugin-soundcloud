@@ -294,16 +294,17 @@ function volumeIconState(volume, muted) {
   return "high"
 }
 
-function volumeIconGlyph(state) {
-  if (state === "muted") return ""
-  if (state === "low") return ""
-  if (state === "medium") return ""
-  return ""
+// How many sound waves the volume icon draws (VolumeGlyph): one, two or three.
+function volumeWaves(state) {
+  if (state === "low") return 1
+  if (state === "medium") return 2
+  if (state === "high") return 3
+  return 0
 }
 
 // The volume icon's tooltip while the slider is not shown.
 function volumeTooltip(volume, muted) {
-  return muted === true ? "Muted (click to unmute)" : "Volume " + volumePercent(volume) + "% (click to mute)"
+  return muted === true ? "Muted (click or m to unmute)" : "Volume " + volumePercent(volume) + "% (click or m to mute)"
 }
 
 // The text next to the icon while the level changes.
@@ -517,6 +518,19 @@ function queueDragOffset(pixels, rowStep, index, count) {
   if (!(step > 0) || !Number.isFinite(Number(pixels)) || at < 1 || at > total - 1) return 0
   var places = Math.round(Number(pixels) / step)
   return Math.max(1 - at, Math.min(total - 1 - at, places)) || 0
+}
+
+// While a row is dragged from index `from` by `places` rows, the rows it passes
+// make room: those it moved past shift one row (`step` pixels) the other way.
+function queueDragShift(index, from, places, step) {
+  var at = Math.floor(Number(index))
+  var start = Math.floor(Number(from))
+  var moved = Math.floor(Number(places))
+  var size = Number(step)
+  if (!(size > 0) || !(start >= 0) || !Number.isFinite(at) || !Number.isFinite(moved) || at === start) return 0
+  if (moved > 0 && at > start && at <= start + moved) return -size
+  if (moved < 0 && at < start && at >= start + moved) return size
+  return 0
 }
 
 // The dim text on the queue toolbar: how many tracks follow the playing one.
@@ -804,7 +818,7 @@ if (typeof module !== "undefined") {
     volumePercent: volumePercent,
     volumeTooltip: volumeTooltip,
     volumeIconState: volumeIconState,
-    volumeIconGlyph: volumeIconGlyph,
+    volumeWaves: volumeWaves,
     volumeText: volumeText,
     wheelSteps: wheelSteps,
     volumeStepCommand: volumeStepCommand,
@@ -832,6 +846,7 @@ if (typeof module !== "undefined") {
     queueSelectionAfterUpdate: queueSelectionAfterUpdate,
     queueKeyMoveOffset: queueKeyMoveOffset,
     queueDragOffset: queueDragOffset,
+    queueDragShift: queueDragShift,
     keyAction: keyAction,
     filterTracks: filterTracks,
     filterCountText: filterCountText,

@@ -27,6 +27,14 @@ BarWidget {
   property string repeat: "none"
   property int queueCursor: -1
   property int queueLength: 0
+  // The held row is drawn as a copy above the list (the list does not paint a row that has
+  // scrolled far from its slot); this is its data (queueDrag holds where it is).
+  property var queueDragItem: null
+  property string queueDragArt: ""
+  // A queue edit (move, remove) replaces the list and the view would go back to the top:
+  // remember where it was and put it back when the new rows arrive.
+  property real queueKeepY: 0
+  property double queueKeepAt: 0
   // The signed-in account (empty until the status has it, and when logged out).
   property string accountName: ""
   property string accountAvatarDataUrl: ""
@@ -34,6 +42,9 @@ BarWidget {
   // The queue view replaces the track list below the tabs; queueData is the
   // last `queue` response ({cursor, items, explicit_count, autoplay}).
   property bool queueOpen: false
+  // One size for the rows of every list (tabs and queue).
+  readonly property real listRowHeight: Style.space(56)
+  readonly property real listArtSize: Style.space(48)
   // Keyboard selection in the track list (-1 = none). It resets when the tab
   // changes or the list is replaced, and Enter plays that row.
   property int selectedRow: -1
@@ -305,14 +316,29 @@ BarWidget {
   onQueueRowsChanged: {
     if (clearArmedSignature !== null
         && !SoundCloudModel.clearConfirmStays(clearArmedSignature, queueRows, queueOpen)) cancelClearQueue()
+    if (queueKeepAt > 0 && Date.now() - queueKeepAt <= 3000) {
+      var keep = queueKeepY
+      queueKeepAt = 0
+      Qt.callLater(function() {
+        queueList.contentY = Math.max(0, Math.min(keep, queueList.contentHeight - queueList.height))
+      })
+    }
   }
   onQueueOpenChanged: {
     if (!queueOpen && clearArmedSignature !== null) cancelClearQueue()
   }
 
+  function rememberQueueScroll() {
+    queueKeepY = queueList.contentY
+    queueKeepAt = Date.now()
+  }
+
+
   function moveQueueRow(playbackId, offset) {
     var command = SoundCloudModel.queueMoveCommand(playbackId, offset)
-    if (command !== "") sendCommand(command, "queue-edit")
+    if (command === "") return
+    rememberQueueScroll()
+    sendCommand(command, "queue-edit")
   }
 
   // Fire-and-forget commands (volume, switches, queue edits). The answer only
@@ -387,7 +413,10 @@ BarWidget {
   // runs the shell's own IPC call, `omarchy-shell osd show <json>`: one process
   // per 80 ms at most, the trailing timer sends the latest level. Without
   // execDetached the bar tooltip carries the level.
+  // Not while the popup is open: it shows its own slider, so there would be two
+  // volume bars at once.
   function showBarVolume() {
+    if (popupOpen) return
     if (typeof Quickshell.execDetached !== "function") {
       if (root.bar) root.bar.showTooltip(root, "Volume " + SoundCloudModel.volumeText(volume, muted))
       return
@@ -401,6 +430,7 @@ BarWidget {
   }
 
   function sendOsd() {
+    if (popupOpen) return
     lastOsdAt = Date.now()
     Quickshell.execDetached(SoundCloudModel.osdCommand(volume, muted))
   }
@@ -932,17 +962,34 @@ BarWidget {
 
   }
 
+  // The bar shows the pointing hand only over widgets registered as click
+  // targets (as Omarchy's own bar buttons do), and presses them through
+  // triggerPress.
+  property var registeredBar: null
+
+  function triggerPress(button) {
+    if (button === Qt.MiddleButton) root.runAction(root.running ? "play-pause" : "launch")
+    else if (button === Qt.RightButton && root.running && root.canNext) root.runAction("next")
+    else root.toggle()
+  }
+
+  function syncClickRegistration() {
+    if (registeredBar && registeredBar.unregisterClickTarget) registeredBar.unregisterClickTarget(root)
+    registeredBar = root.bar
+    if (registeredBar && registeredBar.registerClickTarget) registeredBar.registerClickTarget(root)
+  }
+
+  onBarChanged: syncClickRegistration()
+  Component.onCompleted: syncClickRegistration()
+  Component.onDestruction: if (registeredBar && registeredBar.unregisterClickTarget) registeredBar.unregisterClickTarget(root)
+
   MouseArea {
     anchors.fill: parent
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
     acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
 
-    onClicked: function(mouse) {
-      if (mouse.button === Qt.MiddleButton) root.runAction(root.running ? "play-pause" : "launch")
-      else if (mouse.button === Qt.RightButton && root.running && root.canNext) root.runAction("next")
-      else root.toggle()
-    }
+    onClicked: function(mouse) { root.triggerPress(mouse.button) }
     // A swipe over the icon changes the volume, not the track.
     VolumeControl {
       anchors.fill: parent
@@ -1156,6 +1203,7 @@ BarWidget {
             foreground: root.bar.foreground
             enabled: SoundCloudModel.queueButtonEnabled(root.actionBusy, root.hasTrack, root.canPrevious)
             opacity: enabled ? 1 : 0.4
+            tooltipText: "Previous (Shift+Left)"
             onClicked: root.runAction("previous")
           }
           Rectangle {
@@ -1187,7 +1235,7 @@ BarWidget {
 
             PanelToolTip {
               visible: playPauseMouse.hot
-              text: root.playing ? "Pause" : "Play"
+              text: root.playing ? "Pause (Space)" : "Play (Space)"
             }
           }
           Button {
@@ -1195,6 +1243,7 @@ BarWidget {
             foreground: root.bar.foreground
             enabled: SoundCloudModel.queueButtonEnabled(root.actionBusy, root.hasTrack, root.canNext)
             opacity: enabled ? 1 : 0.4
+            tooltipText: "Next (Shift+Right)"
             onClicked: root.runAction("next")
           }
         }
@@ -1234,7 +1283,7 @@ BarWidget {
 
           PanelToolTip {
             visible: likeMouse.hot
-            text: root.liked ? "Unlike" : "Like"
+            text: root.liked ? "Unlike (l)" : "Like (l)"
           }
         }
 
@@ -1244,13 +1293,26 @@ BarWidget {
           anchors.left: parent.left
           anchors.leftMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
-          iconText: SoundCloudModel.volumeIconGlyph(SoundCloudModel.volumeIconState(root.volume, root.muted))
           foreground: root.bar.foreground
+          readonly property string volumeState: SoundCloudModel.volumeIconState(root.volume, root.muted)
+          // The icon is drawn (one, two or three waves) because no icon font has all of them.
+          implicitWidth: volumeGlyph.width + horizontalPadding * 2 + _reservedBorderLeft + _reservedBorderRight
+          implicitHeight: Math.max(volumeGlyph.height, Style.font.icon * 1.4) + verticalPadding * 2
+            + _reservedBorderTop + _reservedBorderBottom
           // The tooltip would cover the slider.
           tooltipText: root.volumeShown ? "" : SoundCloudModel.volumeTooltip(root.volume, root.muted)
           onClicked: root.sendUi("mute")
 
           HoverHandler { id: volumeIconHover }
+
+          VolumeGlyph {
+            id: volumeGlyph
+            anchors.centerIn: parent
+            size: Style.font.icon * 1.2
+            color: root.bar.foreground
+            muted: volumeButton.volumeState === "muted"
+            waves: SoundCloudModel.volumeWaves(volumeButton.volumeState)
+          }
 
           VolumeControl {
             anchors.fill: parent
@@ -1499,6 +1561,7 @@ BarWidget {
             readonly property real iconNudge: Math.max(1, Math.round(Style.space(1)))
             foreground: root.bar.foreground
             selected: root.queueOpen
+            tooltipText: "Queue (q)"
             // Same height and padding as a text tab (its own row is empty, the
             // content below is drawn over it); the width only fits the content.
             implicitHeight: homeTab.implicitHeight
@@ -1651,7 +1714,7 @@ BarWidget {
             required property var modelData
             required property int index
             width: trackList.width
-            height: Style.space(56)
+            height: root.listRowHeight
             opacity: encrypted ? 0.5 : 1
             property var track: modelData
             property string artworkId: String(track.artworkId || "")
@@ -1701,8 +1764,8 @@ BarWidget {
 
             BorderSurface {
               id: trackArtwork
-              width: Style.space(48)
-              height: Style.space(48)
+              width: root.listArtSize
+              height: root.listArtSize
               anchors.left: parent.left
               anchors.leftMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
@@ -1864,16 +1927,6 @@ BarWidget {
           color: root.bar.foreground
         }
 
-        Rectangle {
-          anchors.right: parent.right
-          width: Style.space(2)
-          y: trackList.y + trackList.visibleArea.yPosition * trackList.height
-          height: Math.max(Style.space(18), trackList.visibleArea.heightRatio * trackList.height)
-          radius: width / 2
-          color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.35)
-          visible: trackList.visibleArea.heightRatio < 1
-        }
-
         Text {
           anchors.centerIn: parent
           visible: root.tracksLoading && root.tracks.length === 0
@@ -1956,15 +2009,15 @@ BarWidget {
               iconText: "󰒟"
               foreground: root.bar.foreground
               selected: root.shuffle
-              tooltipText: root.shuffle ? "Shuffle: on" : "Shuffle: off"
+              tooltipText: root.shuffle ? "Shuffle: on (Shift+S)" : "Shuffle: off (Shift+S)"
               onClicked: root.sendUi("shuffle")
             }
             Button {
               iconText: SoundCloudModel.repeatIconGlyph(root.repeat)
               foreground: root.bar.foreground
               selected: root.repeat !== "none"
-              tooltipText: root.repeat === "one" ? "Repeat: this track"
-                : (root.repeat === "all" ? "Repeat: all" : "Repeat: off")
+              tooltipText: (root.repeat === "one" ? "Repeat: this track"
+                : (root.repeat === "all" ? "Repeat: all" : "Repeat: off")) + " (Shift+L)"
               onClicked: root.sendUi("repeat")
             }
             Button {
@@ -2027,22 +2080,34 @@ BarWidget {
           boundsBehavior: Flickable.StopAtBounds
           flickDeceleration: 6000
           maximumFlickVelocity: 4000
+          // While a row is dragged, keep every row alive: the held row would otherwise be
+          // dropped as soon as the wheel scrolled its place out of view.
+          cacheBuffer: queueDrag.active ? (root.listRowHeight + queueList.spacing) * Math.max(1, root.queueRows.length) : 0
           model: root.queueRows
 
           delegate: Item {
+            id: queueRow
             required property var modelData
+            required property int index
             width: queueList.width
-            height: Style.space(40)
+            height: root.listRowHeight
             readonly property real rowStep: height + queueList.spacing
             property var item: modelData
             property bool isCurrent: item.current === true
             property string artworkId: String(item.artworkId || "")
             property string itemArtDataUrl: String(root.trackArtworkData[artworkId] || "")
             // Drag handle: how far the row has been dragged (pixels), 0 at rest.
-            property real dragDy: 0
             property bool dragging: false
+            // The rows a dragged row passes slide out of its way.
+            property real shiftY: SoundCloudModel.queueDragShift(index, queueDrag.fromIndex, queueDrag.places, rowStep)
+            Behavior on shiftY {
+              enabled: queueDrag.active
+              NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+            }
             z: dragging ? 5 : 0
-            transform: Translate { y: dragDy }
+            transform: Translate { y: shiftY }
+            // The held row is drawn by the copy above the list; its slot stays empty.
+            opacity: dragging ? 0 : 1
 
             Component.onCompleted: root.requestTrackArtwork(artworkId)
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
@@ -2060,7 +2125,7 @@ BarWidget {
               anchors.rightMargin: Style.space(3)
               anchors.verticalCenter: parent.verticalCenter
               width: Style.space(3)
-              height: Style.space(30)
+              height: Style.space(40)
               radius: width / 2
               color: Color.accent
               visible: isCurrent
@@ -2088,8 +2153,8 @@ BarWidget {
 
             BorderSurface {
               id: queueArtwork
-              width: Style.space(36)
-              height: Style.space(36)
+              width: root.listArtSize
+              height: root.listArtSize
               anchors.left: parent.left
               anchors.leftMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
@@ -2157,8 +2222,8 @@ BarWidget {
               anchors.right: queueRemove.left
               anchors.rightMargin: Style.space(2)
               anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(22)
-              height: Style.space(32)
+              width: Style.space(30)
+              height: parent.height
               visible: !isCurrent
 
               Text {
@@ -2172,22 +2237,38 @@ BarWidget {
 
               Interactive {
                 id: handleMouse
-                property real startY: 0
                 anchors.fill: parent
-                dragCursor: true
-                function listY(mouse) { return mapToItem(queueList.contentItem, mouse.x, mouse.y).y }
-                onPressed: function(mouse) { startY = listY(mouse); dragging = true }
+                // The list is a Flickable that would take over a vertical drag and scroll
+                // instead, so the handle keeps the pointer until the button is released.
+                preventStealing: true
+                // Where the pointer is in the visible list.
+                function viewY(mouse) { return mapToItem(queueList, mouse.x, mouse.y).y }
+                onPressed: function(mouse) {
+                  root.queueDragItem = item
+                  root.queueDragArt = itemArtDataUrl
+                  dragging = true
+                  queueDrag.begin(index, viewY(mouse), queueList.contentY, queueRow.y)
+                }
                 onPositionChanged: function(mouse) {
-                  if (pressed) dragDy = listY(mouse) - startY
+                  if (pressed) queueDrag.move(viewY(mouse), queueList.contentY)
                 }
                 onReleased: function(mouse) {
                   var at = SoundCloudModel.queueIndexOf(root.queueRows, item.playbackId)
-                  root.moveQueueRow(item.playbackId, SoundCloudModel.queueDragOffset(
-                    dragDy, rowStep, at, root.queueRows.length))
+                  root.moveQueueRow(item.playbackId, queueDrag.end(at))
                   dragging = false
-                  dragDy = 0
+                  root.queueDragItem = null
                 }
-                onCanceled: { dragging = false; dragDy = 0 }
+                onCanceled: {
+                  queueDrag.cancel()
+                  dragging = false
+                  root.queueDragItem = null
+                }
+              }
+
+              // The wheel scrolls the list while a row is held: keep the row under the pointer.
+              Connections {
+                target: queueList
+                function onContentYChanged() { if (handleMouse.pressed) queueDrag.move(queueDrag.pointerViewY, queueList.contentY) }
               }
 
               PanelToolTip {
@@ -2206,7 +2287,7 @@ BarWidget {
               iconText: "󰅖"
               foreground: root.bar.foreground
               tooltipText: "Remove from queue"
-              onClicked: root.sendUi(SoundCloudModel.queueRemoveCommand(item.playbackId))
+              onClicked: { root.rememberQueueScroll(); root.sendUi(SoundCloudModel.queueRemoveCommand(item.playbackId)) }
             }
           }
         }
@@ -2214,6 +2295,104 @@ BarWidget {
         ListWheelScroll {
           anchors.fill: queueList
           view: queueList
+        }
+
+        // Dragging a row to reorder it (the held row's place, how far it has moved).
+        QueueDrag {
+          id: queueDrag
+          rowStep: root.listRowHeight + queueList.spacing
+          rowHeight: root.listRowHeight
+          count: root.queueRows.length
+          listHeight: queueList.height
+        }
+
+        // The held row, drawn at the pointer whatever the list has scrolled to.
+        Rectangle {
+          id: queueDragGhost
+          readonly property var row: root.queueDragItem
+          readonly property string artData: root.queueDragArt
+          visible: row !== null && queueDrag.active
+          z: 10
+          x: queueList.x
+          width: queueList.width
+          height: root.listRowHeight
+          y: queueList.y + queueDrag.ghostY
+          radius: Style.spacing.labelGap
+          color: Style.pressedFillFor(root.bar.foreground, Color.accent)
+
+          BorderSurface {
+            id: ghostArtwork
+            width: root.listArtSize
+            height: root.listArtSize
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            radius: Style.spacing.labelGap
+            color: Style.normalFillFor(root.bar.foreground, Color.accent)
+            borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+
+            Image {
+              anchors.fill: parent
+              anchors.margins: Style.space(2)
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+              sourceSize.width: 80
+              sourceSize.height: 80
+              source: queueDragGhost.artData
+              visible: queueDragGhost.artData !== ""
+            }
+          }
+
+          Column {
+            anchors.left: ghostArtwork.right
+            anchors.leftMargin: Style.space(9)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(70)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
+            Text {
+              width: parent.width
+              text: queueDragGhost.row ? (queueDragGhost.row.title || "Untitled") : ""
+              textFormat: Text.PlainText
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: queueDragGhost.row ? (SoundCloudModel.queueRowLabel(queueDragGhost.row) || String(queueDragGhost.row.artist || "")) : ""
+              textFormat: Text.PlainText
+              color: root.dim
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(46)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: "󰍜"
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.icon
+          }
+
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(16)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: "󰅖"
+            color: root.dim
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.icon
+          }
         }
 
         ListScrollBar {

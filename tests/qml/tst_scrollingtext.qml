@@ -88,7 +88,7 @@ TestCase {
       { text: "An extremely long collective name, featuring many guests and their friends" })
     verify(item !== null)
     verify(item.overflowing)
-    compare(item.cursorShape, Qt.OpenHandCursor)
+    compare(item.cursorShape, Qt.PointingHandCursor)
     item.advance(1500)
     item.advance(1000)
     verify(item.scrollX > 0)

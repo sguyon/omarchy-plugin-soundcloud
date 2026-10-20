@@ -45,11 +45,11 @@ Item {
     }
   }
 
-  // A hand while there is something to drag; the plain arrow otherwise.
+  // The pointing hand (as on the buttons) while there is something to drag; the
+  // plain arrow otherwise.
   HoverHandler {
     id: hover
-    cursorShape: !root.overflowing ? Qt.ArrowCursor
-      : (root.dragging ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
+    cursorShape: root.overflowing ? Qt.PointingHandCursor : Qt.ArrowCursor
   }
 
   // Advances the scroll by the time that passed; pure steps so tests can drive it.

@@ -161,10 +161,10 @@ for (const [volume, muted, state] of [
 ]) {
   assert.equal(model.volumeIconState(volume, muted), state, `${volume} ${muted}`);
 }
-assert.equal(model.volumeIconGlyph("muted"), "");
-assert.equal(model.volumeIconGlyph("low"), "");
-assert.equal(model.volumeIconGlyph("medium"), "");
-assert.equal(model.volumeIconGlyph("high"), "");
+assert.equal(model.volumeWaves("muted"), 0);
+assert.equal(model.volumeWaves("low"), 1);
+assert.equal(model.volumeWaves("medium"), 2);
+assert.equal(model.volumeWaves("high"), 3);
 assert.equal(model.volumeText(0.354, false), "35%");
 assert.equal(model.volumeText(0.354, true), "Muted");
 assert.equal(model.volumeText(5, false), "100%");
@@ -185,8 +185,8 @@ assert.equal(model.sliderEmitDue(1000, 1050, 50), true);
 assert.equal(model.sliderEmitDue(1000, 900, 50), true);      // clock went backwards
 assert.equal(model.sliderEmitDue(1000, 1000, 0), true);
 assert.equal(model.sliderThrottleMs, 50);
-assert.equal(model.volumeTooltip(0.45, false), "Volume 45% (click to mute)");
-assert.equal(model.volumeTooltip(0.45, true), "Muted (click to unmute)");
+assert.equal(model.volumeTooltip(0.45, false), "Volume 45% (click or m to mute)");
+assert.equal(model.volumeTooltip(0.45, true), "Muted (click or m to unmute)");
 assert.equal(model.sliderWidth(200), 96);
 assert.equal(model.sliderWidth(96.7), 96);
 assert.equal(model.sliderWidth(80), 80);
@@ -476,6 +476,15 @@ assert.equal(model.queueKeyMoveOffset(rows, "", 1), 0);
 assert.equal(model.queueDragOffset(100, 51, 1, 3), 1); // 100 px is about two rows, clamped to the end
 assert.equal(model.queueDragOffset(-200, 51, 2, 3), -1); // clamped below the playing row
 assert.equal(model.queueDragOffset(60, 51, 1, 5), 1);
+// Rows passed by a dragged row make room for it.
+assert.equal(model.queueDragShift(2, 1, 2, 51), -51); // dragged down two: rows 2 and 3 move up
+assert.equal(model.queueDragShift(3, 1, 2, 51), -51);
+assert.equal(model.queueDragShift(4, 1, 2, 51), 0);
+assert.equal(model.queueDragShift(1, 1, 2, 51), 0); // the dragged row itself
+assert.equal(model.queueDragShift(3, 4, -2, 51), 51); // dragged up two: rows 2 and 3 move down
+assert.equal(model.queueDragShift(1, 4, -2, 51), 0);
+assert.equal(model.queueDragShift(2, 4, 0, 51), 0);
+assert.equal(model.queueDragShift(2, -1, 3, 51), 0); // nothing is being dragged
 assert.equal(model.queueDragOffset(10, 51, 1, 5), 0);
 assert.equal(model.queueDragOffset(-60, 51, 0, 5), 0); // the playing row stays
 assert.equal(model.queueDragOffset(60, 0, 1, 5), 0);
