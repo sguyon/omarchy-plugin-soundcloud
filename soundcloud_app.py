@@ -3931,7 +3931,10 @@ def build_application(show_on_start: bool = False):
             }
             self.selection_generation = 0
             self.pending_start = 0
+            self.resume_ms = 0
             self.queue = saved_queue
+            # A saved track is shown paused at its saved position until the user plays it.
+            self.restored_position_ms = saved_position_ms if saved_queue.current else None
             self.auto_skip = AutoSkip()
             self.notice = ""
             self.notice_until = 0.0
@@ -4159,9 +4162,12 @@ def build_application(show_on_start: bool = False):
                 )
                 if started:
                     self._record_local_play(selected_track)
+                    if self.resume_ms:
+                        self.playback.seek_when_playing(self.resume_ms / 1000)
                 else:
                     self.playback.error = "SoundCloud could not play this track"
                     GLib.idle_add(self._track_failed)
+                self.resume_ms = 0
                 self._publish_status_once()
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 return
@@ -4227,7 +4233,8 @@ def build_application(show_on_start: bool = False):
             if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
                 self.webview.load_uri(source_uri("home"))
 
-        def _play_when_page_ready(self, row, connection, request_id, automatic=False, direction=0):
+        def _play_when_page_ready(self, row, connection, request_id, automatic=False, resume_ms=0,
+                                  direction=0):
             """Start `row` once the page is on Home or Feed, so its request context exists."""
             self._keep_page_on_track_source()
             self.pending_start += 1
@@ -4246,14 +4253,14 @@ def build_application(show_on_start: bool = False):
                     and not self.webview.is_loading()
                 )
                 if ready or time.monotonic() > deadline:
-                    self._start_track(row, connection, request_id, automatic, direction=direction)
+                    self._start_track(row, connection, request_id, automatic, resume_ms, direction)
                     return False
                 return True
 
             if check():
                 GLib.timeout_add(250, check)
 
-        def _start_track(self, row, connection, request_id, automatic=False, direction=0):
+        def _start_track(self, row, connection, request_id, automatic=False, resume_ms=0, direction=0):
             """The one way a track starts: resolve it in the page, then play it with GStreamer.
 
             `direction` (1 next, -1 previous) marks a step by the user's Next or Previous: a
@@ -4272,7 +4279,9 @@ def build_application(show_on_start: bool = False):
                     {"ok": False, "error": "SoundCloud track details are not ready"},
                 )
                 return
+            self.restored_position_ms = None
             self.queue_finished = False
+            self.resume_ms = resume_ms
             self.selection_generation = (self.selection_generation + 1) % (2**31)
             generation = self.selection_generation
             self.auto_skip.started(generation, automatic, time.monotonic(), direction)
@@ -4319,7 +4328,7 @@ def build_application(show_on_start: bool = False):
                 return int(self.playback.pending_seek * 1000)
             if self.playback.active:
                 return int(self.playback.status()["position"] * 1000)
-            return 0
+            return self.restored_position_ms or 0
 
         def _save_queue(self):
             self.queue_save_pending = False
@@ -4694,8 +4703,13 @@ def build_application(show_on_start: bool = False):
             return self._secure_status(self._raw_status())
 
         def _raw_status(self):
+            gst_status = self.playback.status()
+            saved = self.queue.current
+            if (self.restored_position_ms is not None and saved is not None
+                    and not self.playback.active and gst_status["playbackState"] == "idle"):
+                gst_status = restored_status(saved, self.restored_position_ms)
             status = {
-                **merge_status(self.page_status.values, self.playback.status()),
+                **merge_status(self.page_status.values, gst_status),
                 **queue_status(self.queue),
                 **self.playback.volume_status(),
             }
@@ -4908,6 +4922,11 @@ def build_application(show_on_start: bool = False):
                         request_id,
                         {"ok": self.playback.toggle(), "running": True},
                         publish_status=True,
+                    )
+                elif self.restored_position_ms is not None and self.queue.current is not None:
+                    self._play_when_page_ready(
+                        self.queue.current, connection, request_id,
+                        resume_ms=self.restored_position_ms,
                     )
                 else:
                     if self.playback.error:

@@ -4304,6 +4304,42 @@ class QueuePlaybackTest(unittest.TestCase):
         self.application._save_queue()  # what do_shutdown does first
         self.assertEqual(saved_position(), 55_000)
 
+    def test_a_saved_queue_comes_back_paused_with_nothing_playing(self):
+        queue = load_module().PlayQueue(repeat="all")
+        queue.replace([self.row(n, durationMs=200_000) for n in (1, 2, 3)], 1, "likes")
+        self.build(saved=(queue, 61_000))
+
+        status = self.application.build_status()
+
+        self.assertEqual((status["playbackState"], status["playing"], status["position"]),
+                         ("paused", False, 61.0))
+        self.assertEqual((status["title"], status["duration"]), ("Song 2", 200.0))
+        self.assertEqual((status["cursor"], status["length"], status["repeat"]), (1, 3, "all"))
+        self.assertEqual((self.gst.ElementFactory.made, self.evaluated), ([], []))
+
+    def test_play_pause_on_a_restored_track_starts_it_and_seeks_to_the_saved_position(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n, durationMs=200_000) for n in (1, 2, 3)], 1, "likes")
+        self.build(saved=(queue, 61_000))
+
+        reply = self.command("play-pause")
+        self.assertEqual(self.started_id(), "2")
+        self.resolve()
+
+        self.assertEqual(self.application.playback.current.seeks, [61 * 10**9])
+        self.assertIsNone(self.application.restored_position_ms)
+        self.assertTrue(reply.reply["ok"])
+
+    def test_next_from_a_restored_state_plays_the_following_track(self):
+        queue = load_module().PlayQueue()
+        queue.replace([self.row(n) for n in (1, 2, 3)], 0, "feed")
+        self.build(saved=(queue, 10_000))
+
+        self.command("next")
+
+        self.assertEqual(self.started_id(), "2")
+        self.assertIsNone(self.application.restored_position_ms)
+
     def test_a_corrupt_or_missing_queue_file_gives_an_empty_idle_queue(self):
         for content in (None, b"{broken", b'{"v":1,"items":"x"}'):
             with self.subTest(content=content):
