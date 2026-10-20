@@ -5872,6 +5872,15 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("SoundCloudModel.queuePlayCommand(item.playbackId)", qml)
         self.assertIn('text === "q"', qml)
 
+    def test_track_rows_offer_play_next_and_add_to_queue_and_dim_encrypted_tracks(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertIn("SoundCloudModel.queueNextCommand(track.playbackId)", qml)
+        self.assertIn("SoundCloudModel.queueAddCommand(track.playbackId)", qml)
+        self.assertIn("SoundCloudModel.queueRemoveCommand(item.playbackId)", qml)
+        self.assertIn("enabled: !encrypted && (!root.actionBusy || root.selectionBusy)", qml)
+        self.assertIn("if (!track || SoundCloudModel.isEncrypted(track)) return", qml)
+
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 

@@ -56,6 +56,8 @@ BarWidget {
   // moves ("" = none).
   property string queueSelectedId: ""
   readonly property var queueRows: SoundCloudModel.upcomingQueue(queueData)
+  // The list row whose action menu is open ("tab:playbackId"), if any.
+  property string menuRowKey: ""
   property int activeSelectionRequestId: 0
   property string selectedTab: "home"
   property var tracks: []
@@ -135,6 +137,7 @@ BarWidget {
   function close() {
     popupOpen = false
     queueOpen = false
+    menuRowKey = ""
     selectedRow = -1
     queueSelectedId = ""
   }
@@ -148,6 +151,7 @@ BarWidget {
       return
     }
     selectedRow = SoundCloudModel.moveSelection(selectedRow, delta, tracks.length)
+    menuRowKey = ""
     if (selectedRow >= 0) trackList.positionViewAtIndex(selectedRow, ListView.Contain)
   }
 
@@ -159,7 +163,7 @@ BarWidget {
       return
     }
     var track = tracks[selectedRow]
-    if (!track) return
+    if (!track || SoundCloudModel.isEncrypted(track)) return
     var command = SoundCloudModel.playFromCommand(selectedTab, track.playbackId)
     if (command !== "" && (!actionBusy || selectionBusy)) runAction("play-from", command)
   }
@@ -266,6 +270,7 @@ BarWidget {
   function selectTab(tab) {
     selectedTab = tab
     queueOpen = false
+    menuRowKey = ""
     selectedRow = -1
     tracks = tracksFor(tab)
     tracksLoading = true
@@ -374,6 +379,7 @@ BarWidget {
 
   function toggleQueue() {
     queueOpen = !queueOpen
+    menuRowKey = ""
     if (queueOpen) refreshQueue()
   }
 
@@ -763,7 +769,7 @@ BarWidget {
       }
     }
 
-    // Keys: Esc closes, Up/Down (or j/k) move the selection (in the list or the
+    // Keys: Esc closes (an open row menu first), Up/Down (or j/k) move the selection (in the list or the
     // queue), Enter plays it, Tab/Shift+Tab switch tabs and Queue, Space plays or
     // pauses, Left/Right seek (5 s, longer while held), q the queue, m mutes.
     // AppKeys adds PageDown/Shift+Right next,
@@ -776,7 +782,10 @@ BarWidget {
       anchors.fill: parent
       // Forwarded keys reach seekKeys first, which counts the repeats.
       Keys.forwardTo: [appKeys, seekKeys]
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (root.menuRowKey !== "") root.menuRowKey = ""
+        else root.close()
+      }
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveSelectedRow(dy)
         else if (dx !== 0) root.seekKey(dx)
@@ -1283,15 +1292,23 @@ BarWidget {
             required property int index
             width: trackList.width
             height: Style.space(56)
+            opacity: encrypted ? 0.5 : 1
             property var track: modelData
             property string artworkId: String(track.artworkId || "")
             property string trackArtDataUrl: String(root.trackArtworkData[artworkId] || "")
             property bool isCurrent: SoundCloudModel.isCurrentTrack(track.playbackId, root.playbackId)
             property string pendingLabel: isCurrent ? SoundCloudModel.pendingLabel(root.playbackState) : ""
             property bool failed: isCurrent && root.playbackState === "error"
+            property bool encrypted: SoundCloudModel.isEncrypted(track)
+            property string rowKey: root.selectedTab + ":" + String(track.playbackId || "")
+            property bool menuOpen: root.menuRowKey === rowKey
+            readonly property bool rowHovered: rowHover.hovered
 
             Component.onCompleted: root.requestTrackArtwork(artworkId)
             onArtworkIdChanged: root.requestTrackArtwork(artworkId)
+            onRowHoveredChanged: if (!rowHovered && menuOpen) root.menuRowKey = ""
+
+            HoverHandler { id: rowHover }
 
             Rectangle {
               anchors.fill: parent
@@ -1389,11 +1406,12 @@ BarWidget {
               anchors.right: parent.right
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
-              text: root.trackDuration(track)
+              text: encrypted ? "󰌾" : root.trackDuration(track)
               textFormat: Text.PlainText
               color: root.dim
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
+              visible: !(rowHovered && !encrypted)
             }
 
             MouseArea {
@@ -1401,10 +1419,71 @@ BarWidget {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              enabled: (!root.actionBusy || root.selectionBusy)
+              enabled: !encrypted && (!root.actionBusy || root.selectionBusy)
                 && /^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))
               onClicked: {
                 root.runAction("play-from", SoundCloudModel.playFromCommand(root.selectedTab, modelData.playbackId))
+              }
+            }
+
+            // "..." appears on hover and opens the row's action menu.
+            Button {
+              id: rowMenuButton
+              visible: rowHovered && !encrypted && !menuOpen
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰇘"
+              foreground: root.bar.foreground
+              tooltipText: "More actions"
+              onClicked: root.menuRowKey = rowKey
+            }
+
+            Rectangle {
+              visible: menuOpen
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              width: menuButtons.implicitWidth + Style.space(8)
+              height: menuButtons.implicitHeight + Style.space(6)
+              radius: Style.spacing.labelGap
+              color: root.bar.background
+              border.width: 1
+              border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.28)
+
+              // Keeps clicks between the buttons from playing the row.
+              MouseArea { anchors.fill: parent }
+
+              Row {
+                id: menuButtons
+                anchors.centerIn: parent
+                spacing: Style.space(4)
+
+                Button {
+                  text: "Play"
+                  foreground: root.bar.foreground
+                  enabled: trackMouse.enabled
+                  onClicked: {
+                    root.menuRowKey = ""
+                    root.runAction("play-from", SoundCloudModel.playFromCommand(root.selectedTab, track.playbackId))
+                  }
+                }
+                Button {
+                  text: "Play next"
+                  foreground: root.bar.foreground
+                  onClicked: {
+                    root.menuRowKey = ""
+                    root.sendUi(SoundCloudModel.queueNextCommand(track.playbackId))
+                  }
+                }
+                Button {
+                  text: "Add to queue"
+                  foreground: root.bar.foreground
+                  onClicked: {
+                    root.menuRowKey = ""
+                    root.sendUi(SoundCloudModel.queueAddCommand(track.playbackId))
+                  }
+                }
               }
             }
           }
@@ -1580,7 +1659,7 @@ BarWidget {
             Column {
               anchors.left: queueArtwork.right
               anchors.leftMargin: Style.space(9)
-              anchors.right: parent.right
+              anchors.right: queueRemove.left
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
@@ -1605,6 +1684,19 @@ BarWidget {
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
               }
+            }
+
+            // The playing track stays; the rest can be taken out of the queue.
+            Button {
+              id: queueRemove
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: !isCurrent
+              iconText: "󰅖"
+              foreground: root.bar.foreground
+              tooltipText: "Remove from queue"
+              onClicked: root.sendUi(SoundCloudModel.queueRemoveCommand(item.playbackId))
             }
           }
         }

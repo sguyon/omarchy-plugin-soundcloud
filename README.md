@@ -21,8 +21,10 @@ without official SoundCloud API credentials.
   Shift+L repeat, Shift+S shuffle, m mute, q queue, Esc close
 - Queue button (the last stop of the tab row, with a badge counting the tracks still to
   come): shows the playing track and what follows, each row marked "added by you" when you
-  queued it. Click a row, or select it and press Enter, to play it. Tab and Shift+Tab
-  reach it after History
+  queued it. Click a row, or select it and press Enter, to play it, or take it out of
+  the queue with the cross. Tab and Shift+Tab reach it after History
+- Hover a track in a list for a menu: play, play next, add to queue. Tracks that only
+  offer an encrypted stream are dimmed with a lock
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll

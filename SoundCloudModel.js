@@ -290,6 +290,20 @@ function queueRemoveCommand(playbackId) {
   return trackIdPattern.test(String(playbackId || "")) ? "queue-remove:" + playbackId : ""
 }
 
+// "Play next" and "Add to queue" in a track row's menu.
+function queueNextCommand(playbackId) {
+  return trackIdPattern.test(String(playbackId || "")) ? "queue-next:" + playbackId : ""
+}
+
+function queueAddCommand(playbackId) {
+  return trackIdPattern.test(String(playbackId || "")) ? "queue-add:" + playbackId : ""
+}
+
+// A track that only offers an encrypted stream cannot be played or queued.
+function isEncrypted(track) {
+  return !!track && track.encrypted === true
+}
+
 // The small label under a queue row.
 function queueRowLabel(item) {
   item = item || {}
@@ -502,6 +516,9 @@ if (typeof module !== "undefined") {
     repeatMode: repeatMode,
     queuePlayCommand: queuePlayCommand,
     queueRemoveCommand: queueRemoveCommand,
+    queueNextCommand: queueNextCommand,
+    queueAddCommand: queueAddCommand,
+    isEncrypted: isEncrypted,
     queueRowLabel: queueRowLabel,
     upcomingQueue: upcomingQueue,
     queueIndexOf: queueIndexOf,

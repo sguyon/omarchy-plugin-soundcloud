@@ -236,10 +236,19 @@ assert.equal(model.repeatMode("bogus"), "none");
 const t1 = "soundcloud:tracks:1", t2 = "soundcloud:tracks:2", t3 = "soundcloud:tracks:3";
 assert.equal(model.queuePlayCommand(t2), "queue-play:" + t2);
 assert.equal(model.queueRemoveCommand("soundcloud:tracks:7"), "queue-remove:soundcloud:tracks:7");
+assert.equal(model.queueNextCommand("soundcloud:tracks:7"), "queue-next:soundcloud:tracks:7");
+assert.equal(model.queueAddCommand(t1), "queue-add:" + t1);
 for (const bad of ["", "7", "soundcloud:tracks:0", undefined, "queue-clear"]) {
   assert.equal(model.queuePlayCommand(bad), "");
   assert.equal(model.queueRemoveCommand(bad), "");
+  assert.equal(model.queueNextCommand(bad), "");
+  assert.equal(model.queueAddCommand(bad), "");
 }
+
+// Rows that only offer an encrypted stream are flagged.
+assert.equal(model.isEncrypted({ encrypted: true }), true);
+assert.equal(model.isEncrypted({ encrypted: "yes" }), false);
+assert.equal(model.isEncrypted(undefined), false);
 
 // Queue rows: label by origin; the view starts at the current track.
 assert.equal(model.queueRowLabel({ current: true, explicit: true }), "playing now");
