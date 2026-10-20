@@ -3709,6 +3709,199 @@ class GstPlayback:
         self.hls_executor.shutdown(wait=False, cancel_futures=True)
 
 
+MPRIS_BUS_NAME = "org.mpris.MediaPlayer2.omarchy_soundcloud"
+MPRIS_OBJECT_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT_INTERFACE = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER_INTERFACE = "org.mpris.MediaPlayer2.Player"
+MPRIS_NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+MPRIS_TRACK_PATH = "/org/omarchy/soundcloud/track/"
+MPRIS_MAX_TEXT = 256
+MPRIS_LOOP_BY_REPEAT = {"none": "None", "one": "Track", "all": "Playlist"}
+MPRIS_REPEAT_BY_LOOP = {loop: repeat for repeat, loop in MPRIS_LOOP_BY_REPEAT.items()}
+MPRIS_METADATA_TYPES = {
+    "mpris:trackid": "o", "mpris:length": "x", "mpris:artUrl": "s",
+    "xesam:title": "s", "xesam:artist": "as", "xesam:url": "s",
+}
+MPRIS_PLAYER_TYPES = {
+    "PlaybackStatus": "s", "LoopStatus": "s", "Rate": "d", "Shuffle": "b", "Volume": "d",
+    "Position": "x", "MinimumRate": "d", "MaximumRate": "d", "CanGoNext": "b",
+    "CanGoPrevious": "b", "CanPlay": "b", "CanPause": "b", "CanSeek": "b", "CanControl": "b",
+}
+MPRIS_ROOT_PROPERTIES = {
+    "CanQuit": ("b", False), "CanRaise": ("b", False), "HasTrackList": ("b", False),
+    "Identity": ("s", "SoundCloud"), "SupportedUriSchemes": ("as", []),
+    "SupportedMimeTypes": ("as", []),
+}
+MPRIS_INTROSPECTION = """
+<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/>
+    <method name="Quit"/>
+    <property name="CanQuit" type="b" access="read"/>
+    <property name="CanRaise" type="b" access="read"/>
+    <property name="HasTrackList" type="b" access="read"/>
+    <property name="Identity" type="s" access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes" type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/>
+    <method name="Previous"/>
+    <method name="Pause"/>
+    <method name="PlayPause"/>
+    <method name="Stop"/>
+    <method name="Play"/>
+    <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+    <method name="SetPosition">
+      <arg direction="in" name="TrackId" type="o"/>
+      <arg direction="in" name="Position" type="x"/>
+    </method>
+    <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+    <signal name="Seeked"><arg name="Position" type="x"/></signal>
+    <property name="PlaybackStatus" type="s" access="read"/>
+    <property name="LoopStatus" type="s" access="readwrite"/>
+    <property name="Rate" type="d" access="readwrite"/>
+    <property name="Shuffle" type="b" access="readwrite"/>
+    <property name="Metadata" type="a{sv}" access="read"/>
+    <property name="Volume" type="d" access="readwrite"/>
+    <property name="Position" type="x" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="false"/>
+    </property>
+    <property name="MinimumRate" type="d" access="read"/>
+    <property name="MaximumRate" type="d" access="read"/>
+    <property name="CanGoNext" type="b" access="read"/>
+    <property name="CanGoPrevious" type="b" access="read"/>
+    <property name="CanPlay" type="b" access="read"/>
+    <property name="CanPause" type="b" access="read"/>
+    <property name="CanSeek" type="b" access="read"/>
+    <property name="CanControl" type="b" access="read"/>
+  </interface>
+</node>
+"""
+
+
+def _mpris_text(value: object, maximum: int = MPRIS_MAX_TEXT) -> str:
+    """A string that is safe to put on D-Bus: no NUL, valid UTF-8, bounded; otherwise empty."""
+    if not isinstance(value, str) or "\x00" in value:
+        return ""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return ""
+    return value if len(value) <= maximum else ""
+
+
+def _mpris_track_id(status: Mapping[str, object]) -> str:
+    playback_id = status.get("playbackId")
+    if not is_playback_id(playback_id):
+        return MPRIS_NO_TRACK
+    return MPRIS_TRACK_PATH + str(playback_id).rpartition(":")[2]
+
+
+def mpris_position_us(seconds: object) -> int:
+    value = _finite_number(seconds, 0, 60 * 60 * 24 * 7)
+    return int(value * 1_000_000) if value is not None else 0
+
+
+def mpris_metadata(status: Mapping[str, object]) -> dict[str, object]:
+    """The MPRIS Metadata map as plain Python values, built only from validated status fields."""
+    metadata: dict[str, object] = {"mpris:trackid": _mpris_track_id(status)}
+    duration = _finite_number(status.get("duration"), 0, 60 * 60 * 24 * 7)
+    if duration:
+        metadata["mpris:length"] = mpris_position_us(duration)
+    title = _mpris_text(status.get("title"))
+    if title:
+        metadata["xesam:title"] = title
+    artist = _mpris_text(status.get("artist"))
+    if artist:
+        metadata["xesam:artist"] = [artist]
+    track_url = _mpris_text(status.get("trackUrl"), MAX_URL_BYTES)
+    if track_url and is_soundcloud_uri(track_url):
+        metadata["xesam:url"] = track_url
+    art_url = _mpris_text(status.get("artUrl"), MAX_URL_BYTES)
+    if art_url and is_allowed_artwork_uri(art_url):  # https only, never a data URL
+        metadata["mpris:artUrl"] = art_url
+    return metadata
+
+
+def mpris_properties(status: Mapping[str, object]) -> dict[str, object]:
+    """Every Player property except Position (read on demand) as plain Python values."""
+    state = status.get("playbackState")
+    playback = {"playing": "Playing", "buffering": "Playing", "resolving": "Playing",
+                "paused": "Paused"}.get(state if isinstance(state, str) else "", "Stopped")
+    has_track = is_playback_id(status.get("playbackId"))
+    duration = _finite_number(status.get("duration"), 0, 60 * 60 * 24 * 7) or 0
+    volume = _finite_number(status.get("volume"), 0, 1)
+    repeat = status.get("repeat")
+    return {
+        "PlaybackStatus": playback,
+        "LoopStatus": MPRIS_LOOP_BY_REPEAT.get(repeat if isinstance(repeat, str) else "", "None"),
+        "Rate": 1.0,
+        "Shuffle": status.get("shuffle") is True,
+        "Metadata": mpris_metadata(status),
+        "Volume": round(volume, 3) if volume is not None else 1.0,
+        "MinimumRate": 1.0,
+        "MaximumRate": 1.0,
+        "CanGoNext": status.get("canNext") is True,
+        "CanGoPrevious": status.get("canPrevious") is True,
+        "CanPlay": has_track,
+        "CanPause": has_track,
+        "CanSeek": has_track and duration > 0,
+        "CanControl": True,
+    }
+
+
+def mpris_changed(previous: Mapping[str, object] | None, current: Mapping[str, object]) -> dict[str, object]:
+    """The properties whose value differs from what was last emitted."""
+    return {name: value for name, value in current.items()
+            if previous is None or previous.get(name) != value}
+
+
+def mpris_method_commands(method: str, args: tuple, status: Mapping[str, object]) -> list[str] | None:
+    """The socket commands a Player method runs (maybe none); None for an unsupported method."""
+    state = status.get("playbackState")
+    playing = state in ("playing", "buffering")
+    if method in ("Next", "Previous"):
+        return [method.lower()]
+    if method == "PlayPause":
+        return ["play-pause"]
+    if method == "Play":
+        return ["play-pause"] if state in ("paused", "idle", "error") else []
+    if method in ("Pause", "Stop"):
+        return ["play-pause"] if playing else []
+    if method in ("Seek", "SetPosition"):
+        duration = _finite_number(status.get("duration"), 0, 60 * 60 * 24 * 7) or 0
+        if duration <= 0:
+            return []
+        if method == "Seek":
+            offset = args[0] if args and isinstance(args[0], int) else 0
+            target = mpris_position_us(status.get("position")) + offset
+        else:
+            if (len(args) != 2 or args[0] != _mpris_track_id(status)
+                    or not isinstance(args[1], int)):
+                return []
+            target = args[1]
+        if method == "SetPosition" and not 0 <= target <= duration * 1_000_000:
+            return []
+        if target >= duration * 1_000_000:
+            return ["next"]
+        return [f"seek:{max(0, target) / (duration * 1_000_000):.6f}"]
+    return None
+
+
+def mpris_property_commands(name: str, value: object) -> list[str] | None:
+    """The socket commands a writable Player property runs; None if it can't be written."""
+    if name == "Volume":
+        level = _finite_number(value, -1e9, 1e9)
+        return [f"volume:{max(0.0, min(1.0, level)):.4f}"] if level is not None else []
+    if name == "LoopStatus":
+        mode = MPRIS_REPEAT_BY_LOOP.get(value) if isinstance(value, str) else None
+        return [f"repeat:{mode}"] if mode else []
+    if name == "Shuffle":
+        return ["shuffle:on" if value is True else "shuffle:off"] if isinstance(value, bool) else []
+    return None
+
+
 class ClientConnection:
     def __init__(self, connection: socket.socket):
         self.connection = connection

@@ -6341,5 +6341,173 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("python3 soundcloud_app.py stop", readme)
 
 
+class MprisHelpersTest(unittest.TestCase):
+    def setUp(self):
+        self.app = load_module()
+
+    def status(self, **overrides):
+        return {
+            "playbackState": "playing", "playing": True,
+            "playbackId": "soundcloud:tracks:12345", "title": "Song", "artist": "Band",
+            "artUrl": "https://i1.sndcdn.com/artworks-x-large.jpg",
+            "duration": 200.5, "position": 12.0, "volume": 0.5, "repeat": "none",
+            "shuffle": False, "canNext": True, "canPrevious": False,
+            "trackUrl": "https://soundcloud.com/band/song", **overrides,
+        }
+
+    def test_metadata_for_a_playing_track(self):
+        metadata = self.app.mpris_metadata(self.status())
+
+        self.assertEqual(metadata["mpris:trackid"], "/org/omarchy/soundcloud/track/12345")
+        self.assertEqual(metadata["mpris:length"], 200500000)
+        self.assertEqual(metadata["xesam:title"], "Song")
+        self.assertEqual(metadata["xesam:artist"], ["Band"])
+        self.assertEqual(metadata["xesam:url"], "https://soundcloud.com/band/song")
+        self.assertEqual(metadata["mpris:artUrl"], "https://i1.sndcdn.com/artworks-x-large.jpg")
+
+    def test_metadata_without_a_track_uses_the_no_track_path(self):
+        metadata = self.app.mpris_metadata(self.status(playbackId="", title="", artist="", duration=0))
+
+        self.assertEqual(metadata["mpris:trackid"], "/org/mpris/MediaPlayer2/TrackList/NoTrack")
+        self.assertNotIn("mpris:length", metadata)
+
+    def test_metadata_drops_unsafe_values(self):
+        metadata = self.app.mpris_metadata(self.status(
+            artUrl="data:image/png;base64,AAAA", trackUrl="https://evil.example/x",
+            title="a\x00b", artist="x" * 5000, duration=float("nan"),
+        ))
+
+        for key in ("mpris:artUrl", "xesam:url", "xesam:title", "xesam:artist", "mpris:length"):
+            self.assertNotIn(key, metadata)
+        self.assertNotIn(
+            "mpris:artUrl",
+            self.app.mpris_metadata(self.status(artUrl="http://i1.sndcdn.com/a.jpg")),
+        )
+        self.assertNotIn("xesam:title", self.app.mpris_metadata(self.status(title="\ud800")))
+        self.assertNotIn("xesam:title", self.app.mpris_metadata(self.status(title=7)))
+
+    def test_metadata_rejects_bad_ids_and_negative_durations(self):
+        metadata = self.app.mpris_metadata(self.status(playbackId="../../etc", duration=-4))
+
+        self.assertEqual(metadata["mpris:trackid"], "/org/mpris/MediaPlayer2/TrackList/NoTrack")
+        self.assertNotIn("mpris:length", metadata)
+
+    def test_properties_follow_the_status(self):
+        props = self.app.mpris_properties(self.status(repeat="all", shuffle=True, volume=0.25))
+
+        self.assertEqual(props["PlaybackStatus"], "Playing")
+        self.assertEqual(props["LoopStatus"], "Playlist")
+        self.assertTrue(props["Shuffle"])
+        self.assertEqual(props["Volume"], 0.25)
+        self.assertTrue(props["CanGoNext"])
+        self.assertFalse(props["CanGoPrevious"])
+        for name in ("CanPlay", "CanPause", "CanSeek", "CanControl"):
+            self.assertTrue(props[name], name)
+        self.assertEqual((props["Rate"], props["MinimumRate"], props["MaximumRate"]), (1.0, 1.0, 1.0))
+        self.assertNotIn("Position", props)
+
+    def test_playback_status_mapping(self):
+        def status(state):
+            return self.app.mpris_properties(self.status(playbackState=state))["PlaybackStatus"]
+
+        self.assertEqual(status("paused"), "Paused")
+        for state in ("idle", "error", "bogus"):
+            self.assertEqual(status(state), "Stopped")
+        for state in ("playing", "buffering", "resolving"):
+            self.assertEqual(status(state), "Playing")
+
+    def test_loop_modes(self):
+        def loop(mode):
+            return self.app.mpris_properties(self.status(repeat=mode))["LoopStatus"]
+
+        self.assertEqual([loop("none"), loop("one"), loop("all"), loop("x")],
+                         ["None", "Track", "Playlist", "None"])
+
+    def test_no_track_loaded_disables_play_but_not_control(self):
+        props = self.app.mpris_properties(self.status(playbackState="idle", playbackId="", duration=0))
+
+        self.assertFalse(props["CanPlay"])
+        self.assertFalse(props["CanPause"])
+        self.assertFalse(props["CanSeek"])
+        self.assertTrue(props["CanControl"])
+
+    def test_volume_and_flags_are_sanitized(self):
+        props = self.app.mpris_properties(self.status(
+            volume=float("inf"), shuffle="yes", canNext="x"))
+
+        self.assertEqual(props["Volume"], 1.0)
+        self.assertFalse(props["Shuffle"])
+        self.assertFalse(props["CanGoNext"])
+        self.assertEqual(self.app.mpris_properties(self.status(volume=0.123456))["Volume"], 0.123)
+        self.assertEqual(self.app.mpris_properties({})["PlaybackStatus"], "Stopped")
+
+    def test_position_in_microseconds(self):
+        self.assertEqual(self.app.mpris_position_us(12.5), 12500000)
+        self.assertEqual(self.app.mpris_position_us(-1), 0)
+        self.assertEqual(self.app.mpris_position_us(float("nan")), 0)
+
+    def test_changed_properties_only_reports_differences(self):
+        first = self.app.mpris_properties(self.status())
+
+        self.assertEqual(self.app.mpris_changed(None, first).keys(), first.keys())
+        self.assertEqual(self.app.mpris_changed(first, dict(first)), {})
+        second = self.app.mpris_properties(self.status(playbackState="paused", position=99))
+        self.assertEqual(list(self.app.mpris_changed(first, second)), ["PlaybackStatus"])
+
+
+class MprisCommandMappingTest(unittest.TestCase):
+    def setUp(self):
+        self.app = load_module()
+        self.status = {"playbackState": "playing", "playbackId": "soundcloud:tracks:12345",
+                       "duration": 100.0, "position": 40.0}
+
+    def commands(self, method, *args, **overrides):
+        return self.app.mpris_method_commands(method, args, {**self.status, **overrides})
+
+    def test_play_and_pause_depend_on_state(self):
+        self.assertEqual(self.commands("Play"), [])
+        self.assertEqual(self.commands("Play", playbackState="paused"), ["play-pause"])
+        self.assertEqual(self.commands("Pause"), ["play-pause"])
+        self.assertEqual(self.commands("Pause", playbackState="paused"), [])
+        self.assertEqual(self.commands("Stop"), ["play-pause"])
+        self.assertEqual(self.commands("PlayPause", playbackState="paused"), ["play-pause"])
+        self.assertEqual(self.commands("PlayPause"), ["play-pause"])
+
+    def test_next_previous(self):
+        self.assertEqual(self.commands("Next"), ["next"])
+        self.assertEqual(self.commands("Previous"), ["previous"])
+
+    def test_seek_is_relative_and_clamped(self):
+        self.assertEqual(self.commands("Seek", 10_000_000), ["seek:0.500000"])
+        self.assertEqual(self.commands("Seek", -90_000_000), ["seek:0.000000"])
+        self.assertEqual(self.commands("Seek", 70_000_000), ["next"])
+        self.assertEqual(self.commands("Seek", 1, duration=0), [])
+
+    def test_set_position_checks_the_track_id(self):
+        track = "/org/omarchy/soundcloud/track/12345"
+        self.assertEqual(self.commands("SetPosition", track, 25_000_000), ["seek:0.250000"])
+        self.assertEqual(self.commands("SetPosition", "/org/omarchy/soundcloud/track/9", 1), [])
+        self.assertEqual(self.commands("SetPosition", track, -1), [])
+        self.assertEqual(self.commands("SetPosition", track, 101_000_000), [])
+
+    def test_property_writes(self):
+        write = self.app.mpris_property_commands
+        self.assertEqual(write("Volume", 0.5), ["volume:0.5000"])
+        self.assertEqual(write("Volume", 7.0), ["volume:1.0000"])
+        self.assertEqual(write("Volume", -1.0), ["volume:0.0000"])
+        self.assertEqual(write("Volume", float("nan")), [])
+        self.assertEqual(write("LoopStatus", "Track"), ["repeat:one"])
+        self.assertEqual(write("LoopStatus", "Playlist"), ["repeat:all"])
+        self.assertEqual(write("LoopStatus", "None"), ["repeat:none"])
+        self.assertEqual(write("LoopStatus", "Bogus"), [])
+        self.assertEqual(write("Shuffle", True), ["shuffle:on"])
+        self.assertEqual(write("Shuffle", False), ["shuffle:off"])
+        self.assertIsNone(write("Rate", 2.0))
+
+    def test_unknown_method_is_none(self):
+        self.assertIsNone(self.commands("Explode"))
+        self.assertIsNone(self.commands("OpenUri", "https://soundcloud.com/a/b"))
+
+
 if __name__ == "__main__":
     unittest.main()
