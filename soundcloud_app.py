@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,7 @@ LIST_ARTWORK_DIMENSION = 512
 MAX_COOKIE_STORE_BYTES = 512 * 1024
 MAX_TRACK_CACHE_BYTES = 1024 * 1024
 MAX_SETTINGS_BYTES = 4096
+NOTIFICATION_TIMEOUT_SECONDS = 3.0
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
 MAX_PENDING_DISPATCHES = 32
@@ -4378,14 +4380,31 @@ def wait_for_playback(timeout: float = 12.0) -> dict[str, object]:
         time.sleep(0.4)
 
 
+# Bidi controls can reorder a title on screen (a right-to-left override hides what it is).
+_BIDI_CONTROLS = dict.fromkeys(
+    [0x61C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+
+
+def clean_notification_text(text: str) -> str:
+    """Text from SoundCloud made safe for a notification: one line, no control or bidi
+    characters (an ESC could drive the terminal or daemon), and markup escaped."""
+    text = " ".join(text.split()).translate(_BIDI_CONTROLS)
+    text = "".join(char for char in text if unicodedata.category(char) != "Cc")
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def send_desktop_notification(message: str) -> None:
     notifier = "/usr/bin/notify-send"
     if os.access(notifier, os.X_OK):
-        # Track titles come from SoundCloud and some daemons render markup, so escape it.
-        safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        subprocess.run(
-            [notifier, "--app-name=SoundCloud", "--expire-time=4000", "SoundCloud", safe], check=False
-        )
+        try:
+            subprocess.run(
+                [notifier, "--app-name=SoundCloud", "--expire-time=4000", "--", "SoundCloud",
+                 clean_notification_text(message)],
+                check=False, timeout=NOTIFICATION_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def open_popup() -> None:

@@ -2399,6 +2399,29 @@ class PlayUrlCommandTest(unittest.TestCase):
             self.assertEqual(str(raised.exception), message)
 
 
+class DesktopNotificationTest(unittest.TestCase):
+    def test_desktop_notification_separates_options_times_out_and_cleans_the_text(self):
+        app = load_module()
+        calls = []
+        with mock.patch.object(app.os, "access", return_value=True), \
+                mock.patch.object(app.subprocess, "run", lambda *a, **k: calls.append((a, k))):
+            app.send_desktop_notification("-h <b>&\x1b[2J\x07\u202etxt")
+
+        (args,), options = calls[0]
+        self.assertEqual(args[-3:], ["--", "SoundCloud", "-h &lt;b&gt;&amp;[2Jtxt"])
+        self.assertEqual(options["timeout"], 3.0)
+        self.assertNotIn("shell", options)
+
+    def test_desktop_notification_ignores_a_notifier_that_fails_or_hangs(self):
+        app = load_module()
+        for error in (OSError("gone"), subprocess.TimeoutExpired("notify-send", 3)):
+            def run(*_args, _error=error, **_kwargs):
+                raise _error
+            with mock.patch.object(app.os, "access", return_value=True), \
+                    mock.patch.object(app.subprocess, "run", run):
+                app.send_desktop_notification("hello")
+
+
 class LocalPlayHistoryTest(unittest.TestCase):
     def row(self, number):
         return {"url": f"https://soundcloud.com/artist/song-{number}", "title": f"Song {number}"}
