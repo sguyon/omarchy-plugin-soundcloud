@@ -1946,6 +1946,64 @@ class LikedTracksTest(unittest.TestCase):
         self.assertEqual(cache, {"likes": [row], "history": [row]})
 
 
+class LocalPlayHistoryTest(unittest.TestCase):
+    def row(self, number):
+        return {"url": f"https://soundcloud.com/artist/song-{number}", "title": f"Song {number}"}
+
+    def test_a_played_track_goes_to_the_front_once(self):
+        app = load_module()
+        tracks = [self.row(1), self.row(2), self.row(3)]
+
+        result = app.with_play_first(tracks, self.row(3))
+
+        self.assertEqual([t["title"] for t in result], ["Song 3", "Song 1", "Song 2"])
+        self.assertEqual([t["title"] for t in app.with_play_first(tracks, self.row(9))],
+                         ["Song 9", "Song 1", "Song 2", "Song 3"])
+
+    def test_the_play_list_is_bounded(self):
+        app = load_module()
+
+        result = app.with_play_first([self.row(n) for n in range(1, 6)], self.row(9), limit=3)
+
+        self.assertEqual([t["title"] for t in result], ["Song 9", "Song 1", "Song 2"])
+
+    def test_local_plays_are_merged_with_a_server_page_by_play_time(self):
+        app = load_module()
+        at = lambda number, when: {**self.row(number), "playedAt": when}
+        server = [at(1, 900), at(2, 500), at(3, 100)]
+
+        result = app.with_local_plays(server, [at(5, 700), at(2, 800)])
+
+        # Song 5 and Song 2 played here fall between the server's own plays,
+        # and Song 2 appears once, with its latest time.
+        self.assertEqual([t["title"] for t in result], ["Song 1", "Song 2", "Song 5", "Song 3"])
+        self.assertEqual(result[1]["playedAt"], 800)
+        self.assertEqual(app.with_local_plays(server, []), server)
+
+    def test_a_server_play_keeps_its_time_and_a_bad_time_is_dropped(self):
+        app = load_module()
+
+        row = app.track_from_entry({**like_item(4), "played_at": 1_700_000_000_000})
+        bad = app.track_from_entry({**like_item(4), "played_at": "yesterday"})
+
+        self.assertEqual(row["playedAt"], 1_700_000_000_000)
+        self.assertNotIn("playedAt", bad)
+
+    def test_local_plays_survive_a_restart_through_the_track_cache(self):
+        app = load_module()
+        row = app.track_from_entry({**like_item(4), "played_at": 1_700_000_000_000})
+
+        cache = app.sanitize_track_cache({"plays": [row], "history": [row]})
+
+        self.assertEqual(cache, {"plays": [row], "history": [row]})
+
+    def test_history_refreshes_sooner_than_likes(self):
+        app = load_module()
+
+        self.assertLess(app.API_LIST_REFRESH_SECONDS["history"], app.API_LIST_REFRESH_SECONDS["likes"])
+        self.assertEqual(set(app.API_LIST_REFRESH_SECONDS), set(app.API_TRACK_LISTS))
+
+
 class TrackLikesTest(unittest.TestCase):
     def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
         app = load_module()

@@ -17,7 +17,8 @@ without official SoundCloud API credentials.
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
-- Likes and Play history tabs for your account, newest first, that load more as you scroll
+- Likes and History tabs for your account, newest first, that load more as you scroll.
+  History also lists what you play here, because SoundCloud does not record it
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
@@ -105,7 +106,8 @@ and removes its runtime socket. These owner-only files in
 not require another sign-in:
 
 - `cookies.json`: the SoundCloud session cookies
-- `tracks.json`: the cached Home and Feed track lists (titles, artists, links)
+- `tracks.json`: the cached track lists (Home, Feed, Likes, History, and the tracks you
+  played here), with titles, artists, and links
 - `settings.json`: the volume level and whether it is muted
 
 The runtime directory `$XDG_RUNTIME_DIR/omarchy-soundcloud/` (lock file and the
@@ -127,10 +129,9 @@ the authenticated web app's private JSON APIs through an isolated WebKit view.
 Selecting a track resolves its stable track ID to a short-lived media URL for the
 local GStreamer player. These private API schemas can change without notice.
 
-- **History** shows what SoundCloud has recorded. In testing, tracks played in this
-  plugin did not appear in SoundCloud's history, so they are missing from the History tab
-  until you play them elsewhere. Plays on the SoundCloud website or your phone appear as
-  usual.
+- **History** shows what SoundCloud recorded, plus the last 50 tracks you played in this
+  plugin. In testing, SoundCloud's history did not include tracks played here, so the plugin
+  keeps its own list and merges it with SoundCloud's by play time, newest first.
 - Some tracks, mostly ad-supported ones, only offer encrypted streams. The plugin cannot
   play those, so selecting one shows an error.
 
@@ -148,9 +149,11 @@ widget talks to the backend over a private Unix socket.
   disconnects.
 - Likes and History are read by the backend straight from SoundCloud's account API
   (`/users/{id}/track_likes` and `/me/play-history/tracks`) with the session token, a
-  page at a time (24), and cached like the other lists. The hidden page is kept on Home
-  or Feed while they are open, because playing a track needs the request context the page
-  records there.
+  page at a time (24), and cached like the other lists. SoundCloud does not record plays
+  from this player, so the plugin keeps its own list of the last 50 tracks it played and
+  merges them into SoundCloud's history by play time. The hidden page is kept on Home or Feed
+  while they are open, because playing a track needs the request context the page records
+  there.
 - Home and Feed are built from the SoundCloud page's own API responses and
   paginated through SoundCloud's API cursors. Each list keeps at most 100 tracks
   and is cached so the popup has content right after a restart.

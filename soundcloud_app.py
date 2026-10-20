@@ -46,7 +46,9 @@ MAX_TITLE_BYTES = 512
 MAX_ARTIST_BYTES = 256
 MAX_URL_BYTES = 2048
 MAX_TRACKS = 100
-API_LIST_REFRESH_SECONDS = 60.0
+API_LIST_REFRESH_SECONDS = {"likes": 60.0, "history": 15.0}
+MAX_LOCAL_PLAYS = 50
+MAX_PLAYED_AT_MS = 4_102_444_800_000  # year 2100
 # Track lists read straight from the account API, with each list's first-page path.
 API_TRACK_LISTS = {
     "likes": "/users/{user_id}/track_likes",
@@ -709,6 +711,31 @@ def merge_track_pages(
         if isinstance(url, str) and url:
             merged[url] = track
     return list(merged.values())[:max(0, limit)]
+
+
+def with_play_first(tracks: list[dict[str, object]], track: dict[str, object],
+                    limit: int = MAX_TRACKS) -> list[dict[str, object]]:
+    """The tracks with `track` moved or added at the front, one row per track URL."""
+    rest = [item for item in tracks if item.get("url") != track.get("url")]
+    return ([track] + rest)[:max(0, limit)]
+
+
+def with_local_plays(server_tracks: list[dict[str, object]],
+                     plays: list[dict[str, object]]) -> list[dict[str, object]]:
+    """A page of SoundCloud's play history merged with this player's own plays, newest first.
+
+    SoundCloud does not record plays from this player, so they would never appear otherwise.
+    A track in both lists appears once, with its latest play time.
+    """
+    def played_at(track):
+        return track.get("playedAt") or 0
+
+    latest: dict[object, dict[str, object]] = {}
+    for track in [*plays, *server_tracks]:
+        known = latest.get(track.get("url"))
+        if known is None or played_at(track) > played_at(known):
+            latest[track.get("url")] = track
+    return sorted(latest.values(), key=played_at, reverse=True)
 
 
 def load_more_script(source: str) -> str | None:
@@ -1584,6 +1611,7 @@ def validate_tracks_payload(payload: object) -> dict[str, object] | None:
         track_url = _bounded_string(item.get("url", ""), MAX_URL_BYTES)
         art_url = _bounded_string(item.get("artUrl", ""), MAX_URL_BYTES)
         playback_id = _bounded_string(item.get("playbackId", ""), 64)
+        played_at = _bounded_integer(item.get("playedAt"), 0, MAX_PLAYED_AT_MS)
         if (None in (title, artist, track_url, art_url, playback_id)
                 or not title or not isinstance(track_url, str) or not is_soundcloud_uri(track_url)
                 or (playback_id and not is_playback_id(playback_id))):
@@ -1601,6 +1629,7 @@ def validate_tracks_payload(payload: object) -> dict[str, object] | None:
                 "durationMs": _bounded_integer(
                     item.get("durationMs"), 0, MAX_TRACK_DURATION_MS
                 ),
+                **({"playedAt": played_at} if played_at else {}),
             }
         )
     return {"tracks": tracks}
@@ -1610,7 +1639,7 @@ def sanitize_track_cache(payload: object) -> dict[str, list[dict[str, object]]]:
     if not isinstance(payload, dict):
         return {}
     sanitized = {}
-    for source in ("home", "feed", *API_TRACK_LISTS):
+    for source in ("home", "feed", "plays", *API_TRACK_LISTS):
         tracks = payload.get(source)
         if not isinstance(tracks, list) or not tracks:
             continue
@@ -2286,6 +2315,7 @@ def track_from_entry(item: object) -> dict[str, object] | None:
     artist = user.get("username") or user.get("full_name") or publisher.get("artist") or ""
     art_url = track.get("artwork_url") or user.get("avatar_url") or ""
     play_count = track.get("playback_count")
+    played_at = item.get("played_at")
     return {
         "playbackId": f"soundcloud:tracks:{track_id}",
         "title": _truncate_bytes(title.strip()[:MAX_TITLE_BYTES], MAX_TITLE_BYTES),
@@ -2294,6 +2324,8 @@ def track_from_entry(item: object) -> dict[str, object] | None:
         "artUrl": str(art_url)[:2048],
         "playCount": play_count if isinstance(play_count, int) and not isinstance(play_count, bool) else 0,
         "durationMs": duration,
+        **({"playedAt": played_at} if isinstance(played_at, int) and not isinstance(played_at, bool)
+           and 0 < played_at <= MAX_PLAYED_AT_MS else {}),
     }
 
 
@@ -3389,7 +3421,9 @@ def build_application(show_on_start: bool = False):
                     protocol,
                     mime_type,
                 )
-                if not started:
+                if started:
+                    self._record_local_play(selected_track)
+                else:
                     self.playback.error = "SoundCloud could not play this track"
                 self._publish_status_once()
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
@@ -3402,6 +3436,30 @@ def build_application(show_on_start: bool = False):
             except OSError:
                 pass
             return False
+
+        def _record_local_play(self, track):
+            """Put a track this player just started at the front of History, now and after refreshes."""
+            track = {**track, "playedAt": int(time.time() * 1000)}
+            self.track_cache["plays"] = with_play_first(
+                self.track_cache.get("plays", []), track, MAX_LOCAL_PLAYS
+            )
+            history = with_play_first(self.track_cache.get("history", []), track)
+            self.track_cache["history"] = history
+            result = self._secure_tracks({"tracks": history})
+            if result is not None:
+                self.status_subscribers.publish_message(
+                    {
+                        "type": "tracks",
+                        "source": "history",
+                        "reset": False,
+                        "hasMore": self.api_lists["history"]["cursor"] is not None,
+                        "addedCount": 1,
+                        **result,
+                    }
+                )
+            if not self.track_cache_save_pending:
+                self.track_cache_save_pending = True
+                GLib.idle_add(self._save_track_cache)
 
         def _load_api_list(self, source, reset):
             """Fetch one page of an account list on a worker thread; False if one is already loading."""
@@ -3431,6 +3489,8 @@ def build_application(show_on_start: bool = False):
             if error:
                 reset, merged, added_count = False, existing, 0
             else:
+                if source == "history" and reset:
+                    tracks = with_local_plays(tracks, self.track_cache.get("plays", []))
                 merged = merge_track_pages(existing, tracks, reset=reset)
                 added_count = max(0, len(merged) - (0 if reset else len(existing)))
                 state["cursor"] = (
@@ -3698,7 +3758,7 @@ def build_application(show_on_start: bool = False):
                 if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
                     self.webview.load_uri(source_uri("home"))
                 cached = self._secure_tracks({"tracks": self.track_cache.get(source, [])})
-                if time.monotonic() - self.api_lists[source]["loaded_at"] > API_LIST_REFRESH_SECONDS:
+                if time.monotonic() - self.api_lists[source]["loaded_at"] > API_LIST_REFRESH_SECONDS[source]:
                     self._load_api_list(source, reset=True)
                 self._respond(
                     connection,
