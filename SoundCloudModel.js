@@ -62,6 +62,39 @@ function canStartAction(actionBusy, selectionBusy, action) {
   return !actionBusy || (selectionBusy === true && action === "play")
 }
 
+// Keyboard selection in the track list: -1 means no row is selected.
+function clampSelection(index, count) {
+  var total = Math.max(0, Math.floor(Number(count) || 0))
+  var value = Math.floor(Number(index))
+  if (total === 0 || !Number.isFinite(value) || value < 0) return -1
+  return Math.min(value, total - 1)
+}
+
+// The first move from "nothing selected" lands on the first row; moves stop at the ends.
+function moveSelection(index, delta, count) {
+  var total = Math.max(0, Math.floor(Number(count) || 0))
+  if (total === 0) return -1
+  var current = clampSelection(index, total)
+  if (current < 0) return 0
+  return clampSelection(Math.max(0, current + Math.sign(Number(delta) || 0)), total)
+}
+
+// A refresh keeps the row when the list only grew; a reset starts over.
+function selectionAfterUpdate(index, count, reset) {
+  return reset === true ? -1 : clampSelection(index, count)
+}
+
+// Tab and Shift+Tab walk the four tabs in order and wrap around.
+var tabStops = ["home", "feed", "likes", "history"]
+
+function cycleTab(tab, direction, tabs) {
+  var list = Array.isArray(tabs) && tabs.length > 0 ? tabs : tabStops
+  var at = list.indexOf(tab)
+  if (at < 0) return list[0]
+  var step = Number(direction) < 0 ? -1 : 1
+  return list[(at + step + list.length) % list.length]
+}
+
 function isCurrentSelectionResponse(activeRequestId, responseId) {
   return Number(activeRequestId) > 0 && Number(activeRequestId) === Number(responseId)
 }
@@ -230,6 +263,10 @@ if (typeof module !== "undefined") {
     selectionIsPending: selectionIsPending,
     pendingLabel: pendingLabel,
     canStartAction: canStartAction,
+    clampSelection: clampSelection,
+    moveSelection: moveSelection,
+    selectionAfterUpdate: selectionAfterUpdate,
+    cycleTab: cycleTab,
     isCurrentSelectionResponse: isCurrentSelectionResponse,
     isCurrentTrack: isCurrentTrack,
     errorShownOnRow: errorShownOnRow,

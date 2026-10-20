@@ -78,6 +78,30 @@ assert.equal(model.canStartAction(true, true, "next"), false);
 assert.equal(model.isCurrentSelectionResponse(42, 41), false);
 assert.equal(model.isCurrentSelectionResponse(42, 42), true);
 
+// Keyboard selection: first move lands on row 0, stops at the ends, empty list has none.
+assert.equal(model.moveSelection(-1, 1, 5), 0);
+assert.equal(model.moveSelection(-1, -1, 5), 0);
+assert.equal(model.moveSelection(0, 1, 5), 1);
+assert.equal(model.moveSelection(4, 1, 5), 4);
+assert.equal(model.moveSelection(0, -1, 5), 0);
+assert.equal(model.moveSelection(2, -1, 5), 1);
+assert.equal(model.moveSelection(9, 1, 5), 4);
+assert.equal(model.moveSelection(0, 1, 0), -1);
+assert.equal(model.clampSelection(7, 3), 2);
+assert.equal(model.clampSelection(-3, 3), -1);
+assert.equal(model.clampSelection(undefined, 3), -1);
+assert.equal(model.clampSelection(0, 0), -1);
+assert.equal(model.selectionAfterUpdate(3, 20, false), 3);
+assert.equal(model.selectionAfterUpdate(3, 2, false), 1);
+assert.equal(model.selectionAfterUpdate(3, 20, true), -1);
+
+// Tab cycling wraps both ways through the four tabs; an unknown tab starts at the first.
+assert.equal(model.cycleTab("home", 1), "feed");
+assert.equal(model.cycleTab("history", 1), "home");
+assert.equal(model.cycleTab("home", -1), "history");
+assert.equal(model.cycleTab("likes", -1), "feed");
+assert.equal(model.cycleTab("nope", 1), "home");
+
 assert.equal(model.isCurrentTrack("soundcloud:tracks:9", "soundcloud:tracks:9"), true);
 assert.equal(model.isCurrentTrack("soundcloud:tracks:8", "soundcloud:tracks:9"), false);
 // Nothing playing must not mark rows that also lack an id.

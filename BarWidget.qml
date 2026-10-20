@@ -28,6 +28,12 @@ BarWidget {
   property string lastError: ""
   property bool actionBusy: false
   property bool selectionBusy: false
+  // Keyboard selection in the track list (-1 = none). It resets when the tab
+  // changes or the list is replaced, and Enter plays that row.
+  property int selectedRow: -1
+  // Return emits returnRequested and then activateRequested; Space only the
+  // latter. This flag tells the two apart.
+  property bool returnHeld: false
   property int activeSelectionRequestId: 0
   property string selectedTab: "home"
   property var tracks: []
@@ -104,7 +110,23 @@ BarWidget {
     else if (tracks.length === 0) selectTab(selectedTab)
   }
 
-  function close() { popupOpen = false }
+  function close() {
+    popupOpen = false
+    selectedRow = -1
+  }
+
+  // Keyboard actions (see PanelKeyCatcher below).
+  function moveSelectedRow(delta) {
+    selectedRow = SoundCloudModel.moveSelection(selectedRow, delta, tracks.length)
+    if (selectedRow >= 0) trackList.positionViewAtIndex(selectedRow, ListView.Contain)
+  }
+
+  // Enter plays the selected row, like a click on it.
+  function playSelectedRow() {
+    var track = tracks[selectedRow]
+    if (!track || !/^soundcloud:tracks:[1-9][0-9]*$/.test(String(track.playbackId || ""))) return
+    runAction("play", track.playbackId)
+  }
 
   function toggle() {
     if (popupOpen) close()
@@ -177,6 +199,7 @@ BarWidget {
 
   function selectTab(tab) {
     selectedTab = tab
+    selectedRow = -1
     tracks = tracksFor(tab)
     tracksLoading = true
     trackLoadAttempts = 0
@@ -225,7 +248,11 @@ BarWidget {
       else if (sourceTab === "likes") likesTracks = applied.tracks
       else if (sourceTab === "history") historyTracks = applied.tracks
     }
-    if (selectedTab === sourceTab) tracks = applied.tracks
+    if (selectedTab === sourceTab) {
+      tracks = applied.tracks
+      var resetRows = !!(result && result.reset === true)
+      selectedRow = SoundCloudModel.selectionAfterUpdate(selectedRow, applied.tracks.length, resetRows)
+    }
     if (previousContentY !== null) {
       Qt.callLater(function() {
         var maximum = Math.max(trackList.originY,
@@ -626,12 +653,26 @@ BarWidget {
       }
     }
 
-    // Keys: Esc closes the popup. The content sits inside the key catcher, so
-    // the catcher sees the keys first.
+    // Keys: Esc closes, Up/Down (or j/k) move the selection, Enter plays it,
+    // Tab/Shift+Tab switch tabs, Space plays or pauses. The content sits inside
+    // the key catcher, so the catcher sees the keys first.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: root.close()
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveSelectedRow(dy)
+      }
+      onReturnRequested: root.returnHeld = true
+      onActivateRequested: {
+        var fromReturn = root.returnHeld
+        root.returnHeld = false
+        if (fromReturn) root.playSelectedRow()
+        else if (root.running && root.loggedIn && root.hasTrack) root.runAction("play-pause")
+      }
+      onTabRequested: function(direction) {
+        if (root.running && root.loggedIn) root.selectTab(SoundCloudModel.cycleTab(root.selectedTab, direction))
+      }
 
     Column {
       id: content
@@ -1022,6 +1063,7 @@ BarWidget {
 
           delegate: Item {
             required property var modelData
+            required property int index
             width: trackList.width
             height: Style.space(56)
             property var track: modelData
@@ -1039,6 +1081,16 @@ BarWidget {
               radius: Style.spacing.labelGap
               color: Style.hoverFillFor(root.bar.foreground, Color.accent)
               visible: trackMouse.enabled && trackMouse.containsMouse
+            }
+
+            // Keyboard selection.
+            Rectangle {
+              anchors.fill: parent
+              radius: Style.spacing.labelGap
+              color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+              border.width: 1
+              border.color: Color.accent
+              visible: index === root.selectedRow
             }
 
             Rectangle {
