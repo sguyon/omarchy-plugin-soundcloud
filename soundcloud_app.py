@@ -69,6 +69,7 @@ LIST_ARTWORK_PIXELS = 512 * 512
 LIST_ARTWORK_DIMENSION = 512
 MAX_COOKIE_STORE_BYTES = 512 * 1024
 MAX_TRACK_CACHE_BYTES = 1024 * 1024
+MAX_QUEUE_BYTES = 256 * 1024
 MAX_QUEUE_SOURCE_BYTES = 64
 MAX_SETTINGS_BYTES = 4096
 NOTIFICATION_TIMEOUT_SECONDS = 3.0
@@ -1088,6 +1089,32 @@ class PlayQueue:
             self._cursor = max(0, min(self._cursor, len(self._items) - 1))
         return replacement
 
+    def to_dict(self, position_ms: int = 0, now_ms: int | None = None) -> dict[str, object]:
+        return {
+            "v": 1,
+            "items": [dict(row) for row in self._items],
+            "cursor": self._cursor,
+            "explicit": [dict(row) for row in self._explicit],
+            "added": [dict(row) for row in self._added],
+            "repeat": self._repeat,
+            "shuffle": self._shuffle,
+            "source": self.source,
+            "positionMs": position_ms,
+            "savedAt": int(time.time() * 1000) if now_ms is None else now_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object, rng: object | None = None) -> "PlayQueue":
+        """A queue from saved data. Anything invalid gives an empty queue."""
+        data = sanitize_queue(payload)
+        queue = cls(repeat=data["repeat"], shuffle=data["shuffle"], rng=rng)
+        queue._items = data["items"]
+        queue._explicit = data["explicit"]
+        queue._added = data["added"]
+        queue._cursor = data["cursor"]
+        queue.source = data["source"]
+        return queue
+
 
 def load_more_script(source: str) -> str | None:
     if source not in {"home", "feed"}:
@@ -2003,6 +2030,39 @@ def sanitize_track_cache(payload: object) -> dict[str, list[dict[str, object]]]:
     return sanitized
 
 
+def sanitize_queue(payload: object) -> dict[str, object]:
+    """Saved queue data checked field by field. Anything invalid gives the empty queue."""
+    empty: dict[str, object] = {
+        "v": 1, "items": [], "cursor": 0, "explicit": [], "added": [], "repeat": "none",
+        "shuffle": False, "source": "", "positionMs": 0, "savedAt": 0,
+    }
+    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != 1:
+        return empty
+    lists = []
+    for key in ("items", "explicit", "added"):  # older saves have no "added"
+        result = validate_tracks_payload({"tracks": payload.get(key, [])})
+        if result is None:
+            return empty
+        lists.append(_queue_rows(result["tracks"]))
+    items, explicit, added = lists
+    cursor = payload.get("cursor")
+    if isinstance(cursor, bool) or not isinstance(cursor, int):
+        cursor = 0
+    repeat = payload.get("repeat")
+    return {
+        "v": 1,
+        "items": items,
+        "cursor": max(0, min(cursor, len(items) - 1)),
+        "explicit": explicit,
+        "added": added,
+        "repeat": repeat if repeat in REPEAT_MODES else "none",
+        "shuffle": payload.get("shuffle") is True,
+        "source": _bounded_string(payload.get("source", ""), MAX_QUEUE_SOURCE_BYTES) or "",
+        "positionMs": _bounded_integer(payload.get("positionMs"), 0, MAX_TRACK_DURATION_MS),
+        "savedAt": _bounded_integer(payload.get("savedAt"), 0, MAX_PLAYED_AT_MS),
+    }
+
+
 DEFAULT_SETTINGS: dict[str, object] = {"v": 1, "volume": 1.0, "muted": False}
 
 
@@ -2031,6 +2091,22 @@ class SettingsStore:
 
     def save(self, settings: dict[str, object]) -> None:
         self._store.save(sanitize_settings(settings))
+
+
+class QueueStore:
+    """The play queue in `queue.json`, next to the track cache."""
+
+    def __init__(self, directory_fd: int, maximum_bytes: int = MAX_QUEUE_BYTES):
+        self._store = PrivateJsonStore(directory_fd, "queue.json", maximum_bytes)
+
+    def load(self) -> tuple[PlayQueue, int]:
+        """The saved queue and its position in ms. A missing or bad file gives an empty queue."""
+        data = sanitize_queue(self._store.load())
+        return PlayQueue.from_dict(data), cast(int, data["positionMs"])
+
+    def save(self, queue: PlayQueue, position_ms: int = 0) -> None:
+        # Like the track cache, a payload over the size cap is not written.
+        self._store.save(queue.to_dict(position_ms))
 
 
 def _image_kind_and_dimensions(data: bytes) -> tuple[str, int, int] | None:

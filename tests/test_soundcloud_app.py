@@ -2725,6 +2725,23 @@ class PlayQueueTest(unittest.TestCase):
             self.assertIsNone(queue.mark_dead("soundcloud:tracks:1"))
             self.assertIsNone(queue.mark_dead(None))
 
+    def test_the_queue_round_trips_through_a_dict(self):
+        app = load_module()
+        queue = self.queue(4, index=2, repeat="all")
+        queue.play_next(self.row(10))
+
+        data = queue.to_dict(position_ms=4321, now_ms=1_700_000_000_000)
+        again = app.PlayQueue.from_dict(data)
+
+        self.assertEqual(data["v"], 1)
+        self.assertEqual((data["cursor"], data["repeat"], data["shuffle"], data["source"]),
+                         (2, "all", False, "home"))
+        self.assertEqual((data["positionMs"], data["savedAt"]), (4321, 1_700_000_000_000))
+        self.assertEqual(again.to_dict(4321, 1_700_000_000_000), data)
+        self.assertEqual(again.current["title"], "Song 3")
+        self.assertEqual(self.titles(again.explicit), ["Song 10"])
+
+
     def ids(self, rows):
         return [row["playbackId"].rpartition(":")[2] for row in rows]
 
@@ -2888,6 +2905,139 @@ class PlayQueueTest(unittest.TestCase):
             self.assertFalse(queue.move("soundcloud:tracks:3", True))
 
             self.assertEqual((self.ids(queue.items), queue.cursor), (before, 1))
+
+    def test_added_rows_are_saved_loaded_and_older_saves_still_load(self):
+        app = load_module()
+        queue = self.queue(3)
+        queue.add_last(self.row(20))
+
+        data = queue.to_dict(position_ms=5, now_ms=1_700_000_000_000)
+        again = app.PlayQueue.from_dict(data)
+
+        self.assertEqual(self.ids(again.added), ["20"])
+        self.assertEqual((again.added[0]["added"], again.added[0]["explicit"]), (True, True))
+        self.assertEqual(again.to_dict(5, 1_700_000_000_000), data)
+        old = {key: value for key, value in data.items() if key != "added"}
+        self.assertEqual(self.ids(app.PlayQueue.from_dict(old).items), ["1", "2", "3"])
+        self.assertEqual(app.PlayQueue.from_dict(old).added, [])
+        self.assertEqual(app.sanitize_queue({**data, "added": [{"title": "bad"}]})["items"], [])
+
+
+class QueueStoreTest(unittest.TestCase):
+    def row(self, number):
+        return PlayQueueTest.row(None, number)
+
+    def with_store(self, check, maximum=None):
+        app = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                store = app.QueueStore(directory_fd, **({"maximum_bytes": maximum} if maximum else {}))
+                check(app, store, Path(directory) / "queue.json")
+            finally:
+                os.close(directory_fd)
+
+    def test_the_queue_survives_a_restart_in_an_owner_only_file(self):
+        def check(app, store, path):
+            queue = app.PlayQueue(repeat="one", shuffle=False)
+            queue.replace([self.row(n) for n in range(1, 4)], 1, "likes")
+            queue.play_next(self.row(10))
+
+            store.save(queue, position_ms=61_000)
+            loaded, position_ms = store.load()
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(position_ms, 61_000)
+            self.assertEqual((loaded.cursor, loaded.repeat, loaded.source), (1, "one", "likes"))
+            self.assertEqual(loaded.current["title"], "Song 2")
+            self.assertEqual([r["title"] for r in loaded.explicit], ["Song 10"])
+            self.assertEqual(app.MAX_QUEUE_BYTES, 256 * 1024)
+
+        self.with_store(check)
+
+    def test_a_missing_or_corrupt_file_gives_an_empty_queue(self):
+        def check(app, store, path):
+            loaded, position_ms = store.load()
+            self.assertEqual((loaded.length, loaded.current, position_ms), (0, None, 0))
+            for content in (b"{not json", b"[]", b"\xff\xfe", b"null", b"{}", b'{"v":2,"items":[]}'):
+                path.write_bytes(content)
+                os.chmod(path, 0o600)
+                loaded, position_ms = store.load()
+                self.assertEqual((loaded.length, position_ms), (0, 0))
+
+        self.with_store(check)
+
+    def test_an_oversize_file_is_ignored(self):
+        def check(app, store, path):
+            queue = app.PlayQueue()
+            queue.replace([self.row(n) for n in range(1, 4)], 0, "home")
+            store.save(queue)
+            self.assertEqual(store.load()[0].length, 3)
+            path.write_bytes(b" " * (app.MAX_QUEUE_BYTES + 1))
+            os.chmod(path, 0o600)
+            self.assertEqual(store.load()[0].length, 0)
+
+        self.with_store(check)
+
+    def test_a_queue_that_does_not_fit_is_not_written(self):
+        def check(app, store, path):
+            queue = app.PlayQueue()
+            queue.replace([self.row(n) for n in range(1, 4)], 0, "home")
+
+            store.save(queue)
+
+            self.assertFalse(path.exists())
+
+        self.with_store(check, maximum=100)
+
+    def sanitized(self, **changes):
+        app = load_module()
+        payload = {
+            "v": 1, "items": [self.row(1), self.row(2), self.row(3)], "cursor": 1,
+            "explicit": [self.row(10)], "repeat": "all", "shuffle": True,
+            "source": "home", "positionMs": 500, "savedAt": 1_700_000_000_000,
+        }
+        return app.sanitize_queue({**payload, **changes})
+
+    def test_sanitize_keeps_a_good_payload_and_clamps_or_resets_bad_fields(self):
+        with self.subTest('sanitize keeps a good payload'):
+            result = self.sanitized()
+
+            self.assertEqual(result["cursor"], 1)
+            self.assertEqual((result["repeat"], result["shuffle"], result["source"]), ("all", True, "home"))
+            self.assertEqual((result["positionMs"], result["savedAt"]), (500, 1_700_000_000_000))
+            self.assertEqual(len(result["items"]), 3)
+        with self.subTest('sanitize clamps the cursor and drops hostile numbers'):
+            for cursor, expected in ((99, 2), (-3, 0), (10**30, 2), (True, 0), ("1", 0), (1.5, 0), (None, 0)):
+                self.assertEqual(self.sanitized(cursor=cursor)["cursor"], expected, cursor)
+            for value in (True, -1, 10**30, "5", 2.5, float("nan")):
+                result = self.sanitized(positionMs=value, savedAt=value)
+                self.assertEqual((result["positionMs"], result["savedAt"]), (0, 0), value)
+        with self.subTest('sanitize resets unknown modes and non boolean shuffle'):
+            result = self.sanitized(repeat="forever", shuffle=1, source=["x"])
+
+            self.assertEqual((result["repeat"], result["shuffle"], result["source"]), ("none", False, ""))
+
+    def test_sanitize_empties_everything_on_a_bad_row_or_too_many_rows(self):
+        app = load_module()
+        bad = {**self.row(2), "url": "https://example.com/x"}
+        many = [self.row(n) for n in range(1, app.MAX_TRACKS + 2)]
+
+        for changes in ({"items": [self.row(1), bad]}, {"items": many}, {"explicit": [bad]},
+                        {"items": "nope"}, {"explicit": {"a": 1}}):
+            result = self.sanitized(**changes)
+            self.assertEqual((result["items"], result["explicit"], result["cursor"]), ([], [], 0), changes)
+
+    def test_sanitize_drops_duplicate_urls_and_bad_payloads(self):
+        app = load_module()
+        result = self.sanitized(items=[self.row(1), self.row(1), self.row(2)], explicit=[self.row(5), self.row(5)])
+
+        self.assertEqual(len(result["items"]), 2)
+        self.assertEqual(len(result["explicit"]), 1)
+        for payload in (None, 5, "x", [], True):
+            self.assertEqual(app.sanitize_queue(payload)["items"], [])
+        self.assertEqual(app.sanitize_queue({"v": True, "items": [self.row(1)]})["items"], [])
+
 
 class TrackLikesTest(unittest.TestCase):
     def test_like_command_accepts_only_stable_soundcloud_track_ids(self):
