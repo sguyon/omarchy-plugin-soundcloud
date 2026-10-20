@@ -4561,11 +4561,12 @@ def build_application(show_on_start: bool = False):
                     tracks, next_cursor = self.track_likes.tracks_page(source, cursor)
                 except PermissionError:
                     error = f"Sign in to SoundCloud to see your {source}"
-                except (OSError, ValueError):
+                except Exception:
                     error = f"Could not load your {source}"
-                GLib.idle_add(self._api_list_loaded, source, reset, tracks, next_cursor, error)
+                finally:
+                    GLib.idle_add(self._api_list_loaded, source, reset, tracks, next_cursor, error)
 
-            threading.Thread(target=worker, daemon=True).start()
+            self.run_in_thread(worker)
             return True
 
         def _api_list_loaded(self, source, reset, tracks, next_cursor, error):
@@ -4587,9 +4588,7 @@ def build_application(show_on_start: bool = False):
             if result is None:
                 return False
             for track in merged:
-                self.playback_tracks[track["playbackId"]] = track
-            while len(self.playback_tracks) > MAX_TRACKS * 2:
-                self.playback_tracks.pop(next(iter(self.playback_tracks)))
+                self._remember_playback_track(track)
             self.status_subscribers.publish_message(
                 {
                     "type": "tracks",

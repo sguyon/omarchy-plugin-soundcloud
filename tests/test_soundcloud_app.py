@@ -4421,6 +4421,48 @@ class QueuePlaybackTest(unittest.TestCase):
 
     # an API reply cut short mid-body must not wedge the worker threads
 
+    def truncated_api(self):
+        """Make every API call except /me fail the way a cut connection does."""
+        import http.client
+
+        class Response:
+            def __init__(self, body, fail): self.body, self.fail = body, fail
+            def __enter__(self): return self
+            def __exit__(self, *_exc): return False
+            def read(self, _size=-1):
+                if self.fail:
+                    raise http.client.IncompleteRead(b"{", 100)
+                return self.body
+
+        class Opener:
+            def open(self, request, timeout=None):
+                is_me = request.full_url.endswith("/me")
+                return Response(b'{"id": 42}', fail=not is_me)
+
+        self.enterContext(mock.patch.object(self.app, "_api_opener", Opener()))
+        self.application.track_likes.load_token = lambda: "token"
+        self.application.track_likes.request = self.app.soundcloud_api_request
+
+    def test_a_cut_reply_ends_a_list_load_and_the_tab_can_refresh(self):
+        self.build()
+        self.truncated_api()
+
+        reply = self.command("tracks:likes").reply
+        self.glib.run_idle()
+
+        self.assertTrue(reply["ok"])
+        self.assertFalse(self.application.api_lists["likes"]["loading"])
+        self.assertTrue(self.application._load_api_list("likes", reset=True))
+
+    def test_a_worker_that_dies_still_resets_its_flags_and_replies(self):
+        self.build()
+        self.application.track_likes.tracks_page = mock.Mock(side_effect=RuntimeError("boom"))
+
+        self.application._load_api_list("likes", reset=True)
+        self.glib.run_idle()
+
+        self.assertFalse(self.application.api_lists["likes"]["loading"])
+
     def test_the_queue_command_lists_marked_rows_capped_at_100(self):
         with self.subTest('the queue command lists the rows with their marks'):
             self.build()
