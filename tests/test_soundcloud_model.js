@@ -119,6 +119,121 @@ assert.equal(requestEvents.length, 2);
 observeListEvent("movement-ended", 31, false);
 assert.equal(requestEvents.length, 2);
 
+// Volume icon: Omarchy OSD thresholds (0 or muted, up to 33, up to 66, above).
+for (const [volume, muted, state] of [
+  [0, false, "muted"], [0.004, false, "muted"], [0.5, true, "muted"],
+  [0.01, false, "low"], [0.33, false, "low"], [0.34, false, "medium"],
+  [0.66, false, "medium"], [0.67, false, "high"], [1, false, "high"],
+  [undefined, false, "high"], [2, false, "high"], [-1, false, "muted"],
+]) {
+  assert.equal(model.volumeIconState(volume, muted), state, `${volume} ${muted}`);
+}
+assert.equal(model.volumeIconGlyph("muted"), "");
+assert.equal(model.volumeIconGlyph("low"), "");
+assert.equal(model.volumeIconGlyph("medium"), "");
+assert.equal(model.volumeIconGlyph("high"), "");
+assert.equal(model.volumeText(0.354, false), "35%");
+assert.equal(model.volumeText(0.354, true), "Muted");
+assert.equal(model.volumeText(5, false), "100%");
+
+// The wheel steps by 5 points and never leaves 0..1.
+// Volume slider: pointer maths, throttle, width and show/hide timing.
+assert.equal(model.sliderValueFromX(6, 6, 88), 0);
+assert.equal(model.sliderValueFromX(50, 6, 88), 0.5);
+assert.equal(model.sliderValueFromX(94, 6, 88), 1);
+assert.equal(model.sliderValueFromX(-20, 6, 88), 0);
+assert.equal(model.sliderValueFromX(500, 6, 88), 1);
+assert.equal(model.sliderValueFromX(30, 6, 0), 0);
+assert.equal(model.sliderValueFromX("x", 6, 88), 0);
+assert.equal(model.sliderValueFromX(6 + 88 * 0.337, 6, 88), 0.34);
+assert.equal(model.sliderEmitDue(0, 1000, 50), true);        // nothing emitted yet
+assert.equal(model.sliderEmitDue(1000, 1049, 50), false);
+assert.equal(model.sliderEmitDue(1000, 1050, 50), true);
+assert.equal(model.sliderEmitDue(1000, 900, 50), true);      // clock went backwards
+assert.equal(model.sliderEmitDue(1000, 1000, 0), true);
+assert.equal(model.sliderThrottleMs, 50);
+assert.equal(model.volumeTooltip(0.45, false), "Volume 45% (click to mute)");
+assert.equal(model.volumeTooltip(0.45, true), "Muted (click to unmute)");
+assert.equal(model.sliderWidth(200), 96);
+assert.equal(model.sliderWidth(96.7), 96);
+assert.equal(model.sliderWidth(80), 80);
+assert.equal(model.sliderWidth(48), 48);
+assert.equal(model.sliderWidth(47), 0);                      // too narrow: hidden, never overlaps
+assert.equal(model.sliderWidth(-5), 0);
+assert.equal(model.sliderWidth(undefined), 0);
+assert.equal(model.sliderHideDelay("leave"), 600);
+assert.equal(model.sliderHideDelay("flash"), 1000);
+assert.equal(model.sliderVisible(false, false, false), false);
+assert.equal(model.sliderVisible(true, false, false), true);
+assert.equal(model.sliderVisible(false, true, false), true);
+assert.equal(model.sliderVisible(false, false, true), true);
+assert.equal(model.sliderDisplayValue(0.6, false), 0.6);
+assert.equal(model.sliderDisplayValue(0.6, true), 0);
+assert.equal(model.sliderDisplayValue(7, false), 1);
+assert.equal(model.sliderDisplayValue(undefined, false), 1);
+assert.equal(model.volumeSetCommand(0.35), "volume:0.35");
+assert.equal(model.volumeSetCommand(0), "volume:0.00");
+assert.equal(model.volumeSetCommand(3), "volume:1.00");
+assert.equal(model.volumeSetCommand(-1), "volume:0.00");
+assert.equal(model.volumeSetCommand("x"), "");
+
+assert.equal(model.volumeStepCommand(120), "volume-step:+0.05");
+assert.equal(model.volumeStepCommand(-15), "volume-step:-0.05");
+assert.equal(model.volumeStepCommand(0), "");
+assert.equal(model.volumeStepCommand("x"), "");
+assert.equal(model.steppedVolume(0.5, 120), 0.55);
+assert.equal(model.steppedVolume(0.98, 120), 1);
+assert.equal(model.steppedVolume(0.02, -120), 0);
+assert.equal(model.steppedVolume(0.3, 0), 0.3);
+assert.equal(model.steppedVolume(undefined, -120), 0.95);
+
+// Wheel events add up to whole notches: smooth-scroll deltas are small, a mouse notch is 120.
+assert.deepEqual(model.wheelSteps(0, 120), { steps: 1, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(0, -120), { steps: -1, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(0, 15), { steps: 0, accumulator: 15 });
+assert.deepEqual(model.wheelSteps(105, 15), { steps: 1, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(100, 50), { steps: 1, accumulator: 30 });
+assert.deepEqual(model.wheelSteps(-100, -50), { steps: -1, accumulator: -30 });
+assert.deepEqual(model.wheelSteps(100, -20), { steps: 0, accumulator: -20 });
+assert.deepEqual(model.wheelSteps(0, 360), { steps: 3, accumulator: 0 });
+assert.deepEqual(model.wheelSteps(0, -250), { steps: -2, accumulator: -10 });
+assert.deepEqual(model.wheelSteps(undefined, 30), { steps: 0, accumulator: 30 });
+assert.deepEqual(model.wheelSteps(40, 0), { steps: 0, accumulator: 40 });
+assert.deepEqual(model.wheelSteps(40, "x"), { steps: 0, accumulator: 40 });
+let swipe = { steps: 0, accumulator: 0 };
+let swipeSteps = 0;
+for (let i = 0; i < 40; i++) {
+  swipe = model.wheelSteps(swipe.accumulator, 6);
+  swipeSteps += swipe.steps;
+}
+assert.equal(swipeSteps, 2); // 40 events of 6 units = 240 units = two notches, not forty steps
+
+// QML only sees TOP-LEVEL function and var declarations of a JS module, not
+// the properties of module.exports. Every name a .qml file uses as
+// SoundCloudModel.<name> must be declared at the top level of the source.
+{
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const root = path.join(__dirname, "..");
+  const source = fs.readFileSync(path.join(root, "SoundCloudModel.js"), "utf8");
+  const declared = new Set();
+  for (const m of source.matchAll(/^(?:function\s+|var\s+)([A-Za-z_$][\w$]*)/gm)) declared.add(m[1]);
+  const used = new Map();
+  const files = [root, path.join(root, "tests", "qml")]
+    .flatMap(dir => fs.readdirSync(dir).filter(f => f.endsWith(".qml")).map(f => path.join(dir, f)));
+  for (const file of files) {
+    const text = fs.readFileSync(file, "utf8");
+    for (const m of text.matchAll(/\bSoundCloudModel\.([A-Za-z_$][\w$]*)/g)) {
+      if (m[1] === "js") continue;
+      if (!used.has(m[1])) used.set(m[1], path.basename(file));
+    }
+  }
+  assert.ok(used.size > 20, "the scan should find the names the QML files use");
+  for (const [name, file] of used) {
+    assert.ok(declared.has(name), `${file} uses SoundCloudModel.${name}, which is not a top-level declaration in SoundCloudModel.js`);
+  }
+}
+
 console.log("SoundCloudModel tests passed");
 
 // The launcher prints one JSON line. A failed start carries the reason, such

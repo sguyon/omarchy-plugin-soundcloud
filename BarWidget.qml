@@ -17,6 +17,8 @@ BarWidget {
   property string playbackId: ""
   property bool liked: false
   property bool likeBusy: false
+  property real volume: 1
+  property bool muted: false
   property string title: ""
   property string artist: ""
   property string artDataUrl: ""
@@ -53,6 +55,21 @@ BarWidget {
   property bool tracksRequestPending: false
   property int nextRequestId: 1
   property var pendingRequests: ({})
+  // The volume slider beside the volume icon: shown while the pointer is on the
+  // icon or the bar, while dragging, and for a moment after a wheel change or
+  // after the pointer leaves (volumeLinger, ended by volumeHideTimer).
+  property bool volumeLinger: false
+  readonly property bool volumePointer: volumeIconHover.hovered || volumeSliderHover.hovered
+  readonly property bool volumeDragging: volumeSlider.dragging
+  readonly property bool volumeShown: SoundCloudModel.sliderVisible(volumePointer, volumeDragging, volumeLinger)
+  // Status updates leave the level alone while it is dragged and for a moment after.
+  property bool volumeSettling: false
+  onVolumePointerChanged: {
+    if (volumePointer) return
+    volumeLinger = true
+    volumeHideTimer.interval = SoundCloudModel.sliderHideDelay("leave")
+    volumeHideTimer.restart()
+  }
   property bool connectionInitialized: false
   // Probe an existing daemon so shell restarts preserve playback, but never
   // launch one until the user interacts with the plugin.
@@ -246,6 +263,40 @@ BarWidget {
     likeBusy = sendCommand((liked ? "unlike:" : "like:") + playbackId, "like") > 0
   }
 
+  // Fire-and-forget commands (volume). The answer only matters when it fails;
+  // state comes back through the status.
+  function sendUi(command) {
+    return command !== "" && sendCommand(command, "ui") > 0
+  }
+
+  // One call per volume step (VolumeControl adds the wheel events up into
+  // whole notches, so a swipe does not run it from 0 to 100).
+  function stepVolumeOnce(direction) {
+    var command = SoundCloudModel.volumeStepCommand(direction)
+    if (command === "") return
+    volume = SoundCloudModel.steppedVolume(volume, direction)
+    if (muted && direction > 0) muted = false
+    flashVolumeSlider()
+    sendUi(command)
+  }
+
+  // Shows the slider for a second (a wheel change moved the level).
+  function flashVolumeSlider() {
+    volumeLinger = true
+    volumeHideTimer.interval = SoundCloudModel.sliderHideDelay("flash")
+    volumeHideTimer.restart()
+  }
+
+  // The slider is being dragged: show the level and the icon at once, and send
+  // it. The backend unmutes for any level above 0 and mutes at 0.
+  function setVolumeFromSlider(level) {
+    var command = SoundCloudModel.volumeSetCommand(level)
+    if (command === "") return
+    volume = level
+    muted = level <= 0
+    sendUi(command)
+  }
+
   function commandValue(action, value) {
     if (action === "launch") return "show"
     if (action === "seek") return "seek:" + String(value)
@@ -375,6 +426,10 @@ BarWidget {
     }
     var preserveMetadata = SoundCloudModel.shouldPreservePlaybackMetadata(state, root.title)
     playing = state.playing === true
+    if (!volumeDragging && !volumeSettling) {
+      if (state.volume !== undefined) volume = Math.max(0, Math.min(1, Number(state.volume) || 0))
+      muted = state.muted === true
+    }
     duration = Number(state.duration || 0)
     position = Number(state.position || 0)
     if (!preserveMetadata) {
@@ -639,51 +694,118 @@ BarWidget {
         }
       }
 
-      Row {
-        anchors.horizontalCenter: parent.horizontalCenter
-        spacing: Style.space(7)
+      // Transport stays centred; the volume icon sits on the left edge.
+      Item {
+        width: parent.width
+        height: transportRow.implicitHeight
         visible: root.running && root.loggedIn
         opacity: root.hasTrack ? 1 : 0.45
 
-        Button {
-          iconText: "󰒮"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy && root.hasTrack
-          opacity: enabled ? 1 : 0.4
-          onClicked: root.runAction("previous")
+        Row {
+          id: transportRow
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(7)
+
+          Button {
+            iconText: "󰒮"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy && root.hasTrack
+            opacity: enabled ? 1 : 0.4
+            onClicked: root.runAction("previous")
+          }
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(40)
+            height: width
+            radius: width / 2
+            color: playPauseMouse.containsMouse ? Qt.lighter(Color.accent, 1.15) : Color.accent
+            enabled: !root.actionBusy && root.hasTrack
+            opacity: enabled ? 1 : 0.4
+
+            Text {
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.playIcon
+              color: root.bar.background
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.iconLarge
+            }
+
+            MouseArea {
+              id: playPauseMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.runAction("play-pause")
+            }
+          }
+          Button {
+            iconText: "󰒭"
+            foreground: root.bar.foreground
+            enabled: !root.actionBusy && root.hasTrack
+            opacity: enabled ? 1 : 0.4
+            onClicked: root.runAction("next")
+          }
         }
-        Rectangle {
+
+        // Click mutes; the wheel changes the level by 5 points; hovering opens the slider.
+        Button {
+          id: volumeButton
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(6)
           anchors.verticalCenter: parent.verticalCenter
-          width: Style.space(40)
-          height: width
-          radius: width / 2
-          color: playPauseMouse.containsMouse ? Qt.lighter(Color.accent, 1.15) : Color.accent
-          enabled: !root.actionBusy && root.hasTrack
-          opacity: enabled ? 1 : 0.4
+          iconText: SoundCloudModel.volumeIconGlyph(SoundCloudModel.volumeIconState(root.volume, root.muted))
+          foreground: root.bar.foreground
+          // The tooltip would cover the slider.
+          tooltipText: root.volumeShown ? "" : SoundCloudModel.volumeTooltip(root.volume, root.muted)
+          onClicked: root.sendUi("mute")
 
-          Text {
-            anchors.centerIn: parent
-            textFormat: Text.PlainText
-            text: root.playIcon
-            color: root.bar.background
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.iconLarge
-          }
+          HoverHandler { id: volumeIconHover }
 
-          MouseArea {
-            id: playPauseMouse
+          VolumeControl {
             anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.runAction("play-pause")
+            onStepped: function(direction) { root.stepVolumeOnce(direction) }
           }
         }
-        Button {
-          iconText: "󰒭"
-          foreground: root.bar.foreground
-          enabled: !root.actionBusy && root.hasTrack
-          opacity: enabled ? 1 : 0.4
-          onClicked: root.runAction("next")
+
+        // The slider sits in the free space between the icon and the transport
+        // group. The wrapper also covers the gap next to the icon, so moving
+        // from the icon to the bar never loses the hover.
+        Item {
+          id: volumeSliderWrap
+          readonly property real gap: Style.space(4)
+          readonly property real barWidth: SoundCloudModel.sliderWidth(
+            transportRow.x - (volumeButton.x + volumeButton.width) - gap - Style.space(12))
+          x: volumeButton.x + volumeButton.width
+          width: gap + barWidth
+          height: parent.height
+          visible: barWidth > 0 && opacity > 0
+          opacity: root.volumeShown ? 1 : 0
+
+          Behavior on opacity {
+            NumberAnimation { duration: 110; easing.type: Easing.OutCubic }
+          }
+
+          HoverHandler { id: volumeSliderHover; enabled: volumeSliderWrap.visible }
+
+          VolumeSlider {
+            id: volumeSlider
+            x: volumeSliderWrap.gap
+            width: volumeSliderWrap.barWidth
+            anchors.verticalCenter: parent.verticalCenter
+            value: SoundCloudModel.sliderDisplayValue(root.volume, root.muted)
+            trackColor: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.28)
+            fillColor: Color.accent
+            knobColor: root.bar.foreground
+            onMoved: function(level) { root.setVolumeFromSlider(level) }
+            onCommitted: {
+              root.volumeSettling = true
+              volumeSettleTimer.restart()
+              root.volumeLinger = true
+              volumeHideTimer.interval = SoundCloudModel.sliderHideDelay("leave")
+              volumeHideTimer.restart()
+            }
+          }
         }
       }
 
@@ -1072,6 +1194,20 @@ BarWidget {
       }
 
     }
+  }
+
+  Timer {
+    id: volumeHideTimer
+    interval: 1000
+    onTriggered: root.volumeLinger = false
+  }
+
+  // A status that was already on its way when the drag ended is older than the
+  // level just set; ignore it for a moment.
+  Timer {
+    id: volumeSettleTimer
+    interval: 500
+    onTriggered: root.volumeSettling = false
   }
 
   Timer {

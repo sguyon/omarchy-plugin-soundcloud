@@ -12,6 +12,8 @@ without official SoundCloud API credentials.
 
 - Current track, artist, and artwork, with the bar icon highlighted during playback
 - Play/pause, previous, and next controls
+- Volume icon in the popup: click to mute, scroll over it or hover for a slider to
+  change the level. The player's own volume (not the system volume) is saved between sessions
 - SoundCloud-style waveform progress display with click-to-seek
 - Heart button to like or unlike the current track on your SoundCloud account
 - Home and Feed tabs that load more tracks as you scroll
