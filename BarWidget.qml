@@ -598,14 +598,40 @@ BarWidget {
     onExited: root.bar.hideTooltip(root)
   }
 
-  PopupCard {
+  KeyboardPanel {
     id: popup
     anchorItem: root
     bar: root.bar
     owner: root
     open: root.popupOpen
+    focusTarget: keyCatcher
     contentWidth: popup.fittedContentWidth(Style.space(408))
     contentHeight: popup.fittedContentHeight(Style.space(480))
+
+    // KeyboardPanel catches clicks on the whole screen and hands a bar click on
+    // to the bar's click targets, but a third-party widget only sees its own
+    // targets, so a click on another bar icon just closed this popup. Leaving
+    // the bar strip out of the input region lets that click reach the icon
+    // itself, whose panel then takes over (Bar.requestPopout closes this one).
+    mask: Region {
+      width: popup.screenW
+      height: popup.screenH
+
+      Region {
+        intersection: Intersection.Subtract
+        x: popup.barPos === "right" ? popup.screenW - popup.barW : 0
+        y: popup.barPos === "bottom" ? popup.screenH - popup.barH : 0
+        width: popup.barPos === "top" || popup.barPos === "bottom" ? popup.screenW : popup.barW
+        height: popup.barPos === "top" || popup.barPos === "bottom" ? popup.barH : popup.screenH
+      }
+    }
+
+    // Keys: Esc closes the popup. The content sits inside the key catcher, so
+    // the catcher sees the keys first.
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      onCloseRequested: root.close()
 
     Column {
       id: content
@@ -1192,6 +1218,8 @@ BarWidget {
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
       }
+
+    }
 
     }
   }
