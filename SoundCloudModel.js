@@ -319,7 +319,7 @@ function queueMoveCommand(playbackId, offset) {
 
 // The command for the autoplay switch: the opposite of its current state.
 function toggleCommand(name, currentlyOn) {
-  return name === "autoplay" ? name + ":" + (currentlyOn === true ? "off" : "on") : ""
+  return (name === "autoplay" || name === "notify") ? name + ":" + (currentlyOn === true ? "off" : "on") : ""
 }
 
 // The small label under a queue row.

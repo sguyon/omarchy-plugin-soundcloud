@@ -33,7 +33,9 @@ without official SoundCloud API credentials.
   reorder; the playing track stays first. A slim toolbar has shuffle, repeat and Clear, which
   asks for a confirmation first. The Autoplay switch in the toolbar (on by default) keeps
   playing when the queue ends: related tracks from SoundCloud are added, marked "related".
-  Tab and Shift+Tab reach it after History
+  The bell switch next to it (on by default) shows a "Now playing" notification with the title
+  and artist each time a new track starts, not for a restart, a replay or a resume after
+  a restart. Tab and Shift+Tab reach it after History
 - Link in the clipboard while the popup is open: Ctrl+V (or SUPER+V, Shift+Insert in a
   terminal) adds it as play next, Ctrl+Shift+V plays it now; the popup names the track
   it queued
@@ -202,8 +204,8 @@ not require another sign-in:
 - `cookies.json`: the SoundCloud session cookies
 - `tracks.json`: the cached track lists (Home, Feed, Likes, History, and the tracks you
   played here), with titles, artists, and links
-- `settings.json`: the volume level, whether it is muted, whether Autoplay is on and
-  whether earbud multi-press is on
+- `settings.json`: the volume level, whether it is muted, whether Autoplay is on, whether
+  track notifications are on and whether earbud multi-press is on
 - `queue.json`: the play queue (titles, artists, links), its repeat and shuffle
   settings, and where you stopped in the current track
 

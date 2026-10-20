@@ -2334,6 +2334,15 @@ class PlayUrlCommandTest(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(notices, ["Playing: Song 7 — Artist"])
+        with self.subTest('the backend already shows Now playing, so the CLI does not announce it again'):
+            code, _result, _sent, notices, _popups = self.run_cli(
+                ["play-url", "--notify", "https://soundcloud.com/artist/song"],
+                playback={"playing": True, "playbackState": "playing", "title": "Song 7",
+                          "artist": "Artist", "notify": True},
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(notices, [])
         with self.subTest('a track that fails to start is reported instead of announced'):
             code, result, _sent, notices, popups = self.run_cli(
                 ["play-url", "--notify", "--open", "https://soundcloud.com/artist/song"],
@@ -2490,29 +2499,6 @@ class PlayUrlCommandTest(unittest.TestCase):
             )
             self.assertEqual((code, popups), (1, []))
             self.assertEqual(notices, ["Track not found. It may be private or deleted"])
-
-
-class DesktopNotificationTest(unittest.TestCase):
-    def test_desktop_notification_separates_options_times_out_and_cleans_the_text(self):
-        app = load_module()
-        calls = []
-        with mock.patch.object(app.os, "access", return_value=True), \
-                mock.patch.object(app.subprocess, "run", lambda *a, **k: calls.append((a, k))):
-            app.send_desktop_notification("-h <b>&\x1b[2J\x07\u202etxt")
-
-        (args,), options = calls[0]
-        self.assertEqual(args[-3:], ["--", "SoundCloud", "-h &lt;b&gt;&amp;[2Jtxt"])
-        self.assertEqual(options["timeout"], 3.0)
-        self.assertNotIn("shell", options)
-
-    def test_desktop_notification_ignores_a_notifier_that_fails_or_hangs(self):
-        app = load_module()
-        for error in (OSError("gone"), subprocess.TimeoutExpired("notify-send", 3)):
-            def run(*_args, _error=error, **_kwargs):
-                raise _error
-            with mock.patch.object(app.os, "access", return_value=True), \
-                    mock.patch.object(app.subprocess, "run", run):
-                app.send_desktop_notification("hello")
 
 
 class LocalPlayHistoryTest(unittest.TestCase):
@@ -4000,6 +3986,9 @@ class QueuePlaybackTest(unittest.TestCase):
         )
         for patch in patches:
             self.enterContext(patch)
+        self.notifications = []
+        self.enterContext(mock.patch.object(
+            self.app, "notify_track_started", lambda title, artist: self.notifications.append((title, artist))))
         if settings is not None:
             fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY)
             self.app.SettingsStore(fd).save(settings)
@@ -4469,31 +4458,37 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertEqual(self.application.playback.current.properties["volume"], 0.25)
 
     def test_saved_settings_are_restored_at_startup(self):
-        self.build(settings={"v": 1, "volume": 0.3, "muted": True, "autoplay": False})
+        self.build(settings={"v": 1, "volume": 0.3, "muted": True, "autoplay": False, "notify": False})
 
         status = self.application.build_status()
 
-        self.assertEqual((status["volume"], status["muted"], status["autoplay"]), (0.3, True, False))
+        self.assertEqual((status["volume"], status["muted"], status["autoplay"], status["notify"]),
+                         (0.3, True, False, False))
 
     def test_defaults_without_a_settings_file(self):
         self.build()
 
         status = self.application.build_status()
 
-        self.assertEqual((status["volume"], status["muted"], status["autoplay"]), (1.0, False, True))
+        self.assertEqual((status["volume"], status["muted"], status["autoplay"], status["notify"]),
+                         (1.0, False, True, True))
 
-    def test_autoplay_command_is_reported_and_saved(self):
+    def test_autoplay_and_notify_commands_are_reported_and_saved(self):
         self.build()
 
         self.assertFalse(self.command("autoplay:off").reply["autoplay"])
+        self.assertFalse(self.command("notify:off").reply["notify"])
         self.assertFalse(self.command("autoplay:maybe").reply["ok"])
-        self.assertFalse(self.command("autoplay:").reply["ok"])
-        self.assertIs(self.application.build_status()["autoplay"], False)
+        self.assertFalse(self.command("notify:").reply["ok"])
+        status = self.application.build_status()
+        self.assertEqual((status["autoplay"], status["notify"]), (False, False))
         self.glib.run_idle()
-        self.assertIs(self.saved_settings()["autoplay"], False)
+        saved = self.saved_settings()
+        self.assertEqual((saved["autoplay"], saved["notify"]), (False, False))
 
         self.command("autoplay:on")
-        self.assertIs(self.application.autoplay, True)
+        self.command("notify:on")
+        self.assertEqual((self.application.autoplay, self.application.notify), (True, True))
 
     # autoplay
 
@@ -5570,6 +5565,63 @@ class QueuePlaybackTest(unittest.TestCase):
 
         self.assertEqual(metadata["xesam:title"], "Song 2")
 
+    # notification
+
+    def test_track_started_notification_rules(self):
+        with self.subTest('a started track sends one notification with title and artist'):
+            self.build()
+            self.fill("home", 3)
+
+            self.command("play-from:home:soundcloud:tracks:1")
+            self.assertEqual(self.notifications, [])  # not before it plays
+            self.resolve()
+            self.end_track()
+            self.resolve()
+
+            self.assertEqual(self.notifications, [("Song 1", "Artist"), ("Song 2", "Artist")])
+        with self.subTest('no notification when off or for a restart a replay or a failed start'):
+            self.build()
+            self.fill("home", 3)
+            self.command("notify:off")
+            self.command("play-from:home:soundcloud:tracks:1")
+            self.resolve()
+            self.assertEqual(self.notifications, [])
+
+            self.command("notify:on")
+            self.command("repeat:one")
+            self.end_track()  # replays track 1
+            self.resolve()
+            self.command("previous")  # past the start threshold or not, the same track
+            self.assertEqual(self.notifications, [])
+
+            self.command("play-from:home:soundcloud:tracks:2")
+            self.resolve(ok=False)
+            self.assertEqual(self.notifications, [])
+        with self.subTest('a resume after a restart does not notify'):
+            queue = load_module().PlayQueue()
+            queue.replace([self.row(n, durationMs=200_000) for n in (1, 2, 3)], 1, "likes")
+            self.build(saved=(queue, 61_000))
+
+            self.command("play-pause")
+            self.resolve()
+
+            self.assertEqual(self.notifications, [])
+            self.command("next")
+            self.resolve()
+            self.assertEqual(self.notifications, [("Song 3", "Artist")])
+        with self.subTest('an autoplay track notifies too'):
+            self.build()
+            self.related((101,))
+            self.play_last_of_two()
+            self.notifications.clear()
+
+            self.end_track()
+            self.resolve()
+
+            self.assertEqual(self.notifications, [("Song 101", "Artist")])
+
+    # track link
+
     def test_the_status_carries_the_playing_tracks_page_link(self):
         self.build()
         self.fill("home", 2)
@@ -5823,7 +5875,7 @@ class QueuePlaybackTest(unittest.TestCase):
         self.assertIs(self.command("multipress:off").reply["multiPress"], False)
         self.glib.run_idle()
         self.assertIs(self.saved_settings()["multiPress"], False)
-        self.assertIs(self.application.autoplay, True)
+        self.assertEqual((self.application.autoplay, self.application.notify), (True, True))
         self.command("multipress:on")
         self.assertIs(self.application.multipress, True)
 
@@ -5928,10 +5980,11 @@ class SettingsCommandParsingTest(unittest.TestCase):
         self.assertIs(app.on_off_from_command("autoplay:off", "autoplay"), False)
         self.assertIsNone(app.on_off_from_command("autoplay:maybe", "autoplay"))
         self.assertIsNone(app.on_off_from_command("shuffle:on", "autoplay"))
+        self.assertIsNone(app.on_off_from_command("notify:on", "autoplay"))
 
 
 class SettingsStoreTest(unittest.TestCase):
-    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True,
+    DEFAULTS = {"v": 1, "volume": 1.0, "muted": False, "autoplay": True, "notify": True,
                 "multiPress": True}
 
     def store(self, content=None):
@@ -5953,7 +6006,7 @@ class SettingsStoreTest(unittest.TestCase):
                     self.assertEqual(store.load(), self.DEFAULTS)
         with self.subTest('each bad value falls back on its own'):
             _app, store, _path = self.store(json.dumps({
-                "v": 1, "volume": 3, "muted": "yes", "autoplay": False}).encode())
+                "v": 1, "volume": 3, "muted": "yes", "autoplay": False, "notify": None}).encode())
 
             self.assertEqual(store.load(), {**self.DEFAULTS, "autoplay": False})
         with self.subTest('an oversized file is ignored'):
@@ -5965,11 +6018,12 @@ class SettingsStoreTest(unittest.TestCase):
     def test_settings_round_trip_privately(self):
         _app, store, path = self.store()
 
-        store.save({"v": 1, "volume": 0.35, "muted": True, "autoplay": False,
+        store.save({"v": 1, "volume": 0.35, "muted": True, "autoplay": False, "notify": False,
                     "multiPress": False})
 
         self.assertEqual(store.load(), {
-            "v": 1, "volume": 0.35, "muted": True, "autoplay": False, "multiPress": False})
+            "v": 1, "volume": 0.35, "muted": True, "autoplay": False, "notify": False,
+            "multiPress": False})
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_only_the_known_keys_are_kept_so_a_new_setting_is_added_on_purpose(self):
@@ -5978,8 +6032,10 @@ class SettingsStoreTest(unittest.TestCase):
         store.save({"v": 1, "volume": 0.5, "muted": False, "autoplay": True, "somethingNew": True})
 
         self.assertEqual(store.load(), {
-            "v": 1, "volume": 0.5, "muted": False, "autoplay": True, "multiPress": True})
-        self.assertEqual(set(app.DEFAULT_SETTINGS), {"v", "volume", "muted", "autoplay", "multiPress"})
+            "v": 1, "volume": 0.5, "muted": False, "autoplay": True, "notify": True,
+            "multiPress": True})
+        self.assertEqual(set(app.DEFAULT_SETTINGS),
+                         {"v", "volume", "muted", "autoplay", "notify", "multiPress"})
 
 
 class GstVolumeTest(unittest.TestCase):
@@ -6120,20 +6176,21 @@ class SettingsStatusFieldsTest(unittest.TestCase):
         app = load_module()
 
         status = app.validate_status_payload({
-            **self.BASE, "volume": 0.5, "muted": True, "autoplay": False,
+            **self.BASE, "volume": 0.5, "muted": True, "autoplay": False, "notify": True,
             "trackUrl": "https://soundcloud.com/artist/song"})
 
-        self.assertEqual((status["volume"], status["muted"], status["autoplay"]), (0.5, True, False))
+        self.assertEqual((status["volume"], status["muted"], status["autoplay"], status["notify"]),
+                         (0.5, True, False, True))
         self.assertEqual(status["trackUrl"], "https://soundcloud.com/artist/song")
 
     def test_invalid_values_are_left_out_and_a_foreign_track_url_is_emptied(self):
         app = load_module()
 
         status = app.validate_status_payload({
-            **self.BASE, "volume": 2, "muted": "yes", "autoplay": 1,
+            **self.BASE, "volume": 2, "muted": "yes", "autoplay": 1, "notify": None,
             "trackUrl": "https://evil.example/x"})
 
-        for key in ("volume", "muted", "autoplay"):
+        for key in ("volume", "muted", "autoplay", "notify"):
             self.assertNotIn(key, status)
         self.assertEqual(status["trackUrl"], "")
         self.assertNotIn("volume", app.validate_status_payload({**self.BASE, "volume": float("nan")}))
@@ -6150,7 +6207,7 @@ class SettingsStatusFieldsTest(unittest.TestCase):
 
         status = app.validate_status_payload(self.BASE)
 
-        for key in ("volume", "muted", "autoplay", "trackUrl"):
+        for key in ("volume", "muted", "autoplay", "notify", "trackUrl"):
             self.assertNotIn(key, status)
 
 
@@ -6328,6 +6385,89 @@ class RelatedTracksTest(unittest.TestCase):
             likes.related_tracks(9)
 
 
+class TrackNotificationTest(unittest.TestCase):
+    def test_now_playing_goes_through_notify_send_without_a_shell(self):
+        app = load_module()
+        calls = []
+
+        app.send_track_notification(
+            "Song <b>&", "The\nArtist", run=lambda *a, **k: calls.append((a, k)), notifier=sys.executable)
+
+        (args,), options = calls[0]
+        self.assertEqual(args[0], sys.executable)
+        self.assertEqual(args[-2:], ["Now playing", "Song &lt;b&gt;&amp;\nThe Artist"])
+        self.assertLess(args.index("--"), args.index("Now playing"))
+        self.assertNotIn("shell", options)
+        self.assertLessEqual(options["timeout"], 5)
+
+    def test_hostile_titles_cannot_inject_options_or_terminal_and_bidi_controls(self):
+        app = load_module()
+        calls = []
+
+        app.send_track_notification(
+            "-t evil\x1b[31m\x07\u202egnp.exe", "\u2066Ar\x00tist\u202c",
+            run=lambda *a, **k: calls.append(a), notifier=sys.executable)
+
+        args = calls[0][0]
+        self.assertEqual(args[-2:], ["Now playing", "-t evil[31mgnp.exe\nArtist"])
+        self.assertLess(args.index("--"), args.index("Now playing"))
+
+    def test_desktop_notification_separates_options_times_out_and_cleans_the_text(self):
+        app = load_module()
+        calls = []
+        with mock.patch.object(app.os, "access", return_value=True), \
+                mock.patch.object(app.subprocess, "run", lambda *a, **k: calls.append((a, k))):
+            app.send_desktop_notification("-h <b>&\x1b[2J\x07\u202etxt")
+
+        (args,), options = calls[0]
+        self.assertEqual(args[-3:], ["--", "SoundCloud", "-h &lt;b&gt;&amp;[2Jtxt"])
+        self.assertEqual(options["timeout"], 3.0)
+        self.assertNotIn("shell", options)
+
+    def test_desktop_notification_ignores_a_notifier_that_fails_or_hangs(self):
+        app = load_module()
+        for error in (OSError("gone"), subprocess.TimeoutExpired("notify-send", 3)):
+            def run(*_args, _error=error, **_kwargs):
+                raise _error
+            with mock.patch.object(app.os, "access", return_value=True), \
+                    mock.patch.object(app.subprocess, "run", run):
+                app.send_desktop_notification("hello")
+
+    def test_a_missing_artist_leaves_only_the_title(self):
+        app = load_module()
+        calls = []
+
+        app.send_track_notification("Song", "", run=lambda *a, **k: calls.append(a), notifier=sys.executable)
+
+        self.assertEqual(calls[0][0][-1], "Song")
+
+    def test_failures_and_a_missing_notifier_are_ignored(self):
+        app = load_module()
+        for error in (OSError("gone"), subprocess.TimeoutExpired("notify-send", 3)):
+            def run(*_args, _error=error, **_kwargs):
+                raise _error
+            app.send_track_notification("Song", "Artist", run=run, notifier=sys.executable)
+        calls = []
+        app.send_track_notification("Song", "Artist", run=lambda *a, **k: calls.append(a),
+                                    notifier="/nonexistent/notify-send")
+        self.assertEqual(calls, [])
+
+    def test_the_notification_is_sent_from_a_thread(self):
+        app = load_module()
+        sent = threading.Event()
+        threads = []
+
+        def fake(title, artist):
+            threads.append(threading.current_thread())
+            sent.set()
+
+        with mock.patch.object(app, "send_track_notification", fake):
+            app.notify_track_started("Song", "Artist")
+            self.assertTrue(sent.wait(2))
+
+        self.assertIsNot(threads[0], threading.main_thread())
+
+
 class BarWidgetTest(unittest.TestCase):
     def test_runtime_commands_use_one_persistent_socket(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
@@ -6497,6 +6637,8 @@ class BarWidgetTest(unittest.TestCase):
 
         self.assertIn('SoundCloudModel.toggleCommand("autoplay", root.autoplay)', qml)
         self.assertIn("autoplay = state.autoplay !== false", qml)
+        self.assertIn('SoundCloudModel.toggleCommand("notify", root.notify)', qml)
+        self.assertIn("notify = state.notify !== false", qml)
 
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()

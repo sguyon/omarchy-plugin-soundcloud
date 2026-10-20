@@ -73,6 +73,7 @@ MAX_QUEUE_BYTES = 256 * 1024
 MAX_QUEUE_SOURCE_BYTES = 64
 MAX_SETTINGS_BYTES = 4096
 RELATED_TRACKS_LIMIT = 10
+NOTIFY_SEND = "/usr/bin/notify-send"
 NOTIFICATION_TIMEOUT_SECONDS = 3.0
 NO_PLAYABLE_MESSAGE = "No other track in the queue can play"
 ENCRYPTED_MESSAGE = "This track is only offered as an encrypted stream the plugin can't play"
@@ -2026,7 +2027,7 @@ def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         fields["volume"] = volume
-    for key in ("muted", "autoplay", "multiPress"):
+    for key in ("muted", "autoplay", "notify", "multiPress"):
         if isinstance(payload.get(key), bool):
             fields[key] = payload[key]
     if "trackUrl" in payload:
@@ -2270,7 +2271,7 @@ def sanitize_queue(payload: object) -> dict[str, object]:
 
 
 DEFAULT_SETTINGS: dict[str, object] = {
-    "v": 1, "volume": 1.0, "muted": False, "autoplay": True, "multiPress": True,
+    "v": 1, "volume": 1.0, "muted": False, "autoplay": True, "notify": True, "multiPress": True,
 }
 
 
@@ -2282,14 +2283,14 @@ def sanitize_settings(payload: object) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         settings["volume"] = volume
-    for key in ("muted", "autoplay", "multiPress"):
+    for key in ("muted", "autoplay", "notify", "multiPress"):
         if isinstance(payload.get(key), bool):
             settings[key] = payload[key]
     return settings
 
 
 class SettingsStore:
-    """Volume, mute, autoplay and earbud multi-press choices in `settings.json`."""
+    """Volume, mute, autoplay, notification and earbud multi-press choices in `settings.json`."""
 
     def __init__(self, directory_fd: int, maximum_bytes: int = MAX_SETTINGS_BYTES):
         self._store = PrivateJsonStore(directory_fd, "settings.json", maximum_bytes)
@@ -4470,9 +4471,11 @@ def build_application(show_on_start: bool = False):
             self.queue_finished = False  # the last queued track ended and nothing followed
             self.queue_save_pending = False
             self.autoplay = saved_settings["autoplay"] is True
+            self.notify = saved_settings["notify"] is True
             self.multipress = saved_settings["multiPress"] is True
             self.settings_save_pending = False
             self.autoplay_loading = False
+            self.last_notified_id = ""
             self.run_in_thread = lambda target: threading.Thread(target=target, daemon=True).start()
             self.track_cache_save_pending = False
             self.had_subscriber = False
@@ -4699,6 +4702,8 @@ def build_application(show_on_start: bool = False):
                     self._record_local_play(selected_track)
                     if self.resume_ms:
                         self.playback.seek_when_playing(self.resume_ms / 1000)
+                    else:
+                        self._announce_track(selected_track)
                 else:
                     self.playback.error = "SoundCloud could not play this track"
                     GLib.idle_add(self._track_failed)
@@ -4707,12 +4712,21 @@ def build_application(show_on_start: bool = False):
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 return
 
+        def _announce_track(self, track):
+            """Tell the desktop which track started, if asked to. Not for a replay by repeat one."""
+            playback_id = str(track.get("playbackId", ""))
+            replay = self.auto_skip.automatic and playback_id == self.last_notified_id
+            self.last_notified_id = playback_id
+            if self.notify and not replay:
+                notify_track_started(str(track.get("title", "")), str(track.get("artist", "")))
+
+
         def _save_settings(self):
             self.settings_save_pending = False
             try:
                 settings_store.save({
                     "v": 1, **self.playback.volume_status(),
-                    "autoplay": self.autoplay,
+                    "autoplay": self.autoplay, "notify": self.notify,
                     "multiPress": self.multipress,
                 })
             except OSError:
@@ -5337,6 +5351,7 @@ def build_application(show_on_start: bool = False):
                 **queue_status(self.queue),
                 **self.playback.volume_status(),
                 "autoplay": self.autoplay,
+                "notify": self.notify,
                 "multiPress": self.multipress,
                 "trackUrl": track_url,
             }
@@ -5790,14 +5805,16 @@ def build_application(show_on_start: bool = False):
                     {"ok": enabled is not None, "running": True, "multiPress": self.multipress},
                     publish_status=True,
                 )
-            elif command.startswith("autoplay:"):
-                enabled = on_off_from_command(command, "autoplay")
+            elif command.startswith(("autoplay:", "notify:")):
+                name = command.partition(":")[0]
+                enabled = on_off_from_command(command, name)
                 if enabled is not None:
-                    self.autoplay = enabled
+                    setattr(self, name, enabled)
                     self._settings_changed()
                 self._respond(
                     connection, request_id,
-                    {"ok": enabled is not None, "running": True, "autoplay": self.autoplay},
+                    {"ok": enabled is not None, "running": True,
+                     "autoplay": self.autoplay, "notify": self.notify},
                     publish_status=True,
                 )
             elif command == "queue":
@@ -6085,6 +6102,29 @@ def send_desktop_notification(message: str) -> None:
             pass
 
 
+def send_track_notification(title: str, artist: str, run=subprocess.run, notifier: str = NOTIFY_SEND) -> None:
+    """Show "Now playing" with the track. Runs `notify-send` without a shell and ignores any failure."""
+    if not os.access(notifier, os.X_OK):
+        return
+
+    body = "\n".join(
+        part for part in (clean_notification_text(title), clean_notification_text(artist)) if part)
+    try:
+        run(
+            [notifier, "--app-name=SoundCloud", "--expire-time=4000", "--", "Now playing", body],
+            check=False, timeout=NOTIFICATION_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def notify_track_started(title: str, artist: str) -> None:
+    """`send_track_notification` on a thread, so the main loop never waits for it."""
+    threading.Thread(target=send_track_notification, args=(title, artist), daemon=True).start()
+
+
+
 def open_popup() -> None:
     shell = shutil.which("omarchy-shell")
     if shell:
@@ -6125,7 +6165,8 @@ def play_url_command(text: str, notify: bool, show: bool = False, queue_next: bo
         if state.get("playbackState") == "error":
             return fail(CANT_PLAY_MESSAGE)
         print(json.dumps(response, sort_keys=True))
-        if notify:
+        # The backend already shows "Now playing" when its notify setting is on: don't say it twice.
+        if notify and state.get("notify") is not True:
             label = " — ".join(str(state[key]) for key in ("title", "artist") if state.get(key))
             prefix = "Playing" if state.get("playing") else "Loading"
             send_desktop_notification(f"{prefix}: {label}" if label else prefix)
