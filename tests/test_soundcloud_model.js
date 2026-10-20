@@ -398,6 +398,9 @@ assert.equal(model.keyAction(0x4c, CT, ""), "");
 assert.equal(model.keyAction(0x53, SH, "S"), "shuffle");
 assert.equal(model.keyAction(0x53, 0, "s"), "");
 assert.equal(model.keyAction(0x48, 0, "h"), "ignore");
+assert.equal(model.keyAction(0x56, CT, "\x16"), "link-next");
+assert.equal(model.keyAction(0x56, CT | SH, "\x16"), "link-play");
+assert.equal(model.keyAction(0x56, 0, "v"), "");
 assert.equal(model.keyAction(0x4a, 0, "j"), ""); // j and k stay list navigation
 assert.equal(model.keyAction(0x4b, 0, "k"), "");
 assert.equal(model.keyAction(0x20, 0x20000000, ""), ""); // keypad flag alone is no modifier
@@ -406,7 +409,54 @@ assert.equal(model.actionRepeats("volume-down"), true);
 assert.equal(model.actionRepeats("queue-up"), true);
 assert.equal(model.actionRepeats("queue-down"), true);
 assert.equal(model.actionRepeats("like"), false);
+assert.equal(model.actionRepeats("link-next"), false);
 assert.equal(model.actionRepeats("next"), false);
+
+// Pasted links.
+assert.equal(model.pastedLinkUrl("https://soundcloud.com/a/b"), "https://soundcloud.com/a/b");
+assert.equal(model.pastedLinkUrl("  https://soundcloud.com/a/b\n"), "https://soundcloud.com/a/b");
+assert.equal(model.pastedLinkUrl("http://soundcloud.com/a/b"), "");
+assert.equal(model.pastedLinkUrl("ftp://x"), "");
+assert.equal(model.pastedLinkUrl("see https://soundcloud.com/a/b"), "");
+assert.equal(model.pastedLinkUrl("https://a.com/x y"), "");
+assert.equal(model.pastedLinkUrl("https://" + "a".repeat(3000)), "");
+assert.equal(model.pastedLinkUrl(""), "");
+assert.equal(model.pastedLinkUrl(null), "");
+assert.equal(model.linkCommand("https://soundcloud.com/a/b?x=1&y=2", false),
+  "link-next:" + encodeURIComponent("https://soundcloud.com/a/b?x=1&y=2"));
+assert.equal(model.linkCommand("https://soundcloud.com/a/b", true), "link-play:https%3A%2F%2Fsoundcloud.com%2Fa%2Fb");
+assert.equal(model.linkCommand("javascript:alert(1)", true), "");
+assert.equal(model.linkCommand("", false), "");
+
+
+// Paste keys: Ctrl+V, Shift+Insert (Omarchy's SUPER+V in a terminal), Meta ignored.
+{
+  const ctrl = 0x04000000, shift = 0x02000000, alt = 0x08000000, meta = 0x10000000;
+  assert.equal(model.keyAction(0x56, ctrl, "\u0016"), "link-next");
+  assert.equal(model.keyAction(0x56, ctrl | meta, ""), "link-next");
+  assert.equal(model.keyAction(0x56, ctrl | shift, ""), "link-play");
+  assert.equal(model.keyAction(0x56, ctrl | shift | meta, ""), "link-play");
+  assert.equal(model.keyAction(0x01000006, shift, ""), "link-next");
+  assert.equal(model.keyAction(0x01000006, shift | meta, ""), "link-next");
+  assert.equal(model.keyAction(0x01000006, 0, ""), "");
+  assert.equal(model.keyAction(0x56, ctrl | alt, ""), "");
+  assert.equal(model.keyAction(0x56, 0, "v"), "");
+}
+
+// Paste result: what to send, or what to tell.
+assert.deepEqual(model.pasteRequest("https://soundcloud.com/a/b\n", false),
+  { command: "link-next:https%3A%2F%2Fsoundcloud.com%2Fa%2Fb", error: "" });
+assert.deepEqual(model.pasteRequest("https://soundcloud.com/a/b", true).command.indexOf("link-play:"), 0);
+assert.equal(model.pasteRequest("", false).command, "");
+assert.equal(model.pasteRequest("   ", false).error, "The clipboard has no text to paste");
+assert.equal(model.pasteRequest(null, false).error, "The clipboard has no text to paste");
+assert.equal(model.pasteRequest("hello world", false).error, "The clipboard text is not a link");
+assert.equal(model.pasteNotice({ ok: true, queued: true, title: "Little  Snowflake" }), "Queued: Little Snowflake");
+assert.equal(model.pasteNotice({ ok: true, queued: true }), "Queued");
+assert.equal(model.pasteNotice({ ok: true, title: "X" }), "Playing: X");
+assert.equal(model.pasteNotice({ ok: true }), "Playing the link");
+assert.equal(model.pasteNotice({ ok: false, error: "no" }), "");
+assert.equal(model.pasteNotice(null), "");
 
 // Optimistic seek position: a status right after a seek is older than the seek.
 assert.equal(model.positionFromStatus(30, 12, 1100, 1000), 30); // within 500 ms of a seek

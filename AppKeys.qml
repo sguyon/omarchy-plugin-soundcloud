@@ -2,7 +2,7 @@ import QtQuick
 import "SoundCloudModel.js" as SoundCloudModel
 
 // The popup's own shortcuts (see SoundCloudModel.keyAction): next/previous,
-// volume, like, repeat, shuffle and queue moves. It sits first in the key
+// volume, like, repeat, shuffle, pasted links and queue moves. It sits first in the key
 // catcher's Keys.forwardTo, which runs before the catcher's own handler, so
 // keys the catcher would turn into moves (l, h, Shift+arrows) are taken here.
 // A recognised key is accepted; held keys repeat only for the volume and queue

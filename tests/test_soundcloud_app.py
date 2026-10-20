@@ -5828,8 +5828,13 @@ class BarWidgetTest(unittest.TestCase):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
 
         self.assertIn('["/usr/bin/python3", "-I", helperPath', qml)
-        self.assertNotIn("StdioCollector", qml)
         self.assertNotIn("Component.onCompleted: startBackend", qml)
+        # The only collector is the clipboard read, whose output is cut at 4 KB.
+        self.assertNotIn("stderr: StdioCollector", qml)
+        start = 0
+        while (index := qml.find("StdioCollector", start)) >= 0:
+            self.assertIn("head -c 4096", qml[max(0, index - 400):index])
+            start = index + 1
 
     def test_webkit_profile_is_ephemeral_and_backend_watches_removal(self):
         source = MODULE_PATH.read_text()
@@ -5892,6 +5897,17 @@ class BarWidgetTest(unittest.TestCase):
         # Clear is never sent by the first click.
         self.assertLess(qml.index("function armClearQueue"), qml.index('sendUi("queue-clear")'))
         self.assertNotIn('onClicked: root.sendUi("queue-clear")', qml)
+
+    def test_a_link_pasted_into_the_open_popup_is_read_from_the_clipboard_and_sent_to_the_queue(self):
+        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+
+        self.assertIn('action === "link-next" || action === "link-play"', qml)
+        self.assertIn("wl-paste --no-newline --type text 2>/dev/null | head -c 4096", qml)
+        self.assertIn("pasteTimeout", qml)
+        self.assertIn("SoundCloudModel.pasteRequest(text, pasteNow)", qml)
+        self.assertIn('sendCommand(request.command, "paste")', qml)
+        # The clipboard text only ever reaches the backend as an encoded https link command.
+        self.assertNotIn("sendCommand(text", qml)
 
     def test_history_tab_follows_likes_and_reads_from_the_account_api(self):
         qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()

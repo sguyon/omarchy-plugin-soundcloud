@@ -425,6 +425,7 @@ function barIconColor(playing, accent, foreground) {
 //   PageDown, Shift+Right: next      PageUp, Shift+Left: previous
 //   Shift+Up/Down: volume +/- 5      Alt+Up/Down: move the queue row
 //   l: like/unlike   Shift+L: repeat   Shift+S: shuffle
+//   Ctrl+V, Shift+Insert: link-next   Ctrl+Shift+V: link-play
 // j/k stay list navigation (Omarchy convention) although the website uses K/J
 // for previous/next.
 var keyShift = 0x02000000
@@ -452,6 +453,12 @@ function keyAction(key, modifiers, text) {
   }
   if (shift && (key === 0x53)) return "shuffle"
   if (none && (key === 0x48 || letter === "h")) return "ignore"
+  // Super may still be held when Omarchy's SUPER+V sends its Ctrl+V, so Meta is
+  // ignored for the paste keys; in a terminal that shortcut sends Shift+Insert.
+  var pasteMods = mods & ~keyMeta
+  if (key === 0x56 && pasteMods === keyCtrl) return "link-next"
+  if (key === 0x56 && pasteMods === (keyCtrl | keyShift)) return "link-play"
+  if (key === 0x01000006 && pasteMods === keyShift) return "link-next"
   return ""
 }
 
@@ -459,6 +466,35 @@ function keyAction(key, modifiers, text) {
 function actionRepeats(action) {
   return action === "volume-up" || action === "volume-down"
     || action === "queue-up" || action === "queue-down"
+}
+
+// A pasted link: only text that starts with https:// and has no whitespace.
+function pastedLinkUrl(text) {
+  var value = String(text === undefined || text === null ? "" : text).trim()
+  return /^https:\/\/[^\s]+$/.test(value) && value.length <= 2048 ? value : ""
+}
+
+function linkCommand(url, playNow) {
+  var clean = pastedLinkUrl(url)
+  return clean === "" ? "" : (playNow === true ? "link-play:" : "link-next:") + encodeURIComponent(clean)
+}
+
+// What a paste does with the clipboard text: the backend command, or the
+// message to show when there is nothing to send.
+function pasteRequest(text, playNow) {
+  var value = String(text === undefined || text === null ? "" : text).trim()
+  if (value === "") return { command: "", error: "The clipboard has no text to paste" }
+  var command = linkCommand(value, playNow)
+  if (command === "") return { command: "", error: "The clipboard text is not a link" }
+  return { command: command, error: "" }
+}
+
+// The short confirmation after a pasted link was accepted.
+function pasteNotice(message) {
+  if (!message || message.ok !== true) return ""
+  var title = String(message.title || "").replace(/\s+/g, " ").trim()
+  if (message.queued === true) return title === "" ? "Queued" : "Queued: " + title
+  return title === "" ? "Playing the link" : "Playing: " + title
 }
 
 // Left and Right seek like the website: a step is max(5, n) seconds where n counts
@@ -593,6 +629,10 @@ if (typeof module !== "undefined") {
     isSeekKey: isSeekKey,
     keyAction: keyAction,
     actionRepeats: actionRepeats,
+    pastedLinkUrl: pastedLinkUrl,
+    linkCommand: linkCommand,
+    pasteRequest: pasteRequest,
+    pasteNotice: pasteNotice,
     positionFromStatus: positionFromStatus,
     seekedPosition: seekedPosition,
     launchError: launchError

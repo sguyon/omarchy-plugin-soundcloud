@@ -56,6 +56,9 @@ BarWidget {
   // moves ("" = none).
   property string queueSelectedId: ""
   readonly property var queueRows: SoundCloudModel.upcomingQueue(queueData)
+  property bool pasteNow: false
+  // A short confirmation (such as a queued link), cleared by noticeTimer.
+  property string notice: ""
   // The queue as it was when Clear was pressed (null = no confirmation pending).
   property var clearArmedSignature: null
   // The list row whose action menu is open ("tab:playbackId"), if any.
@@ -197,10 +200,32 @@ BarWidget {
       sendUi("repeat")
     } else if (action === "shuffle") {
       sendUi("shuffle")
+    } else if (action === "link-next" || action === "link-play") {
+      pasteLink(action === "link-play")
     } else if (action === "queue-up" || action === "queue-down") {
       if (queueOpen) moveQueueRow(queueSelectedId, SoundCloudModel.queueKeyMoveOffset(
         queueRows, queueSelectedId, action === "queue-up" ? -1 : 1))
     }
+  }
+
+  // Ctrl+V and Ctrl+Shift+V: read the clipboard, send a link to the backend.
+  function pasteLink(playNow) {
+    if (pasteProcess.running) return
+    pasteNow = playNow
+    pasteProcess.running = true
+    pasteTimeout.restart()
+  }
+
+  // The clipboard text arrived: send it, or say why there is nothing to send.
+  function pasteArrived(text) {
+    var request = SoundCloudModel.pasteRequest(text, pasteNow)
+    if (request.command === "") {
+      lastError = request.error
+      return
+    }
+    if (!running || !loggedIn) return
+    lastError = ""
+    if (sendCommand(request.command, "paste") === 0) lastError = "Not connected to SoundCloud"
   }
 
   // Clear queue asks first (see SoundCloudModel.clearConfirmStays).
@@ -699,6 +724,14 @@ BarWidget {
       if (message.ok === false) lastError = String(message.error || "SoundCloud could not move this track")
       queueSelectedId = SoundCloudModel.queueSelectionAfterUpdate(queueRows, queueSelectedId)
       uiRefreshTimer.restart()
+    } else if (kind === "paste") {
+      if (message.ok !== true || message.error) {
+        lastError = String(message.error || "SoundCloud could not add this link")
+      } else {
+        notice = SoundCloudModel.pasteNotice(message)
+        noticeTimer.restart()
+        uiRefreshTimer.restart()
+      }
     } else if (kind === "ui") {
       if (message.ok !== true || message.error) lastError = String(message.error || "SoundCloud action failed")
       else uiRefreshTimer.restart()
@@ -812,11 +845,11 @@ BarWidget {
     // move the selection (in the list or the queue), Enter plays it, Tab/Shift+Tab
     // switch tabs and Queue, Space plays or pauses, Left/Right seek (5 s, longer
     // while held), q the queue, m mutes, Alt+Up/Down move the selected queue row.
-    // AppKeys adds PageDown/Shift+Right next,
-    // PageUp/Shift+Left previous, Shift+Up/Down volume, l like, Shift+L repeat
-    // and Shift+S shuffle. j/k stay list keys (Omarchy), so unlike the website
-    // they do not skip tracks. The content sits inside the key
-    // catcher, so the catcher sees the keys first.
+    // AppKeys adds PageDown/Shift+Right next, PageUp/Shift+Left previous,
+    // Shift+Up/Down volume, l like, Shift+L repeat, Shift+S shuffle, Ctrl+V add a
+    // copied link as play next and Ctrl+Shift+V play it now. j/k stay list keys
+    // (Omarchy), so unlike the website they do not skip tracks. The content sits
+    // inside the key catcher, so the catcher sees the keys first.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
@@ -1880,10 +1913,11 @@ BarWidget {
         id: errorText
         width: parent.width
         visible: root.lastError !== ""
-          && !SoundCloudModel.errorShownOnRow(root.tracks, root.playbackId, root.playbackState)
+          ? !SoundCloudModel.errorShownOnRow(root.tracks, root.playbackId, root.playbackState)
+          : root.notice !== ""
         textFormat: Text.PlainText
-        text: root.lastError
-        color: root.bar.urgent
+        text: root.lastError !== "" ? root.lastError : root.notice
+        color: root.lastError !== "" ? root.bar.urgent : root.dim
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
@@ -1913,6 +1947,31 @@ BarWidget {
     interval: 100
     repeat: false
     onTriggered: root.refreshTracks()
+  }
+
+  // Ctrl+V: the clipboard text through wl-paste, cut at 4 KB, stopped after 2 s.
+  Process {
+    id: pasteProcess
+    running: false
+    command: ["sh", "-c", "wl-paste --no-newline --type text 2>/dev/null | head -c 4096"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        pasteTimeout.stop()
+        root.pasteArrived(text)
+      }
+    }
+  }
+
+  Timer {
+    id: pasteTimeout
+    interval: 2000
+    onTriggered: pasteProcess.running = false
+  }
+
+  Timer {
+    id: noticeTimer
+    interval: 4000
+    onTriggered: root.notice = ""
   }
 
   // After a volume or queue command, read back the state it changed.

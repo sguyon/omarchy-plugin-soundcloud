@@ -65,6 +65,16 @@ TestCase {
     compare(catcherKeys, [])
   }
 
+  function test_paste_keys_with_super_held_and_shift_insert() {
+    make()
+    keyClick(Qt.Key_V, Qt.ControlModifier)
+    keyClick(Qt.Key_V, Qt.ControlModifier | Qt.MetaModifier)
+    keyClick(Qt.Key_Insert, Qt.ShiftModifier)
+    keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier | Qt.MetaModifier)
+    compare(actions, ["link-next", "link-next", "link-next", "link-play"])
+    compare(catcherKeys, [])
+  }
+
   function test_h_is_swallowed_without_an_action() {
     make()
     keyClick("h")
