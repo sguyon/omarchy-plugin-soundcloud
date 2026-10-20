@@ -5623,6 +5623,23 @@ class QueuePlaybackTest(unittest.TestCase):
         self.command("multipress:on")
         self.assertIs(self.application.multipress, True)
 
+    def test_start_folded_is_unset_until_chosen_then_a_command_a_status_key_and_saved(self):
+        self.build()
+        self.assertNotIn("startFolded", self.application.build_status())
+        self.assertFalse(self.command("startfolded:maybe").reply["ok"])
+        self.assertNotIn("startFolded", self.application.build_status())
+        self.assertIs(self.command("startfolded:on").reply["startFolded"], True)
+        self.assertIs(self.application.build_status()["startFolded"], True)
+        self.glib.run_idle()
+        self.assertIs(self.saved_settings()["startFolded"], True)
+        self.assertIs(self.command("startfolded:off").reply["startFolded"], False)
+        self.assertIs(self.application.build_status()["startFolded"], False)
+
+    def test_saved_start_folded_is_restored(self):
+        self.build(settings={"v": 1, "volume": 1.0, "muted": False, "autoplay": True,
+                             "notify": True, "multiPress": True, "startFolded": True})
+        self.assertIs(self.application.build_status()["startFolded"], True)
+
     def test_saved_multi_press_off_is_restored(self):
         self.build(settings={"v": 1, "volume": 1.0, "muted": False, "autoplay": True,
                              "notify": True, "multiPress": False})
@@ -5749,6 +5766,13 @@ class SettingsStoreTest(unittest.TestCase):
 
             self.assertGreater(5000, app.MAX_SETTINGS_BYTES)
             self.assertEqual(store.load(), self.DEFAULTS)
+
+    def test_start_folded_is_kept_only_when_it_is_a_bool(self):
+        app, store, _path = self.store()
+        self.assertNotIn("startFolded", store.load())
+        for bad in ("yes", 1, None, [True]):
+            self.assertNotIn("startFolded", app.sanitize_settings({**self.DEFAULTS, "startFolded": bad}))
+        self.assertIs(app.sanitize_settings({**self.DEFAULTS, "startFolded": False})["startFolded"], False)
 
     def test_settings_round_trip_privately(self):
         _app, store, path = self.store()

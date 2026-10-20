@@ -119,6 +119,18 @@ Earbuds that only send Play/Pause get two extra gestures (untested on a real dev
 
 Turn this off by setting `multiPress` to `false` in `settings.json` while the backend is stopped.
 
+## Options
+
+Options go on the widget's entry in `~/.config/omarchy/shell.json`. The shell applies a saved change at once. The chevron in the popup saves its own choice, which wins over this option.
+
+```json
+{ "id": "brunosilveira.soundcloud", "startFolded": true }
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `startFolded` | `false` | The popup opens showing only the player and the tabs. Picking a tab, the queue or the filter opens its list, and clicking the open tab folds it again. The popup reopens as you left it (folded or showing a list). The chevron at the right of the tab row folds or shows the lists at any time, and Tab walks through "no tab open" as one stop. |
+
 ## Key bindings
 
 The plugin does not add key bindings itself, because Omarchy has no install hook for plugins. Add the ones you want to `~/.config/hypr/bindings.lua`. Hyprland reloads on save; check for mistakes with `hyprctl configerrors`.

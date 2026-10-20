@@ -2079,7 +2079,7 @@ def _setting_status_fields(payload: dict[str, object]) -> dict[str, object]:
     volume = _finite_number(payload.get("volume"), 0, 1)
     if volume is not None:
         fields["volume"] = volume
-    for key in ("muted", "autoplay", "notify", "multiPress"):
+    for key in ("muted", "autoplay", "notify", "multiPress", "startFolded"):
         if isinstance(payload.get(key), bool):
             fields[key] = payload[key]
     if "trackUrl" in payload:
@@ -2442,6 +2442,9 @@ def sanitize_settings(payload: object) -> dict[str, object]:
     for key in ("muted", "autoplay", "notify", "multiPress"):
         if isinstance(payload.get(key), bool):
             settings[key] = payload[key]
+    # Whether the popup opens with its lists folded: only present once the user has chosen.
+    if isinstance(payload.get("startFolded"), bool):
+        settings["startFolded"] = payload["startFolded"]
     return settings
 
 
@@ -4814,6 +4817,7 @@ def build_application(show_on_start: bool = False):
             self.autoplay = saved_settings["autoplay"] is True
             self.notify = saved_settings["notify"] is True
             self.multipress = saved_settings["multiPress"] is True
+            self.start_folded = saved_settings.get("startFolded")  # None until the user chooses
             self.settings_save_pending = False
             self.autoplay_loading = False
             self.last_notified_id = ""
@@ -5065,6 +5069,9 @@ def build_application(show_on_start: bool = False):
             if self.notify and not replay:
                 notify_track_started(str(track.get("title", "")), str(track.get("artist", "")))
 
+        def _start_folded_status(self):
+            return {} if self.start_folded is None else {"startFolded": self.start_folded}
+
         def _save_settings(self):
             self.settings_save_pending = False
             try:
@@ -5072,6 +5079,7 @@ def build_application(show_on_start: bool = False):
                     "v": 1, **self.playback.volume_status(),
                     "autoplay": self.autoplay, "notify": self.notify,
                     "multiPress": self.multipress,
+                    **self._start_folded_status(),
                 })
             except OSError:
                 pass
@@ -5805,6 +5813,7 @@ def build_application(show_on_start: bool = False):
                 "autoplay": self.autoplay,
                 "notify": self.notify,
                 "multiPress": self.multipress,
+                **self._start_folded_status(),
                 "trackUrl": track_url,
                 **self._account_status(self.page_status.values["loggedIn"] is True),
             }
@@ -6259,6 +6268,16 @@ def build_application(show_on_start: bool = False):
                 self._respond(
                     connection, request_id,
                     {"ok": ok, "running": True, **self.playback.volume_status()},
+                    publish_status=True,
+                )
+            elif command.startswith("startfolded:"):
+                enabled = on_off_from_command(command, "startfolded")
+                if enabled is not None:
+                    self.start_folded = enabled
+                    self._settings_changed()
+                self._respond(
+                    connection, request_id,
+                    {"ok": enabled is not None, "running": True, **self._start_folded_status()},
                     publish_status=True,
                 )
             elif command.startswith("multipress:"):

@@ -285,6 +285,19 @@ assert.equal(model.cycleTab("likes", -1), "feed");
 assert.equal(model.cycleTab("nope", 1), "home");
 assert.equal(model.currentStop("likes", false), "likes");
 assert.equal(model.currentStop("likes", true), "queue");
+assert.equal(model.currentStop("likes", false, true), "none"); // lists folded away
+assert.equal(model.currentStop("likes", true, true), "none");
+// Folded mode: a stop with no tab open before Home, so Tab from there opens Home and Tab
+// from Queue folds the lists; unfolded mode keeps the five stops.
+const foldedStops = model.tabStopsFor(true);
+assert.deepEqual(foldedStops, ["none", "home", "feed", "likes", "history", "queue"]);
+assert.deepEqual(model.tabStopsFor(false), ["home", "feed", "likes", "history", "queue"]);
+assert.equal(model.cycleTab("none", 1, foldedStops), "home");
+assert.equal(model.cycleTab("queue", 1, foldedStops), "none");
+assert.equal(model.cycleTab("home", -1, foldedStops), "none");
+assert.equal(model.cycleTab("none", -1, foldedStops), "queue");
+assert.equal(model.cycleTab("home", 1, foldedStops), "feed");
+assert.equal(model.cycleTab("queue", 1, model.tabStopsFor(false)), "home"); // unchanged when not foldable
 
 // Queue count badge: hidden at 0 or junk, capped at 99+.
 assert.equal(model.queueBadgeText(0), "");

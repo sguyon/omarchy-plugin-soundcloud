@@ -45,6 +45,14 @@ BarWidget {
   // One size for the rows of every list (tabs and queue).
   readonly property real listRowHeight: Style.space(56)
   readonly property real listArtSize: Style.space(48)
+  // Whether the popup starts folded: the lists (tabs and queue) stay folded until a tab is
+  // picked, and the popup grows to show them. The chevron's last choice (saved by the backend,
+  // null until it was used) wins over the `startFolded` option on the widget's shell.json entry.
+  property var savedFold: null
+  readonly property bool listsOnDemand: savedFold === null
+    ? setting("startFolded", false) === true : savedFold === true
+  property bool listOpen: false
+  readonly property bool listShown: !listsOnDemand || listOpen
   // Keyboard selection in the track list (-1 = none). It resets when the tab
   // changes or the list is replaced, and Enter plays that row.
   property int selectedRow: -1
@@ -166,7 +174,12 @@ BarWidget {
   function open() {
     popupOpen = true
     if (!backendConnected) startBackend(false)
-    else if (tracks.length === 0) selectTab(selectedTab)
+    else if (tracks.length === 0) {
+      // Loading the tab's tracks must not change whether the lists are shown.
+      var wasOpen = listOpen
+      selectTab(selectedTab)
+      listOpen = wasOpen
+    }
   }
 
   function close() {
@@ -180,6 +193,7 @@ BarWidget {
 
   function openFilter() {
     if (queueOpen || !running || !loggedIn) return
+    listOpen = true
     filterOpen = true
     filterBar.focusField()
   }
@@ -219,6 +233,7 @@ BarWidget {
 
   // Keyboard actions (see PanelKeyCatcher below).
   function moveSelectedRow(delta) {
+    if (!listShown) listOpen = true
     if (queueOpen) {
       queueSelectedId = SoundCloudModel.queueSelectionAfterMove(queueRows, queueSelectedId, delta)
       var at = SoundCloudModel.queueIndexOf(queueRows, queueSelectedId)
@@ -355,16 +370,40 @@ BarWidget {
 
   // Tab and Shift+Tab: the four tabs, then Queue as the fifth stop.
   function selectStop(stop) {
-    if (stop === "queue") {
+    if (stop === "none") {
+      // The lists fold away: no tab is open.
+      closeFilter()
+      queueOpen = false
+      listOpen = false
+      menuRowKey = ""
+      selectedRow = -1
+    } else if (stop === "queue") {
       if (!queueOpen) toggleQueue()
     } else {
       selectTab(stop)
     }
   }
 
+  // The chevron at the right of the tab row: fold the lists away, or show them again, and
+  // remember the choice for the next time the popup opens (also after a restart).
+  function toggleFold() {
+    var fold = listShown
+    savedFold = fold
+    sendUi("startfolded:" + (fold ? "on" : "off"))
+    if (fold) closeFilter()
+    listOpen = !fold
+  }
+
+  // A tab click: the open tab folds the lists away again, any other tab opens its list.
+  function tabClicked(tab) {
+    if (listsOnDemand && listOpen && !queueOpen && selectedTab === tab) listOpen = false
+    else selectTab(tab)
+  }
+
   function toggleQueue() {
     if (!queueOpen) closeFilter()
     queueOpen = !queueOpen
+    listOpen = queueOpen
     menuRowKey = ""
     if (queueOpen) refreshQueue()
   }
@@ -515,6 +554,7 @@ BarWidget {
     closeFilter()
     selectedTab = tab
     queueOpen = false
+    listOpen = true
     menuRowKey = ""
     selectedRow = -1
     tracks = tracksFor(tab)
@@ -775,6 +815,7 @@ BarWidget {
     }
     autoplay = state.autoplay !== false
     notify = state.notify !== false
+    savedFold = state.startFolded === true ? true : (state.startFolded === false ? false : null)
     shuffle = state.shuffle === true
     repeat = SoundCloudModel.repeatMode(state.repeat)
     queueLength = Math.max(0, Math.floor(Number(state.length) || 0))
@@ -1006,8 +1047,15 @@ BarWidget {
     owner: root
     open: root.popupOpen
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(456))
-    contentHeight: popup.fittedContentHeight(Style.space(480))
+    contentWidth: popup.fittedContentWidth(Style.space(484))
+    // Folded: just the player and the tab row (and a message, when there is one).
+    readonly property real foldedHeight: tabArea.y + tabArea.height
+      + (toast.visible ? toast.implicitHeight + content.spacing : 0)
+    // Shown: the player and the tab row, then room for five whole rows.
+    readonly property real shownHeight: foldedHeight + content.spacing
+      + 5 * (root.listRowHeight + Style.space(3)) - Style.space(3)
+    contentHeight: popup.fittedContentHeight(!(root.running && root.loggedIn) ? Style.space(480)
+      : (root.listShown ? shownHeight : foldedHeight))
 
     // KeyboardPanel catches clicks on the whole screen and hands a bar click on
     // to the bar's click targets, but a third-party widget only sees its own
@@ -1059,8 +1107,11 @@ BarWidget {
         else if (root.running && root.loggedIn && root.hasTrack) root.runAction("play-pause")
       }
       onTabRequested: function(direction) {
-        if (root.running && root.loggedIn) root.selectStop(SoundCloudModel.cycleTab(
-          SoundCloudModel.currentStop(root.selectedTab, root.queueOpen), direction))
+        if (!(root.running && root.loggedIn)) return
+        var stop = SoundCloudModel.currentStop(root.selectedTab, root.queueOpen,
+          root.listsOnDemand && !root.listOpen)
+        root.selectStop(SoundCloudModel.cycleTab(
+          stop, direction, SoundCloudModel.tabStopsFor(root.listsOnDemand)))
       }
       onTextKey: function(text) {
         if (text === "q" || text === "Q") {
@@ -1467,6 +1518,7 @@ BarWidget {
       }
 
       Item {
+        id: tabArea
         width: parent.width
         height: tabRow.implicitHeight
         visible: root.running && root.loggedIn
@@ -1480,38 +1532,50 @@ BarWidget {
             text: "Home"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: !root.queueOpen && root.selectedTab === "home"
-            onClicked: root.selectTab("home")
+            selected: root.listShown && !root.queueOpen && root.selectedTab === "home"
+            onClicked: root.tabClicked("home")
           }
 
           Button {
             text: "Feed"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: !root.queueOpen && root.selectedTab === "feed"
-            onClicked: root.selectTab("feed")
+            selected: root.listShown && !root.queueOpen && root.selectedTab === "feed"
+            onClicked: root.tabClicked("feed")
           }
 
           Button {
             text: "Likes"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: !root.queueOpen && root.selectedTab === "likes"
-            onClicked: root.selectTab("likes")
+            selected: root.listShown && !root.queueOpen && root.selectedTab === "likes"
+            onClicked: root.tabClicked("likes")
           }
 
           Button {
             text: "History"
             foreground: root.bar.foreground
             enabled: !root.actionBusy
-            selected: !root.queueOpen && root.selectedTab === "history"
-            onClicked: root.selectTab("history")
+            selected: root.listShown && !root.queueOpen && root.selectedTab === "history"
+            onClicked: root.tabClicked("history")
           }
         }
 
         // Queue is a tab-like stop behind a divider: while its view is open it is the
         // only selected item. The badge shows how many tracks are queued. The divider
         // has the same gap on both sides (the tab spacing) and is shorter than a tab.
+        // Fold the lists away, or show them again.
+        Button {
+          id: foldButton
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          foreground: root.bar.foreground
+          iconText: root.listShown ? "󰅃" : "󰅀"
+          tooltipText: root.listShown ? "Fold the lists" : "Show the lists"
+          implicitHeight: homeTab.implicitHeight
+          onClicked: root.toggleFold()
+        }
+
         Row {
           anchors.left: tabRow.right
           anchors.leftMargin: tabRow.spacing
@@ -1560,7 +1624,7 @@ BarWidget {
             // x-height centre: nudge them down to line up with the text.
             readonly property real iconNudge: Math.max(1, Math.round(Style.space(1)))
             foreground: root.bar.foreground
-            selected: root.queueOpen
+            selected: root.queueOpen && root.listShown
             tooltipText: "Queue (q)"
             // Same height and padding as a text tab (its own row is empty, the
             // content below is drawn over it); the width only fits the content.
@@ -1622,7 +1686,7 @@ BarWidget {
         width: parent.width
         height: Math.max(0, parent.height - y - (toast.visible
           ? toast.implicitHeight + parent.spacing : 0))
-        visible: root.running && root.loggedIn && !root.queueOpen
+        visible: root.running && root.loggedIn && !root.queueOpen && root.listShown
 
         // The filter field (hidden, zero height, until opened). Omarchy's text field
         // look is drawn here; FilterBar holds the text, count and keys.
@@ -1686,6 +1750,9 @@ BarWidget {
           anchors.top: filterRow.bottom
           anchors.topMargin: root.filterOpen ? Style.space(6) : 0
           anchors.rightMargin: Style.space(6)
+          // Whole rows only: the space left over under the last full row stays empty, so no
+          // thumbnail is cut at the bottom.
+          anchors.bottomMargin: (parent.height - y + spacing) % (root.listRowHeight + spacing)
           clip: true
           spacing: Style.space(3)
           boundsBehavior: Flickable.StopAtBounds
@@ -1977,7 +2044,7 @@ BarWidget {
         width: parent.width
         height: Math.max(0, parent.height - y - (toast.visible
           ? toast.implicitHeight + parent.spacing : 0))
-        visible: root.running && root.loggedIn && root.queueOpen
+        visible: root.running && root.loggedIn && root.queueOpen && root.listShown
 
         // One slim row: how many tracks follow, then the queue switches as icon buttons.
         Item {
@@ -2075,6 +2142,7 @@ BarWidget {
           anchors.left: parent.left
           anchors.right: parent.right
           anchors.rightMargin: Style.space(6)
+          anchors.bottomMargin: (parent.height - y + spacing) % (root.listRowHeight + spacing)
           clip: true
           spacing: Style.space(3)
           boundsBehavior: Flickable.StopAtBounds

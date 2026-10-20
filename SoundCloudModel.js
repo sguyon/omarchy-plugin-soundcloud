@@ -155,8 +155,17 @@ function cycleTab(tab, direction, tabs) {
   return list[(at + step + list.length) % list.length]
 }
 
-// The stop that looks selected: Queue while its view is open, else the tab.
-function currentStop(selectedTab, queueOpen) {
+// The stops Tab walks. With the lists folded away on demand (startFolded) the walk has a
+// stop before Home where no tab is open: Tab from there opens Home, and Tab from
+// Queue folds everything again.
+function tabStopsFor(foldable) {
+  return foldable === true ? ["none"].concat(tabStops) : tabStops
+}
+
+// The stop that looks selected: Queue while its view is open, else the tab, or "none"
+// while the lists are folded away.
+function currentStop(selectedTab, queueOpen, folded) {
+  if (folded === true) return "none"
   return queueOpen === true ? "queue" : selectedTab
 }
 
@@ -800,6 +809,7 @@ if (typeof module !== "undefined") {
     selectionAfterUpdate: selectionAfterUpdate,
     cycleTab: cycleTab,
     currentStop: currentStop,
+    tabStopsFor: tabStopsFor,
     queueBadgeText: queueBadgeText,
     upcomingCount: upcomingCount,
     accountTooltip: accountTooltip,
