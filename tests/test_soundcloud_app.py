@@ -2131,6 +2131,301 @@ global.fetch = async (url, init) => {{
         self.assertIn(app._NoMediaRedirect, handler_types)
 
 
+def fake_gst():
+    """A GStreamer stand-in with pipelines whose bus messages the test delivers by hand."""
+    class Bus:
+        def __init__(self): self.handler = None; self.disconnected = False
+        def add_signal_watch(self): pass
+        def connect(self, _name, callback, pipeline, generation):
+            self.handler = (callback, pipeline, generation); return 1
+        def disconnect(self, _handler): self.disconnected = True
+        def remove_signal_watch(self): pass
+
+    class Source:
+        def __init__(self): self.emitted = []; self.on_emit = None
+        def emit(self, name, *_args):
+            self.emitted.append(name)
+            if self.on_emit: self.on_emit(name)
+            return Gst.FlowReturn.OK
+
+    class Volume:
+        def __init__(self): self.properties = {}
+        def set_property(self, name, value): self.properties[name] = value
+
+    class Pipeline:
+        def __init__(self, name=""):
+            self.name = name; self.bus = Bus(); self.states = []; self.seeks = []
+            self.position = 0; self.seek_result = True; self.source = Source()
+            self.volume = Volume(); self.properties = self.volume.properties
+        def get_bus(self): return self.bus
+        def get_by_name(self, name): return self.volume if name == "volume" else self.source
+        def set_property(self, name, value): self.properties[name] = value
+        def set_state(self, state): self.states.append(state); return Gst.StateChangeReturn.SUCCESS
+        def seek_simple(self, _format, flags, nanoseconds):
+            self.seeks.append(nanoseconds); self.seek_flags = flags; return self.seek_result
+        def query_position(self, _format): return True, self.position
+        def query_duration(self, _format): return True, 200 * Gst.SECOND
+
+    class Factory:
+        made = []
+        @classmethod
+        def make(cls, _kind, name):
+            pipeline = Pipeline(name); cls.made.append(pipeline); return pipeline
+
+    class Chunk:
+        @staticmethod
+        def new_allocate(*_args): return Chunk()
+        def fill(self, *_args): pass
+
+    class Gst:
+        SECOND = 10**9
+        ElementFactory = Factory
+        Buffer = Chunk
+        class State: NULL = "null"; PLAYING = "playing"; PAUSED = "paused"
+        class StateChangeReturn: FAILURE = "failure"; SUCCESS = "success"
+        class MessageType: ERROR = "error"; EOS = "eos"; STATE_CHANGED = "state"
+        class Format: TIME = "time"
+        class SeekFlags: FLUSH = 1; KEY_UNIT = 2; ACCURATE = 4
+        class FlowReturn: OK = "ok"
+        @staticmethod
+        def init(_value): pass
+        @staticmethod
+        def parse_launch(_description):
+            pipeline = Pipeline(); Factory.made.append(pipeline); return pipeline
+
+    return Gst
+
+
+def deliver(player, kind, state=None, error=None):
+    """Send the current pipeline's bus a message, as GStreamer would.
+
+    `error` is (domain, code, message, debug) for an ERROR message."""
+    pipeline = player.current
+    callback, _pipeline, generation = pipeline.bus.handler
+
+    class Message:
+        type = kind
+        src = pipeline
+        def parse_state_changed(self): return (None, state, None)
+        def parse_error(self):
+            if error is None:
+                raise TypeError("no details")
+            domain, code, text, debug = error
+            return type("GError", (), {"domain": domain, "code": code, "message": text})(), debug
+
+    callback(None, Message(), pipeline, generation)
+
+
+class GstPlaybackEndTest(unittest.TestCase):
+    def player(self, **hooks):
+        app = load_module()
+        Gst = fake_gst()
+        queued = []
+        player = app.GstPlayback(
+            Gst, lambda: None, lambda callback, *args: queued.append((callback, args)), **hooks
+        )
+        self.addCleanup(player.hls_executor.shutdown, False)
+        player.run_scheduled = lambda: [callback(*args) for callback, args in
+                                        [queued.pop(0) for _ in range(len(queued))]]
+        player.Gst_fake = Gst
+        return app, player
+
+    def start(self, player, protocol="", mime_type=""):
+        player.begin({"title": "A", "playbackId": "soundcloud:tracks:1"})
+        self.assertTrue(player.play("https://x.sndcdn.com/a", {"title": "A"}, protocol, mime_type))
+
+    def test_a_seek_is_accurate_not_snapped_to_a_key_unit(self):
+        _app, player = self.player()
+        self.start(player)
+
+        player.seek_seconds(61.0)
+
+        flags = player.current.seek_flags
+        self.assertTrue(flags & 1 and flags & 4)  # FLUSH | ACCURATE
+        self.assertFalse(flags & 2)  # not KEY_UNIT: hlsdemux would snap to the 10 s fragment
+
+    def test_seek_by_rules(self):
+        with self.subTest('seek by moves relative to the position'):
+            _app, player = self.player()
+            self.start(player)
+            deliver(player, "state", "playing")
+            player.current.position = 30 * 10**9
+
+            self.assertTrue(player.seek_by(5))
+            player.last_seek = None  # the pipeline has caught up
+            player.current.position = 35 * 10**9
+            self.assertTrue(player.seek_by(-5))
+
+            self.assertEqual(player.current.seeks[-2:], [35 * 10**9, 30 * 10**9])
+        with self.subTest('seek by works while paused'):
+            _app, player = self.player()
+            self.start(player)
+            deliver(player, "state", "playing")
+            deliver(player, "state", "paused")
+            player.current.position = 30 * 10**9
+
+            self.assertTrue(player.seek_by(5))
+
+            self.assertEqual(player.current.seeks, [35 * 10**9])
+        with self.subTest('seek by is clamped to the track'):
+            _app, player = self.player()
+            self.start(player)
+            deliver(player, "state", "playing")
+            player.current.position = 3 * 10**9
+            player.seek_by(-5)
+            player.last_seek = None
+            player.current.position = 199 * 10**9
+            player.seek_by(5)
+
+            self.assertEqual(player.current.seeks, [0, 199 * 10**9])  # duration 200 s, margin 1 s
+        with self.subTest('seek by with nothing loaded is refused'):
+            _app, player = self.player()
+
+            self.assertFalse(player.seek_by(5))
+        with self.subTest('a refused seek by reports failure without reloading'):
+            _app, player = self.player()
+            self.start(player)
+            deliver(player, "state", "playing")
+            player.current.seek_result = False
+            pipeline = player.current
+
+            self.assertFalse(player.seek_by(5))
+            self.assertIs(player.current, pipeline)
+            self.assertEqual(player.state, "playing")
+
+    def test_quick_repeated_seek_by_builds_on_the_last_target(self):
+        app, player = self.player()
+        self.start(player)
+        deliver(player, "state", "playing")
+        player.current.position = 30 * 10**9
+        clock = [100.0]
+        with mock.patch.object(app.time, "monotonic", lambda: clock[0]):
+            player.seek_by(5)
+            clock[0] += 0.2  # the pipeline position has not caught up yet
+            player.seek_by(5)
+            clock[0] += 5.0  # long after: the real position wins again
+            player.current.position = 50 * 10**9
+            player.seek_by(5)
+
+        seeks = [s / 10**9 for s in player.current.seeks]
+        self.assertAlmostEqual(seeks[0], 35)
+        self.assertAlmostEqual(seeks[1], 40.2)
+        self.assertEqual(seeks[2], 55)
+
+    def test_a_seek_does_not_flash_paused_while_playing(self):
+        _app, player = self.player()
+        self.start(player)
+        deliver(player, "state", "playing")
+
+        player.seek_by(5)
+        deliver(player, "state", "paused")  # playbin3 goes PAUSED while it flushes
+
+        self.assertTrue(player.playing)
+        self.assertEqual(player.state, "playing")
+        deliver(player, "state", "playing")
+        self.assertEqual(player.state, "playing")
+        deliver(player, "state", "paused")  # a real pause afterwards still counts
+        self.assertEqual(player.state, "paused")
+
+    def test_the_position_does_not_flash_zero_while_a_seek_settles(self):
+        app, player = self.player()
+        self.start(player)
+        deliver(player, "state", "playing")
+        clock = [100.0]
+        with mock.patch.object(app.time, "monotonic", lambda: clock[0]):
+            player.seek_seconds(61.0)
+            player.current.position = 0  # the demuxer reports 0 while it flushes
+            self.assertAlmostEqual(player.status()["position"], 61.0)
+            clock[0] += 0.5
+            self.assertAlmostEqual(player.status()["position"], 61.5)
+            player.current.position = 61.6 * 10**9  # settled: the real position wins
+            self.assertAlmostEqual(player.status()["position"], 61.6)
+            clock[0] += 3.0
+            player.current.position = 70 * 10**9
+            self.assertAlmostEqual(player.status()["position"], 70.0)
+
+    def test_toggle_during_a_seek_still_pauses(self):
+        _app, player = self.player()
+        self.start(player)
+        deliver(player, "state", "playing")
+        player.seek_by(5)
+
+        player.toggle()
+        deliver(player, "state", "paused")
+
+        self.assertEqual(player.state, "paused")
+
+    def hls_segments(self, app, count=6):
+        return [(f"https://x.sndcdn.com/s{i}", 10.0) for i in range(count)]
+
+    def test_a_hls_mp3_seek_restarts_the_feed_at_the_segment_and_skips_ahead(self):
+        app, player = self.player()
+        self.start(player, "hls", "audio/mpeg")
+        first = player.current
+        player.hls_cache = ("https://x.sndcdn.com/a", self.hls_segments(app))
+        pushed = []
+        with mock.patch.object(app, "fetch_private_media", side_effect=lambda url, *a, **k: pushed.append(url) or b"x" * 160000), \
+                mock.patch.object(player.hls_executor, "submit", lambda fn, *a: fn(*a)):
+            self.assertTrue(player.seek_seconds(34.0))
+
+        self.assertIsNot(player.current, first)
+        self.assertEqual(pushed[0], "https://x.sndcdn.com/s3")  # the segment holding 34 s
+        self.assertEqual(pushed[-1], "https://x.sndcdn.com/s5")
+        self.assertEqual(player.hls_base, 30.0)
+        self.assertEqual(player.hls_skip, 4.0)
+        player.current.position = 2 * 10**9
+        self.assertAlmostEqual(player.status()["position"], 36.0)  # base + skip + pipeline position
+
+    def test_a_hls_mp3_seek_before_the_playlist_is_known_is_refused(self):
+        _app, player = self.player()
+        self.start(player, "hls", "audio/mpeg")
+
+        self.assertFalse(player.seek_seconds(34.0))
+
+
+class SeekByCommandTest(unittest.TestCase):
+    def test_target_is_clamped_to_zero_and_the_end_margin(self):
+        app = load_module()
+        self.assertEqual(app.seek_by_target(30, 5, 200), 35)
+        self.assertEqual(app.seek_by_target(3, -5, 200), 0)
+        self.assertEqual(app.seek_by_target(198, 5, 200), 199)
+        self.assertEqual(app.seek_by_target(0.2, 5, 0.5), 0)  # shorter than the margin
+        self.assertEqual(app.seek_by_target(30, 5, 0), 35)  # unknown duration
+
+    def test_the_cli_refuses_a_non_finite_seek_without_asking_the_backend(self):
+        app = load_module()
+        for value in ("nan", "inf", "1e400"):
+            with self.subTest(value=value):
+                stdout = io.StringIO()
+                with mock.patch.object(app, "request_backend") as request, \
+                        contextlib.redirect_stdout(stdout):
+                    code = app.main(["seek", value])
+
+                request.assert_not_called()
+                self.assertEqual(code, 1)
+                self.assertFalse(json.loads(stdout.getvalue())["ok"])
+        with mock.patch.object(app, "request_backend", return_value={"ok": True}) as request, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(app.main(["seek", "0.5"]), 0)
+        request.assert_called_once_with("seek:0.5")
+
+    def test_command_parsing(self):
+        app = load_module()
+        self.assertEqual(app.seek_by_from_command("seek-by:5"), 5.0)
+        self.assertEqual(app.seek_by_from_command("seek-by:-5"), -5.0)
+        self.assertEqual(app.seek_by_from_command("seek-by:+2.5"), 2.5)
+        for bad in ("seek-by:", "seek-by:abc", "seek-by:nan", "seek-by:inf", "seek-by:99999999"):
+            self.assertIsNone(app.seek_by_from_command(bad), bad)
+
+    def test_hls_playlist_segments_carry_their_durations(self):
+        app = load_module()
+        playlist = (b"#EXTM3U\n#EXTINF:10.0,\nseg0.mp3\n#EXTINF:9.5,\nseg1.mp3\n#EXT-X-ENDLIST\n")
+        with mock.patch.object(app, "fetch_private_media", return_value=playlist):
+            segments = app.hls_segment_list("https://x.sndcdn.com/dir/p.m3u8")
+        self.assertEqual(segments, [("https://x.sndcdn.com/dir/seg0.mp3", 10.0),
+                                    ("https://x.sndcdn.com/dir/seg1.mp3", 9.5)])
+
+
 class FakeGLib:
     def __init__(self): self.idle = []; self.timers = []; self.delays = []
     def set_application_name(self, _name): pass
@@ -2150,6 +2445,81 @@ class FakeConnection:
     def send(self, payload): self.sent.append(payload); return True
     @property
     def reply(self): return self.sent[-1]
+
+
+class SeekCommandTest(unittest.TestCase):
+    """The seek and seek-by socket commands, through the real application class."""
+
+    def build(self):
+        self.app = load_module()
+        self.glib, self.gst = FakeGLib(), fake_gst()
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        data = directory / "data" / "omarchy-soundcloud"
+        data.mkdir(parents=True, mode=0o700)
+        Gtk = type("Gtk", (), {"Application": type("Application", (), {
+            "__init__": lambda self, **_kw: None, "hold": lambda self: None,
+            "quit": lambda self: None, "do_shutdown": lambda self: None,
+        })})
+        Gio = type("Gio", (), {"ApplicationFlags": type("F", (), {"NON_UNIQUE": 0})})
+        patches = (
+            mock.patch.object(self.app, "_load_gi",
+                              lambda: (Gio, self.glib, self.gst, Gtk, None, None)),
+            mock.patch.object(self.app, "profile_paths", lambda env=None: self.app.ProfilePaths(
+                data, directory / "cache", data / "cookies.sqlite")),
+            mock.patch.object(self.app, "runtime_socket_path",
+                              lambda env=None: directory / "run" / "omarchy-soundcloud" / "control.sock"),
+            mock.patch.object(self.app, "prepare_runtime_socket_path", lambda path: None),
+        )
+        for patch in patches:
+            self.enterContext(patch)
+        self.application = self.app.build_application()
+        self.addCleanup(self.application.playback.close)
+        self.addCleanup(self.application.artwork_cache.close)
+        self.addCleanup(self.application.list_artwork_cache.close)
+        self.evaluated = []
+        self.application._evaluate = lambda script, callback: self.evaluated.append((script, callback))
+        return self.application
+
+    def command(self, text):
+        connection = FakeConnection()
+        self.application.dispatch_slots.acquire()
+        self.application._handle_command(text, connection, 7)
+        return connection
+
+    def start(self):
+        playback = self.application.playback
+        playback.begin({"title": "A", "playbackId": "soundcloud:tracks:1"})
+        self.assertTrue(playback.play("https://x.sndcdn.com/a", {"title": "A"}))
+        return playback.current
+
+    def test_seek_by_command_seeks_relative_to_the_position(self):
+        self.build()
+        pipeline = self.start()
+        pipeline.position = 40 * 10**9
+
+        reply = self.command("seek-by:5")
+
+        self.assertTrue(reply.reply["ok"])
+        self.assertEqual(pipeline.seeks[-1], 45 * 10**9)
+        self.assertFalse(self.command("seek-by:nope").reply["ok"])
+        self.assertFalse(self.command("seek-by:").reply["ok"])
+
+    def test_seek_by_command_with_nothing_loaded_is_not_ok(self):
+        self.build()
+
+        self.assertFalse(self.command("seek-by:5").reply["ok"])
+        self.assertEqual(self.evaluated, [])
+
+    def test_a_seek_to_a_non_finite_ratio_is_refused(self):
+        self.build()
+        seeks = self.start().seeks
+
+        for value in ("nan", "inf", "-inf", "1e400"):
+            with self.subTest(value=value):
+                reply = self.command("seek:" + value).reply
+                self.assertEqual((reply["ok"], reply["error"]), (False, "invalid seek position"))
+        self.assertEqual(seeks, [])
+        self.assertTrue(self.command("seek:0.5").reply["ok"])
 
 
 class ApiReplyHardeningTest(unittest.TestCase):

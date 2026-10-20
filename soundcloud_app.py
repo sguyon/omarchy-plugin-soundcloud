@@ -2109,13 +2109,14 @@ def fetch_private_media(
     return bytes(data)
 
 
-def hls_segment_urls(
+def hls_segment_list(
     uri: str,
     depth: int = 0,
     *,
     deadline: float | None = None,
     cancelled=lambda: False,
-) -> list[str]:
+) -> list[tuple[str, float]]:
+    """The (segment URL, seconds) pairs of an HLS playlist; the seconds come from #EXTINF."""
     if depth > 2:
         raise ValueError("nested HLS playlist")
     text = fetch_private_media(
@@ -2127,12 +2128,48 @@ def hls_segment_urls(
         raise ValueError("empty HLS playlist")
     resolved = [urljoin(uri, line) for line in media_lines]
     if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
-        return hls_segment_urls(
+        return hls_segment_list(
             resolved[0], depth + 1, deadline=deadline, cancelled=cancelled
         )
     if len(resolved) > 4096 or any(validate_stream_uri(value) is None for value in resolved):
         raise ValueError("invalid HLS segments")
-    return resolved
+    durations, pending = [], 0.0
+    for line in lines:
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = max(0.0, float(line[8:].partition(",")[0]))
+            except ValueError:
+                pending = 0.0
+        elif not line.startswith("#"):
+            durations.append(pending)
+            pending = 0.0
+    return list(zip(resolved, durations))
+
+
+def hls_segment_urls(uri: str, depth: int = 0, **kwargs) -> list[str]:
+    return [url for url, _seconds in hls_segment_list(uri, depth, **kwargs)]
+
+
+# A relative seek stops this far before the end, so it never ends the track by itself.
+SEEK_END_MARGIN = 1.0
+SEEK_CHAIN_SECONDS = 1.5
+
+
+def seek_by_target(position: float, delta: float, duration: float) -> float:
+    """Where a relative seek lands: clamped to [0, duration - margin] (just >= 0 if unknown)."""
+    target = position + delta
+    if duration > 0:
+        target = min(target, max(0.0, duration - SEEK_END_MARGIN))
+    return max(0.0, target)
+
+
+def seek_by_from_command(command: str) -> float | None:
+    """The signed seconds of `seek-by:<seconds>`, or None if it isn't a sane number."""
+    try:
+        seconds = float(command.removeprefix("seek-by:"))
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and abs(seconds) <= 86400 else None
 
 
 _api_opener = build_opener(ProxyHandler({}), _NoMediaRedirect)
@@ -2343,6 +2380,17 @@ LIKE_TRACK_FUNCTION = r"""
 
 
 class GstPlayback:
+    # A flush seek makes playbin3 report PAUSED for a moment; that isn't a pause
+    seek_in_flight = False
+    last_seek = None  # (target seconds, monotonic time, playing) of the latest seek
+    # HLS mp3 through appsrc can't seek, so a seek restarts the feed at a segment:
+    # `hls_base` is the stream time its first segment starts at, `hls_skip` how far into
+    # that segment playback begins (position = pipeline position + both), `hls_cache` the playlist (uri, [(url, seconds)]).
+    hls_base = 0.0
+    hls_skip = 0.0
+    hls_cache = None
+    hls_uri = ""
+
     def __init__(self, Gst, on_change, schedule=lambda callback, *args: callback(*args)):
         self.Gst = Gst
         Gst.init(None)
@@ -2380,9 +2428,12 @@ class GstPlayback:
             self.on_change()
         elif message.type == self.Gst.MessageType.STATE_CHANGED and message.src == self.current:
             _old, current, _pending = message.parse_state_changed()
+            if self.seek_in_flight and current == self.Gst.State.PAUSED:
+                return
             self.playing = current == self.Gst.State.PLAYING
             if self.playing:
                 self.has_started = True
+                self.seek_in_flight = False
                 self.state = "playing"
             elif current == self.Gst.State.PAUSED:
                 self.state = "paused" if self.has_started else "buffering"
@@ -2390,6 +2441,8 @@ class GstPlayback:
 
     def _stop_current(self) -> None:
         self.generation += 1
+        self.seek_in_flight = False
+        self.last_seek = None
         previous = self.current
         self.current = None
         if previous is None:
@@ -2438,7 +2491,11 @@ class GstPlayback:
         self.playing = False
         self.has_started = False
         self.state = "buffering"
+        self.hls_base = self.hls_skip = 0.0
+        self.hls_cache = None
+        self.hls_uri = ""
         if protocol == "hls" and mime_type == "audio/mpeg":
+            self.hls_uri = uri
             return self._play_hls(uri)
         pipeline = self.Gst.ElementFactory.make(
             "playbin3", f"omarchy-soundcloud-player-{self.generation}"
@@ -2460,7 +2517,7 @@ class GstPlayback:
             return False
         return True
 
-    def _play_hls(self, uri: str) -> bool:
+    def _play_hls(self, uri: str, start: int = 0, paused: bool = False) -> bool:
         try:
             pipeline = self.Gst.parse_launch(
                 "appsrc name=source format=time is-live=false block=true "
@@ -2481,7 +2538,8 @@ class GstPlayback:
         self.current = pipeline
         self._watch_bus(pipeline, self.generation)
         generation = self.generation
-        if pipeline.set_state(self.Gst.State.PLAYING) == self.Gst.StateChangeReturn.FAILURE:
+        target = self.Gst.State.PAUSED if paused else self.Gst.State.PLAYING
+        if pipeline.set_state(target) == self.Gst.StateChangeReturn.FAILURE:
             self._stop_current()
             self.active = False
             self.error = "SoundCloud could not initialize audio playback"
@@ -2499,20 +2557,30 @@ class GstPlayback:
             source,
             uri,
             time.monotonic() + HLS_OPERATION_SECONDS,
+            start,
+            self.hls_skip,
         )
         return True
 
-    def _feed_hls_bounded(self, generation: int, source, uri: str, deadline: float) -> None:
+    def _feed_hls_bounded(self, generation: int, source, uri: str, deadline: float,
+                          start: int = 0, skip: float = 0.0) -> None:
         try:
-            self._feed_hls(generation, source, uri, deadline)
+            self._feed_hls(generation, source, uri, deadline, start, skip)
         finally:
             self.hls_slots.release()
 
-    def _feed_hls(self, generation: int, source, uri: str, deadline: float) -> None:
+    def _feed_hls(self, generation: int, source, uri: str, deadline: float,
+                  start: int = 0, skip: float = 0.0) -> None:
         try:
             total_bytes = 0
             cancelled = lambda: generation != self.generation
-            for segment in hls_segment_urls(uri, deadline=deadline, cancelled=cancelled):
+            if self.hls_cache is not None and self.hls_cache[0] == uri:
+                segments = self.hls_cache[1]
+            else:
+                segments = hls_segment_list(uri, deadline=deadline, cancelled=cancelled)
+                if generation == self.generation:
+                    self.hls_cache = (uri, segments)
+            for index, (segment, seconds) in enumerate(segments[start:]):
                 if generation != self.generation:
                     return
                 data = fetch_private_media(
@@ -2521,6 +2589,10 @@ class GstPlayback:
                     deadline=deadline,
                     cancelled=cancelled,
                 )
+                if index == 0 and skip > 0 and seconds > 0:
+                    # Drop the start of the first segment, in proportion to its bytes;
+                    # the parser finds the next frame on its own.
+                    data = data[min(len(data) - 1, int(len(data) * skip / seconds)):]
                 total_bytes += len(data)
                 if total_bytes > 128 * 1024 * 1024:
                     raise ValueError("track stream too large")
@@ -2544,21 +2616,93 @@ class GstPlayback:
         if not self.active:
             return False
         target = self.Gst.State.PAUSED if self.playing else self.Gst.State.PLAYING
+        self.seek_in_flight = False
         return self.current.set_state(target) != self.Gst.StateChangeReturn.FAILURE
 
     def seek(self, ratio: float) -> bool:
         if not self.active:
             return False
+        duration = self._duration()
+        if duration <= 0:
+            return False
+        return self.seek_seconds(duration * max(0.0, min(1.0, ratio)))
+
+    def _duration(self) -> float:
         duration = self._query_time("query_duration")
         if duration <= 0:
             duration = float(self.metadata.get("durationMs", 0) or 0) / 1000
-        if duration <= 0:
+        return duration
+
+    def _position(self) -> float:
+        """The playing position; right after a seek, the seek target plus the time since."""
+        if self.last_seek is not None:
+            target, at, was_playing = self.last_seek
+            elapsed = time.monotonic() - at
+            if 0 <= elapsed < SEEK_CHAIN_SECONDS:
+                return target + (elapsed if was_playing else 0.0)
+        return self._query_time("query_position") + self.hls_base + self.hls_skip
+
+    def _shown_position(self) -> float:
+        """The pipeline position, except while a seek settles: the demuxer then reports 0 for
+        a moment, which would flash 0:00 in the popup, so show where the seek is heading."""
+        reported = self._query_time("query_position") + self.hls_base + self.hls_skip
+        if self.last_seek is not None:
+            target, at, was_playing = self.last_seek
+            elapsed = time.monotonic() - at
+            expected = target + (elapsed if was_playing else 0.0)
+            if 0 <= elapsed < SEEK_CHAIN_SECONDS and abs(reported - expected) > 3.0:
+                return expected
+        return reported
+
+    def seek_by(self, delta: float) -> bool:
+        """Seek `delta` seconds from where playback is, within [0, duration - margin]."""
+        if not self.active or self.current is None:
             return False
-        return bool(self.current.seek_simple(
-            self.Gst.Format.TIME,
-            self.Gst.SeekFlags.FLUSH | self.Gst.SeekFlags.KEY_UNIT,
-            int(duration * max(0.0, min(1.0, ratio)) * self.Gst.SECOND),
-        ))
+        return self.seek_seconds(seek_by_target(self._position(), delta, self._duration()))
+
+    def seek_seconds(self, seconds: float) -> bool:
+        """Seek to `seconds`. ACCURATE, not KEY_UNIT: hlsdemux would snap a key-unit seek to
+        its 10 s fragment start (measured: a +5 s seek landed up to 9 s early)."""
+        if not self.active:
+            return False
+        seconds = max(0.0, seconds)
+        if self.hls_uri:
+            done = self._seek_hls(seconds)
+        else:
+            was_playing = self.playing
+            done = bool(self.current.seek_simple(
+                self.Gst.Format.TIME,
+                self.Gst.SeekFlags.FLUSH | self.Gst.SeekFlags.ACCURATE,
+                int(seconds * self.Gst.SECOND),
+            ))
+            if done and was_playing:
+                self.seek_in_flight = True
+        if done:
+            self.last_seek = (seconds, time.monotonic(), self.playing)
+        return done
+
+    def _seek_hls(self, seconds: float) -> bool:
+        """The appsrc pipeline can't seek (appsrc isn't seekable), so feed it again from the
+        segment holding `seconds` and cut into that segment to land on the exact second."""
+        if self.hls_cache is None or self.hls_cache[0] != self.hls_uri:
+            return False
+        segments = self.hls_cache[1]
+        start, base = 0, 0.0
+        for index, (_url, length) in enumerate(segments):
+            if base + length > seconds or index == len(segments) - 1:
+                start = index
+                break
+            base += length
+        paused = self.has_started and not self.playing
+        self._stop_current()
+        self.hls_base, self.hls_skip = base, max(0.0, seconds - base)
+        self.playing = False
+        if not self._play_hls(self.hls_uri, start, paused):
+            return False
+        self.has_started = paused
+        self.state = "paused" if paused else "buffering"
+        self.on_change()
+        return True
 
     def _query_time(self, method: str) -> float:
         try:
@@ -2594,7 +2738,7 @@ class GstPlayback:
             "artist": str(self.metadata.get("artist", "")),
             "artUrl": str(self.metadata.get("artUrl", "")),
             "duration": duration,
-            "position": self._query_time("query_position"),
+            "position": self._shown_position(),
             "waveform": list(self.metadata.get("waveform", [])),
             **({"error": self.error} if self.error else {}),
         }
@@ -3564,6 +3708,8 @@ def build_application(show_on_start: bool = False):
             elif command.startswith("seek:"):
                 try:
                     ratio = float(command.partition(":")[2])
+                    if not math.isfinite(ratio):
+                        raise ValueError("seek position is not a finite number")
                 except ValueError:
                     self._respond(
                         connection,
@@ -3588,6 +3734,15 @@ def build_application(show_on_start: bool = False):
                                 publish_status=True,
                             ),
                         )
+            elif command.startswith("seek-by:"):
+                seconds = seek_by_from_command(command)
+                done = seconds is not None and self.playback.seek_by(seconds)
+                self._respond(
+                    connection, request_id,
+                    {"ok": done, "running": True,
+                     **({} if done else {"error": "Can't seek"})},
+                    publish_status=True,
+                )
             elif (playback_id := playback_id_from_command(command)) is not None:
                 metadata = self.playback_tracks.get(playback_id)
                 if metadata is None:
@@ -3826,6 +3981,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("running") else 1
     if command != "daemon":
         if command == "seek":
+            if not math.isfinite(args.ratio):
+                print(json.dumps({"ok": False, "error": "invalid seek position"}, sort_keys=True))
+                return 1
             backend_command = f"seek:{args.ratio}"
         elif command == "play":
             backend_command = f"play:{args.playback_id}"
