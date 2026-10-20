@@ -73,12 +73,15 @@ MAX_QUEUE_BYTES = 256 * 1024
 MAX_QUEUE_SOURCE_BYTES = 64
 MAX_SETTINGS_BYTES = 4096
 NOTIFICATION_TIMEOUT_SECONDS = 3.0
+NO_PLAYABLE_MESSAGE = "No other track in the queue can play"
+ENCRYPTED_MESSAGE = "This track is only offered as an encrypted stream the plugin can't play"
 # Previous restarts the track from this position on. The website's real value is unverified.
 PREVIOUS_RESTART_SECONDS = 3.0
 REPEAT_MODES = ("none", "one", "all")
 QUEUE_SOURCES = ("home", "feed", "likes", "history")
 # A track that fails this soon after an automatic start is skipped instead of stopping the queue.
 AUTO_SKIP_WINDOW_SECONDS = 2.0
+SKIP_NOTICE_SECONDS = 8.0
 QUEUE_POSITION_SAVE_SECONDS = 5
 MAX_COOKIES = 256
 MAX_CLIENTS = 8
@@ -3896,6 +3899,7 @@ def build_application(show_on_start: bool = False):
                 lambda: GLib.idle_add(self._publish_status_once),
                 GLib.idle_add,
                 on_end=self._track_ended,
+                on_error=self._track_failed,
                 volume=cast(float, saved_settings["volume"]),
                 muted=saved_settings["muted"] is True,
             )
@@ -3929,6 +3933,8 @@ def build_application(show_on_start: bool = False):
             self.pending_start = 0
             self.queue = saved_queue
             self.auto_skip = AutoSkip()
+            self.notice = ""
+            self.notice_until = 0.0
             self.queue_finished = False  # the last queued track ended and nothing followed
             self.queue_save_pending = False
             self.settings_save_pending = False
@@ -4155,6 +4161,7 @@ def build_application(show_on_start: bool = False):
                     self._record_local_play(selected_track)
                 else:
                     self.playback.error = "SoundCloud could not play this track"
+                    GLib.idle_add(self._track_failed)
                 self._publish_status_once()
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 return
@@ -4220,7 +4227,7 @@ def build_application(show_on_start: bool = False):
             if self.webview and not is_track_source_page(self.webview.get_uri() or ""):
                 self.webview.load_uri(source_uri("home"))
 
-        def _play_when_page_ready(self, row, connection, request_id, automatic=False):
+        def _play_when_page_ready(self, row, connection, request_id, automatic=False, direction=0):
             """Start `row` once the page is on Home or Feed, so its request context exists."""
             self._keep_page_on_track_source()
             self.pending_start += 1
@@ -4239,17 +4246,26 @@ def build_application(show_on_start: bool = False):
                     and not self.webview.is_loading()
                 )
                 if ready or time.monotonic() > deadline:
-                    self._start_track(row, connection, request_id, automatic)
+                    self._start_track(row, connection, request_id, automatic, direction=direction)
                     return False
                 return True
 
             if check():
                 GLib.timeout_add(250, check)
 
-        def _start_track(self, row, connection, request_id, automatic=False):
-            """The one way a track starts: resolve it in the page, then play it with GStreamer."""
+        def _start_track(self, row, connection, request_id, automatic=False, direction=0):
+            """The one way a track starts: resolve it in the page, then play it with GStreamer.
+
+            `direction` (1 next, -1 previous) marks a step by the user's Next or Previous: a
+            track that can't play is then skipped in that direction, as after an automatic end."""
             playback_id = row.get("playbackId")
             if not self._remember_playback_track(row):
+                if automatic or direction:
+                    # No caller to tell: fail the track so the normal skip path moves on.
+                    self.selection_generation = (self.selection_generation + 1) % (2**31)
+                    self.auto_skip.started(self.selection_generation, automatic, time.monotonic(),
+                                           direction)
+                    self.playback.stop("SoundCloud track details are not ready")
                 self._respond(
                     connection,
                     request_id,
@@ -4259,8 +4275,18 @@ def build_application(show_on_start: bool = False):
             self.queue_finished = False
             self.selection_generation = (self.selection_generation + 1) % (2**31)
             generation = self.selection_generation
-            self.auto_skip.started(generation, automatic, time.monotonic())
+            self.auto_skip.started(generation, automatic, time.monotonic(), direction)
             self.playback.begin(self.playback_tracks[playback_id])
+            if self.playback_tracks[playback_id].get("encrypted") is True:
+                # No point asking the page: this track has no stream the plugin can play.
+                # An automatic start is then skipped like any track that fails at once.
+                self.playback.stop(ENCRYPTED_MESSAGE)
+                self._respond(
+                    connection, request_id,
+                    {"ok": False, "running": True, "error": ENCRYPTED_MESSAGE},
+                    publish_status=True,
+                )
+                return
             self._publish_status_once()
             script = play_track_script(playback_id, generation)
 
@@ -4327,6 +4353,36 @@ def build_application(show_on_start: bool = False):
                 return self._next_playable(True)
             return self.queue.previous(position_seconds)
 
+        def _skip_unplayable(self, direction, target):
+            """From `target`, keep stepping in `direction` past rows known to have no playable
+            stream (flagged encrypted), as far as the queue is long. Counts them for the notice.
+            Returns the first row that may play, or None when the queue has nothing more."""
+            while isinstance(target, dict) and target.get("encrypted") is True:
+                if self.auto_skip.skipped >= self.auto_skip.limit:
+                    return None
+                self.auto_skip.skipped += 1
+                target = self._step_user(direction)
+            return target if isinstance(target, dict) else None
+
+        def _user_step(self, direction, first):
+            """Next or Previous by the user. `first` makes the first queue step. Returns
+            (target, skipped): a row to play, "restart", or None when nothing is left, which
+            leaves the queue where it was."""
+            snapshot = self.queue.snapshot()
+            self.auto_skip.begin_chain(self.queue.length)
+            target = first()
+            if not (isinstance(target, dict) and target.get("encrypted") is True):
+                return target, 0
+            target = self._skip_unplayable(direction, target)
+            if target is None:
+                self.queue.restore(snapshot)
+                return None, self.auto_skip.skipped
+            return target, self.auto_skip.skipped
+
+        def _show_notice(self, message):
+            self.notice = message
+            self.notice_until = time.monotonic() + SKIP_NOTICE_SECONDS
+
         def _track_ended(self):
             if self.auto_skip.generation != self.selection_generation:
                 return  # a newer selection began after the end was reported
@@ -4336,6 +4392,35 @@ def build_application(show_on_start: bool = False):
             self._queue_changed()
             if row is not None:
                 self._play_when_page_ready(row, None, None, automatic=True)
+
+        def _track_failed(self):
+            """A track failed. If an automatic start failed at once, drop it and play the next."""
+            current = self.queue.current
+            if current is None or not self.auto_skip.should_skip(
+                self.selection_generation, time.monotonic()
+            ):
+                return False
+            direction = self.auto_skip.direction
+            if direction:
+                # The user's own Next or Previous: keep the rows, go on in the same direction.
+                row = self._skip_unplayable(direction, self._step_user(direction))
+                self._queue_changed()
+                if row is None:
+                    self._show_notice(NO_PLAYABLE_MESSAGE)
+                    self._publish_status_once()
+                else:
+                    self._show_notice(self.auto_skip.notice())
+                    self._play_when_page_ready(row, None, None, direction=direction)
+                return False
+            row = self.queue.mark_dead(current.get("url"))
+            while row is not None and not is_playback_id(row.get("playbackId")):
+                row = self.queue.mark_dead(row.get("url"))
+            self._queue_changed()
+            if row is not None:
+                self.notice = self.auto_skip.notice()
+                self.notice_until = time.monotonic() + SKIP_NOTICE_SECONDS
+                self._play_when_page_ready(row, None, None, automatic=True)
+            return False
 
         def _play_link(self, link_text, connection, request_id):
             """Play a pasted track link. The link is checked here the way the CLI checks it; the
@@ -4606,11 +4691,29 @@ def build_application(show_on_start: bool = False):
             return False
 
         def build_status(self):
-            return self._secure_status({
+            return self._secure_status(self._raw_status())
+
+        def _raw_status(self):
+            status = {
                 **merge_status(self.page_status.values, self.playback.status()),
                 **queue_status(self.queue),
                 **self.playback.volume_status(),
-            })
+            }
+            if not status.get("error") and time.monotonic() < self.notice_until:
+                status["error"] = self.notice
+            self._keep_failed_track(status, ("error",))
+            return status
+
+        def _keep_failed_track(self, status, states):
+            """A failed track loses its details in the player. Put the queue row's title and
+            artist back so the track stays on show; the state,
+            `playing` and the error text are left as they are."""
+            row = self.queue.current
+            if (row is None or status.get("playbackState") not in states
+                    or status.get("playbackId") not in ("", row.get("playbackId"))):
+                return
+            if not (status.get("title") or status.get("artist")):
+                status["title"], status["artist"] = str(row.get("title", "")), str(row.get("artist", ""))
 
         def _publish_status(self):
             if not self.status_subscribers:
@@ -4820,9 +4923,17 @@ def build_application(show_on_start: bool = False):
                     )
             elif command in {"next", "previous"}:
                 direction = 1 if command == "next" else -1
-                target = self._step_user(direction, self._position_ms() / 1000)
+                target, skipped = self._user_step(
+                    direction, lambda: self._step_user(direction, self._position_ms() / 1000))
                 self._queue_changed()
-                if target is None:
+                if target is None and skipped:
+                    self._show_notice(NO_PLAYABLE_MESSAGE)
+                    self._respond(
+                        connection, request_id,
+                        {"ok": False, "running": True, "error": NO_PLAYABLE_MESSAGE},
+                        publish_status=True,
+                    )
+                elif target is None:
                     self._respond(
                         connection,
                         request_id,
@@ -4831,7 +4942,9 @@ def build_application(show_on_start: bool = False):
                 elif target == "restart":
                     self._restart_current(connection, request_id)
                 else:
-                    self._play_when_page_ready(target, connection, request_id)
+                    if skipped:
+                        self._show_notice(self.auto_skip.notice())
+                    self._play_when_page_ready(target, connection, request_id, direction=direction)
             elif (queued := play_from_command(command)) is not None:
                 tab, playback_id = queued
                 rows = self.track_cache.get(tab, [])

@@ -4207,6 +4207,66 @@ class QueuePlaybackTest(unittest.TestCase):
 
     # dead tracks
 
+    def test_an_automatic_start_that_fails_at_once_is_skipped_with_a_notice(self):
+        self.build()
+        self.fill("home", 5)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.end_track()                      # track 2 starts by itself
+
+        self.resolve(ok=False)                # and fails at once
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "3")
+        self.assertEqual(self.queue_ids(), ["1", "3", "4", "5"])
+        self.assertEqual(self.application.build_status()["error"], "Skipped 1 track that can't play")
+
+    def test_a_queue_where_nothing_plays_stops_instead_of_looping(self):
+        self.build()
+        self.fill("home", 3)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.command("repeat:all")
+        self.end_track()
+
+        for _ in range(20):
+            self.resolve(ok=False)
+            self.glib.run_idle()
+            if self.application.playback.state == "error":
+                break
+
+        self.assertEqual(self.application.playback.state, "error")
+        self.assertLessEqual(len(self.evaluated), 1 + 3 + 1)
+
+    def test_a_track_the_user_picked_keeps_its_error_and_stays_in_the_queue(self):
+        self.build()
+        self.fill("home", 3)
+        started = self.command("play-from:home:soundcloud:tracks:2")
+        self.resolve(ok=False)
+        self.glib.run_idle()
+
+        self.assertEqual(self.application.playback.state, "error")
+        self.assertEqual(self.queue_ids(), ["1", "2", "3"])
+        self.assertEqual(len(self.evaluated), 1)
+        self.assertNotIn("Skipped", self.application.build_status().get("error", ""))
+        self.assertTrue(started.reply["ok"])
+
+    def test_a_late_error_cannot_skip_a_track_the_user_started_since(self):
+        self.build()
+        self.fill("home", 5)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.end_track()                      # track 2 starts by itself
+        self.resolve(ok=False)                # fails; the skip is queued, not yet run
+
+        self.command("play-from:home:soundcloud:tracks:5")
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "5")
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4", "5"])
+
+    # save and resume
+
     def test_structural_changes_are_saved_once_the_loop_is_idle(self):
         self.build()
         self.fill("home", 3)
@@ -4260,6 +4320,166 @@ class QueuePlaybackTest(unittest.TestCase):
         self.fill("home", 2)
         self.command("play-from:home:soundcloud:tracks:2")
         self.resolve()
+
+    def test_an_automatic_start_that_cannot_begin_is_skipped_not_stalled(self):
+        self.build()
+        rows = self.fill("home", 4)
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+        self.application.queue.items[1]["title"] = ""  # fails validate_tracks_payload at start
+        self.application.playback_tracks.pop(rows[1]["playbackId"])
+
+        self.end_track()
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "3")
+        self.assertEqual(self.queue_ids(), ["1", "3", "4"])
+        self.assertEqual(self.application.build_status()["error"], "Skipped 1 track that can't play")
+
+    # an API reply cut short mid-body must not wedge the worker threads
+
+    def test_picking_an_encrypted_only_track_fails_at_once_with_the_real_reason(self):
+        self.build()
+        self.fill("home", 3)[1]["encrypted"] = True
+        message = "This track is only offered as an encrypted stream the plugin can't play"
+
+        reply = self.command("play-from:home:soundcloud:tracks:2")
+
+        self.assertEqual((reply.reply["ok"], reply.reply["error"]), (False, message))
+        self.assertEqual(self.evaluated, [])  # the page was not asked
+        self.assertEqual(self.application.playback.state, "error")
+        status = self.application.build_status()
+        self.assertEqual((status["error"], status["playbackId"]), (message, "soundcloud:tracks:2"))
+        self.glib.run_idle()
+        self.assertEqual(self.queue_ids(), ["1", "2", "3"])  # a user pick keeps its row
+
+    def test_auto_advance_skips_an_encrypted_only_track(self):
+        self.build()
+        rows = self.fill("home", 4)
+        rows[1]["encrypted"] = True
+        self.command("play-from:home:soundcloud:tracks:1")
+        self.resolve()
+
+        self.end_track()
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "3")
+        self.assertEqual(self.queue_ids(), ["1", "3", "4"])
+        self.assertEqual(self.application.build_status()["error"], "Skipped 1 track that can't play")
+
+    # user next and previous skip tracks that can't play
+
+    def play_track(self, number, rows):
+        self.command(f"play-from:home:soundcloud:tracks:{number}")
+        self.resolve()
+
+    def test_next_skips_encrypted_only_tracks_with_a_notice(self):
+        self.build()
+        rows = self.fill("home", 5)
+        rows[1]["encrypted"] = rows[2]["encrypted"] = True
+        self.play_track(1, rows)
+
+        reply = self.command("next")
+        self.glib.run_idle()
+        self.resolve()
+
+        self.assertEqual((self.started_id(), self.application.queue.cursor), ("4", 3))
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4", "5"])  # a user step keeps the rows
+        self.assertEqual(self.application.build_status()["error"], "Skipped 2 tracks that can't play")
+        self.assertEqual(reply.reply["ok"], True)
+
+    def test_previous_skips_encrypted_only_tracks(self):
+        self.build()
+        rows = self.fill("home", 5)
+        rows[2]["encrypted"] = rows[3]["encrypted"] = True
+        self.play_track(5, rows)
+
+        self.command("previous")
+        self.glib.run_idle()
+
+        self.assertEqual((self.started_id(), self.application.queue.cursor), ("2", 1))
+        self.assertEqual(self.application.build_status()["error"], "Skipped 2 tracks that can't play")
+
+    def test_next_with_nothing_playable_left_stays_on_the_current_track_and_says_why(self):
+        self.build()
+        rows = self.fill("home", 3)
+        rows[1]["encrypted"] = rows[2]["encrypted"] = True
+        self.play_track(1, rows)
+        started = len(self.evaluated)
+
+        reply = self.command("next")
+        self.glib.run_idle()
+
+        self.assertEqual((reply.reply["ok"], reply.reply["error"]),
+                         (False, "No other track in the queue can play"))
+        self.assertEqual((len(self.evaluated), self.application.queue.cursor), (started, 0))
+        self.assertEqual(self.application.playback.state, "playing")
+        self.assertEqual(self.application.build_status()["error"], "No other track in the queue can play")
+
+    def test_previous_with_nothing_playable_before_stays_on_the_current_track(self):
+        self.build()
+        rows = self.fill("home", 3)
+        rows[0]["encrypted"] = rows[1]["encrypted"] = True
+        self.play_track(3, rows)
+        started = len(self.evaluated)
+
+        reply = self.command("previous")
+
+        self.assertEqual((reply.reply["ok"], self.application.queue.cursor, len(self.evaluated)),
+                         (False, 2, started))
+        self.assertEqual(self.application.playback.state, "playing")
+
+    def test_next_onto_a_track_that_fails_at_once_moves_on_in_the_same_direction(self):
+        self.build()
+        self.fill("home", 4)
+        self.play_track(1, None)
+
+        self.command("next")
+        self.resolve(ok=False)                # track 2 has a track problem
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "3")
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
+        self.assertEqual(self.application.build_status()["error"], "Skipped 1 track that can't play")
+
+    def test_previous_onto_a_track_that_fails_at_once_keeps_going_back(self):
+        self.build()
+        self.fill("home", 4)
+        self.play_track(4, None)
+
+        self.command("previous")
+        self.resolve(ok=False)
+        self.glib.run_idle()
+
+        self.assertEqual(self.started_id(), "2")
+
+    def test_a_queue_of_failing_tracks_ends_the_next_chain_instead_of_looping(self):
+        self.build()
+        self.fill("home", 4)
+        self.play_track(1, None)
+        self.command("next")
+        for _ in range(10):
+            before = len(self.evaluated)
+            self.resolve(ok=False)
+            self.glib.run_idle()
+            if len(self.evaluated) == before:
+                break
+
+        self.assertLessEqual(len(self.evaluated), 5)
+        self.assertEqual(self.application.playback.state, "error")
+        self.assertEqual(self.application.notice, "No other track in the queue can play")
+
+    def test_a_track_picked_by_hand_is_not_skipped_when_it_fails(self):
+        self.build()
+        self.fill("home", 4)
+        self.command("play-from:home:soundcloud:tracks:2")
+        started = len(self.evaluated)
+
+        self.resolve(ok=False)
+        self.glib.run_idle()
+
+        self.assertEqual((len(self.evaluated), self.application.playback.state), (started, "error"))
+        self.assertEqual(self.queue_ids(), ["1", "2", "3", "4"])
 
 class SeekCommandTest(unittest.TestCase):
     """The seek and seek-by socket commands, through the real application class."""
