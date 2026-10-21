@@ -1259,6 +1259,17 @@ BarWidget {
           spacing: Style.space(7)
 
           Button {
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰒟"
+            foreground: root.bar.foreground
+            selected: root.shuffle
+            enabled: root.hasTrack
+            opacity: enabled ? 1 : 0.4
+            tooltipText: root.shuffle ? "Shuffle: on (Shift+S)" : "Shuffle: off (Shift+S)"
+            onClicked: root.sendUi("shuffle")
+          }
+          Button {
+            anchors.verticalCenter: parent.verticalCenter
             iconText: "󰒮"
             foreground: root.bar.foreground
             enabled: SoundCloudModel.queueButtonEnabled(root.actionBusy, root.hasTrack, root.canPrevious)
@@ -1299,12 +1310,24 @@ BarWidget {
             }
           }
           Button {
+            anchors.verticalCenter: parent.verticalCenter
             iconText: "󰒭"
             foreground: root.bar.foreground
             enabled: SoundCloudModel.queueButtonEnabled(root.actionBusy, root.hasTrack, root.canNext)
             opacity: enabled ? 1 : 0.4
             tooltipText: "Next (Shift+Right)"
             onClicked: root.runAction("next")
+          }
+          Button {
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: SoundCloudModel.repeatIconGlyph(root.repeat)
+            foreground: root.bar.foreground
+            selected: root.repeat !== "none"
+            enabled: root.hasTrack
+            opacity: enabled ? 1 : 0.4
+            tooltipText: (root.repeat === "one" ? "Repeat: this track"
+              : (root.repeat === "all" ? "Repeat: all" : "Repeat: off")) + " (Shift+L)"
+            onClicked: root.sendUi("repeat")
           }
         }
 
@@ -1351,7 +1374,9 @@ BarWidget {
         Button {
           id: volumeButton
           anchors.left: parent.left
-          anchors.leftMargin: Style.space(6)
+          // The glyph, not the button's padding, lines up with the cover's left edge (the heart
+          // lines up with the right edge).
+          anchors.leftMargin: -(horizontalPadding + _reservedBorderLeft)
           anchors.verticalCenter: parent.verticalCenter
           foreground: root.bar.foreground
           readonly property string volumeState: SoundCloudModel.volumeIconState(root.volume, root.muted)
@@ -2059,43 +2084,31 @@ BarWidget {
         Item {
           id: queueHeader
           width: parent.width
-          height: queueHeaderButtons.implicitHeight
+          height: Math.max(queueSwitches.implicitHeight, queueHeaderButtons.implicitHeight)
 
           HoverHandler { id: clearToolbarHover }
 
           Text {
+            id: queueCountLabel
             anchors.left: parent.left
             anchors.leftMargin: Style.space(6)
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: root.clearArmedSignature !== null ? "Clear queue?" : SoundCloudModel.queueCountText(root.queueRows)
-            color: root.clearArmedSignature !== null ? root.bar.foreground : root.dim
+            text: SoundCloudModel.queueCountText(root.queueRows)
+            color: root.dim
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
 
+          // The queue's switches sit next to the count; shuffle and repeat are beside the
+          // transport buttons, and Clear is alone on the right.
           Row {
-            id: queueHeaderButtons
-            visible: root.clearArmedSignature === null
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(6)
+            id: queueSwitches
+            anchors.left: queueCountLabel.right
+            anchors.leftMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
-            Button {
-              iconText: "󰒟"
-              foreground: root.bar.foreground
-              selected: root.shuffle
-              tooltipText: root.shuffle ? "Shuffle: on (Shift+S)" : "Shuffle: off (Shift+S)"
-              onClicked: root.sendUi("shuffle")
-            }
-            Button {
-              iconText: SoundCloudModel.repeatIconGlyph(root.repeat)
-              foreground: root.bar.foreground
-              selected: root.repeat !== "none"
-              tooltipText: (root.repeat === "one" ? "Repeat: this track"
-                : (root.repeat === "all" ? "Repeat: all" : "Repeat: off")) + " (Shift+L)"
-              onClicked: root.sendUi("repeat")
-            }
             Button {
               iconText: "󰲸"
               foreground: root.bar.foreground
@@ -2110,6 +2123,16 @@ BarWidget {
               tooltipText: root.notify ? "Notify on track change: on" : "Notify on track change: off"
               onClicked: root.sendUi(SoundCloudModel.toggleCommand("notify", root.notify))
             }
+          }
+
+          Row {
+            id: queueHeaderButtons
+            visible: root.clearArmedSignature === null
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
             Button {
               iconText: "󰆴"
               foreground: root.bar.foreground
@@ -2120,7 +2143,7 @@ BarWidget {
             }
           }
 
-          // After Clear: confirm or cancel (Esc, 12 s with the pointer away, a queue change or leaving the view also cancel).
+          // After Clear: confirm or cancel (Esc, a queue change or leaving the view also cancel).
           Row {
             visible: root.clearArmedSignature !== null
             anchors.right: parent.right
@@ -2128,6 +2151,15 @@ BarWidget {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              rightPadding: Style.space(6)
+              textFormat: Text.PlainText
+              text: "Clear queue?"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
             Button {
               iconText: "󰄬"
               foreground: Color.accent
