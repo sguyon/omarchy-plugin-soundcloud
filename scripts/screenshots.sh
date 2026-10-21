@@ -43,5 +43,5 @@ ensure_closed; sleep 0.5
 open_popup
 keys q; shot queue
 keys q; sleep 0.4
-keys -M ctrl -k f -m ctrl; sleep 0.5; keys d j; shot filter
+keys -M ctrl -k f -m ctrl; sleep 0.5; keys dj; shot filter
 ensure_closed && echo "popup closed" || echo "WARNING: popup still open"

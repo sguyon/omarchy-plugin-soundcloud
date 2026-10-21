@@ -2,7 +2,7 @@
 
 SoundCloud playback and browsing in the Omarchy top bar, without a browser tab and without official SoundCloud API credentials.
 
-![The SoundCloud popup showing the Feed tab](screenshots/popup-feed.png)![The SoundCloud popup with the play queue open](screenshots/popup-queue.png)
+![The SoundCloud popup showing the Likes tab](screenshots/popup-likes.png)![The SoundCloud popup with the play queue open](screenshots/popup-queue.png)
 
 ## Features
 
